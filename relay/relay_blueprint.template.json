@@ -1,0 +1,293 @@
+{
+    "name": "Salla | Local Backfill Relay (template)",
+    "flow": [
+        {
+            "id": 1,
+            "module": "gateway:CustomWebHook",
+            "version": 1,
+            "parameters": {
+                "hook": 0,
+                "maxResults": 1
+            },
+            "mapper": {},
+            "metadata": {
+                "designer": {
+                    "x": 0,
+                    "y": 0,
+                    "name": "Relay In (JSON: secret + path OR ids)"
+                }
+            }
+        },
+        {
+            "id": 2,
+            "module": "builtin:BasicRouter",
+            "version": 1,
+            "mapper": null,
+            "metadata": {
+                "designer": {
+                    "x": 300,
+                    "y": 0
+                }
+            },
+            "routes": [
+                {
+                    "flow": [
+                        {
+                            "id": 3,
+                            "module": "salla:makeApiCall",
+                            "version": 1,
+                            "parameters": {
+                                "__IMTCONN__": 0
+                            },
+                            "filter": {
+                                "name": "Single path + secret ok",
+                                "conditions": [
+                                    [
+                                        {
+                                            "a": "{{1.path}}",
+                                            "o": "exist"
+                                        },
+                                        {
+                                            "a": "{{1.secret}}",
+                                            "b": "RELAY_SECRET_REPLACE_ME",
+                                            "o": "text:equal"
+                                        }
+                                    ]
+                                ]
+                            },
+                            "mapper": {
+                                "path": "{{1.path}}",
+                                "method": "GET",
+                                "headers": [
+                                    {
+                                        "key": "Content-Type",
+                                        "value": "application/json"
+                                    }
+                                ],
+                                "api_version": "v2"
+                            },
+                            "onerror": [
+                                {
+                                    "id": 6,
+                                    "module": "builtin:Resume",
+                                    "version": 1,
+                                    "mapper": {},
+                                    "metadata": {
+                                        "designer": {
+                                            "x": 600,
+                                            "y": -300
+                                        }
+                                    }
+                                }
+                            ],
+                            "metadata": {
+                                "designer": {
+                                    "x": 600,
+                                    "y": -150,
+                                    "name": "Salla GET (single path)"
+                                }
+                            }
+                        },
+                        {
+                            "id": 4,
+                            "module": "json:TransformToJSON",
+                            "version": 1,
+                            "parameters": {},
+                            "mapper": {
+                                "space": "",
+                                "object": "{{3.body}}"
+                            },
+                            "metadata": {
+                                "designer": {
+                                    "x": 900,
+                                    "y": -150,
+                                    "name": "Serialize body"
+                                }
+                            }
+                        },
+                        {
+                            "id": 5,
+                            "module": "gateway:WebhookRespond",
+                            "version": 1,
+                            "parameters": {},
+                            "mapper": {
+                                "status": "200",
+                                "body": "{\"ok\":true,\"data\":{{4.json}}}",
+                                "headers": [
+                                    {
+                                        "key": "Content-Type",
+                                        "value": "application/json"
+                                    }
+                                ]
+                            },
+                            "metadata": {
+                                "designer": {
+                                    "x": 1200,
+                                    "y": -150,
+                                    "name": "Respond (single)"
+                                }
+                            }
+                        }
+                    ]
+                },
+                {
+                    "flow": [
+                        {
+                            "id": 10,
+                            "module": "builtin:BasicFeeder",
+                            "version": 1,
+                            "parameters": {},
+                            "filter": {
+                                "name": "Batch ids + secret ok",
+                                "conditions": [
+                                    [
+                                        {
+                                            "a": "{{1.ids}}",
+                                            "o": "exist"
+                                        },
+                                        {
+                                            "a": "{{1.secret}}",
+                                            "b": "RELAY_SECRET_REPLACE_ME",
+                                            "o": "text:equal"
+                                        }
+                                    ]
+                                ]
+                            },
+                            "mapper": {
+                                "array": "{{split(1.ids; \",\")}}"
+                            },
+                            "metadata": {
+                                "designer": {
+                                    "x": 600,
+                                    "y": 150,
+                                    "name": "Iterate order ids"
+                                }
+                            }
+                        },
+                        {
+                            "id": 11,
+                            "module": "salla:makeApiCall",
+                            "version": 1,
+                            "parameters": {
+                                "__IMTCONN__": 0
+                            },
+                            "mapper": {
+                                "path": "orders/{{10.value}}?expanded=true",
+                                "method": "GET",
+                                "headers": [
+                                    {
+                                        "key": "Content-Type",
+                                        "value": "application/json"
+                                    }
+                                ],
+                                "api_version": "v2"
+                            },
+                            "onerror": [
+                                {
+                                    "id": 15,
+                                    "module": "builtin:Resume",
+                                    "version": 1,
+                                    "mapper": {},
+                                    "metadata": {
+                                        "designer": {
+                                            "x": 900,
+                                            "y": 450
+                                        }
+                                    }
+                                }
+                            ],
+                            "metadata": {
+                                "designer": {
+                                    "x": 900,
+                                    "y": 150,
+                                    "name": "Salla GET order (expanded)"
+                                }
+                            }
+                        },
+                        {
+                            "id": 12,
+                            "module": "json:TransformToJSON",
+                            "version": 1,
+                            "parameters": {},
+                            "mapper": {
+                                "space": "",
+                                "object": "{{11.body}}"
+                            },
+                            "metadata": {
+                                "designer": {
+                                    "x": 1200,
+                                    "y": 150,
+                                    "name": "Serialize order body"
+                                }
+                            }
+                        },
+                        {
+                            "id": 13,
+                            "module": "util:TextAggregator",
+                            "version": 1,
+                            "parameters": {
+                                "feeder": 10,
+                                "rowSeparator": "other",
+                                "otherRowSeparator": ","
+                            },
+                            "mapper": {
+                                "value": "{{12.json}}"
+                            },
+                            "metadata": {
+                                "designer": {
+                                    "x": 1500,
+                                    "y": 150,
+                                    "name": "Join batch"
+                                }
+                            }
+                        },
+                        {
+                            "id": 14,
+                            "module": "gateway:WebhookRespond",
+                            "version": 1,
+                            "parameters": {},
+                            "mapper": {
+                                "status": "200",
+                                "body": "{\"ok\":true,\"batch\":[{{13.text}}]}",
+                                "headers": [
+                                    {
+                                        "key": "Content-Type",
+                                        "value": "application/json"
+                                    }
+                                ]
+                            },
+                            "metadata": {
+                                "designer": {
+                                    "x": 1800,
+                                    "y": 150,
+                                    "name": "Respond (batch)"
+                                }
+                            }
+                        }
+                    ]
+                }
+            ]
+        }
+    ],
+    "metadata": {
+        "instant": true,
+        "version": 1,
+        "scenario": {
+            "roundtrips": 1,
+            "maxErrors": 10,
+            "autoCommit": true,
+            "autoCommitTriggerLast": true,
+            "sequential": false,
+            "slots": null,
+            "confidential": false,
+            "dataloss": false,
+            "dlq": false,
+            "freshVariables": false
+        },
+        "designer": {
+            "orphans": []
+        },
+        "zone": "eu1.make.com",
+        "notes": []
+    }
+}

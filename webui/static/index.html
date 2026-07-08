@@ -1,0 +1,312 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Salla → HubSpot Backfill</title>
+<style>
+:root{
+  --bg:#f6f7f9; --panel:#ffffff; --text:#16181d; --muted:#6b7280; --line:#e5e7eb;
+  --accent:#4f46e5; --ok:#059669; --warn:#d97706; --bad:#dc2626; --chip:#eef0ff;
+}
+@media (prefers-color-scheme: dark){
+  :root{ --bg:#0e1013; --panel:#171a1f; --text:#e7e9ee; --muted:#9aa1ad; --line:#272b33;
+         --accent:#818cf8; --ok:#34d399; --warn:#fbbf24; --bad:#f87171; --chip:#23263a; }
+}
+*{box-sizing:border-box} body{margin:0;font:14px/1.5 -apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;background:var(--bg);color:var(--text)}
+header{display:flex;align-items:center;gap:12px;padding:14px 20px;border-bottom:1px solid var(--line);background:var(--panel);position:sticky;top:0;z-index:5}
+header h1{font-size:16px;margin:0;font-weight:650}
+.chip{padding:2px 10px;border-radius:999px;font-size:12px;font-weight:600;background:var(--chip)}
+.chip.ok{color:var(--ok)} .chip.bad{color:var(--bad)} .chip.warn{color:var(--warn)}
+nav{display:flex;gap:4px;margin-left:auto}
+nav button{border:0;background:transparent;color:var(--muted);padding:8px 14px;border-radius:8px;cursor:pointer;font-weight:600}
+nav button.active{background:var(--chip);color:var(--text)}
+main{max-width:1060px;margin:0 auto;padding:20px}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:18px 20px;margin-bottom:16px}
+.card h2{margin:0 0 4px;font-size:15px} .card p.hint{margin:2px 0 12px;color:var(--muted);font-size:13px}
+label{display:block;font-size:12px;font-weight:600;color:var(--muted);margin:10px 0 4px}
+input,select{width:100%;padding:8px 10px;border:1px solid var(--line);border-radius:8px;background:var(--bg);color:var(--text);font-size:14px}
+.row{display:flex;gap:12px;flex-wrap:wrap} .row>div{flex:1;min-width:180px}
+button.btn{background:var(--accent);color:#fff;border:0;border-radius:8px;padding:9px 16px;font-weight:650;cursor:pointer;margin-top:12px}
+button.btn.secondary{background:var(--chip);color:var(--text)}
+button.btn.danger{background:var(--bad)}
+button.btn:disabled{opacity:.5;cursor:default}
+.status{font-size:13px;margin-top:8px;white-space:pre-wrap}
+.ok{color:var(--ok)} .bad{color:var(--bad)} .warn{color:var(--warn)} .muted{color:var(--muted)}
+table{width:100%;border-collapse:collapse;font-size:13px} td,th{padding:6px 8px;border-bottom:1px solid var(--line);text-align:left}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:10px;margin:10px 0}
+.stat{background:var(--bg);border:1px solid var(--line);border-radius:10px;padding:10px 12px}
+.stat b{display:block;font-size:20px} .stat span{font-size:12px;color:var(--muted)}
+.bar{height:8px;background:var(--line);border-radius:99px;overflow:hidden;margin:6px 0}
+.bar>i{display:block;height:100%;background:var(--accent)}
+pre{background:var(--bg);border:1px solid var(--line);border-radius:10px;padding:12px;overflow:auto;font-size:12px;max-height:420px}
+.feed{list-style:none;margin:8px 0 0;padding:0;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12.5px}
+.feed li{padding:3px 0;border-bottom:1px dashed var(--line)}
+.step{display:none}.step.active{display:block}
+.dots{display:flex;gap:6px;margin-bottom:14px}
+.dots i{width:26px;height:6px;border-radius:99px;background:var(--line)} .dots i.done{background:var(--accent)}
+.maprow{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:6px;align-items:center}
+</style>
+</head>
+<body>
+<header>
+  <h1>Salla → HubSpot Backfill</h1>
+  <span id="engineChip" class="chip">…</span>
+  <nav>
+    <button data-tab="setup" class="active">Setup</button>
+    <button data-tab="run">Run</button>
+    <button data-tab="dash">Dashboard</button>
+    <button data-tab="logs">Logs</button>
+  </nav>
+</header>
+<main>
+
+<!-- ============================ SETUP ============================ -->
+<section id="tab-setup">
+  <div class="dots" id="dots"></div>
+
+  <div class="card step active" data-step="0">
+    <h2>1 · Credentials</h2>
+    <p class="hint">The HubSpot private-app token needs CRM read/write scopes (contacts, orders/commerce, line items, custom objects). The relay secret is the random string inside your Make relay scenario's filters.</p>
+    <div class="row">
+      <div><label>HubSpot private app token</label><input id="hsToken" type="password" placeholder="pat-…  (leave blank to keep saved)"></div>
+      <div><label>Relay shared secret</label><input id="relaySecret" type="password" placeholder="leave blank to keep saved"></div>
+    </div>
+    <button class="btn" onclick="saveSecrets()">Save & test HubSpot</button>
+    <div class="status" id="s0"></div>
+  </div>
+
+  <div class="card step" data-step="1">
+    <h2>2 · Salla relay</h2>
+    <p class="hint">Import <code>relay/relay_blueprint.template.json</code> into Make (replace the secret placeholder and select your Salla connection on both modules), turn it ON, and paste the webhook URL here. The test fetches your store's order-status list through it.</p>
+    <label>Relay webhook URL</label><input id="relayUrl" placeholder="https://hook.….make.com/…">
+    <button class="btn" onclick="testRelay()">Test relay</button>
+    <div class="status" id="s1"></div>
+  </div>
+
+  <div class="card step" data-step="2">
+    <h2>3 · Google Sheets & Drive (optional)</h2>
+    <p class="hint">Live audit rows and order-JSON archive. Skip it and the engine keeps complete local CSV mirrors instead. To enable: create an OAuth Desktop client in Google Cloud Console (Sheets + Drive APIs), download it as <code>credentials.json</code> next to <code>serve.py</code>.</p>
+    <div class="row">
+      <div><label>Enable Google writes</label>
+        <select id="googleEnabled"><option value="false">No — local mirrors only</option><option value="true">Yes — Sheets + Drive</option></select></div>
+      <div><label>Spreadsheet ID</label><input id="sheetId" placeholder="only if enabled"></div>
+      <div><label>Drive folder ID</label><input id="driveId" placeholder="only if enabled"></div>
+    </div>
+    <div class="status" id="s2"></div>
+    <button class="btn secondary" onclick="nextStep(3)">Continue</button>
+  </div>
+
+  <div class="card step" data-step="3">
+    <h2>4 · Pipeline mapping</h2>
+    <p class="hint">Pick the order pipeline stage used at creation, then map each Salla status to a stage (statuses come from your store via the relay test; stages from your portal). Unmapped statuses fall back to the default stage.</p>
+    <button class="btn secondary" onclick="loadMapping()">Load stages & statuses</button>
+    <div id="mapArea"></div>
+    <label style="margin-top:14px">Bundles (custom objects)</label>
+    <select id="bundlesEnabled" onchange="bundleArea()">
+      <option value="false">Disabled — orders + line items only</option>
+      <option value="true">Enabled — bundle template / bundle / component custom objects</option>
+    </select>
+    <div id="bundleArea"></div>
+    <div class="status" id="s3"></div>
+    <button class="btn secondary" onclick="nextStep(4)">Continue</button>
+  </div>
+
+  <div class="card step" data-step="4">
+    <h2>5 · Backfill window & save</h2>
+    <p class="hint">The engine sweeps this window in fixed slots, oldest first, and keeps its position in <code>cursor.json</code>. Stop and resume any time; deduplication makes rescans free.</p>
+    <div class="row">
+      <div><label>From (first order date)</label><input id="fromDate" type="datetime-local"></div>
+      <div><label>To (exclusive)</label><input id="toDate" type="date"></div>
+      <div><label>Slot hours</label><input id="slotHours" type="number" value="3" min="1" max="24"></div>
+      <div><label>Store timezone</label><input id="tz" value="Asia/Riyadh"></div>
+    </div>
+    <button class="btn" onclick="saveConfig()">Save configuration</button>
+    <div class="status" id="s4"></div>
+  </div>
+</section>
+
+<!-- ============================ RUN ============================ -->
+<section id="tab-run" style="display:none">
+  <div class="card">
+    <h2>Run control</h2>
+    <p class="hint">Dry run reads everything and writes nothing — it prints a would-create plan per order. Live runs sit behind the same RUN confirmation the terminal uses. Stop is always graceful: the engine finishes the current order, the cursor stays safe, resume is free.</p>
+    <div class="row">
+      <div><label>Mode</label><select id="runMode"><option value="dry">Dry run (no writes)</option><option value="live">LIVE (writes to HubSpot)</option></select></div>
+      <div><label>Max orders (blank = all)</label><input id="maxOrders" type="number" min="1" placeholder="e.g. 2 for a test gate"></div>
+      <div><label>Type RUN to arm live mode</label><input id="confirmRun" placeholder="RUN"></div>
+    </div>
+    <button class="btn" onclick="startRun()">Start</button>
+    <button class="btn danger" onclick="stopRun()">Graceful stop</button>
+    <div class="status" id="runStatus"></div>
+  </div>
+  <div class="card">
+    <h2>Recommended first flight</h2>
+    <p class="hint">1) Dry run with max orders 2 — review the plan in Logs. 2) Live with max orders 2 — verify both orders in HubSpot (name, stage, contact, line items). 3) Live, no cap. This mirrors the tested production rollout of this engine.</p>
+  </div>
+</section>
+
+<!-- ============================ DASHBOARD ============================ -->
+<section id="tab-dash" style="display:none">
+  <div class="card">
+    <h2 id="dashPhase">idle</h2>
+    <p class="hint" id="dashSlot">–</p>
+    <div class="bar"><i id="pageBar" style="width:0%"></i></div>
+    <p class="hint" id="pageTxt">–</p>
+    <div class="grid">
+      <div class="stat"><b id="cCreated">0</b><span>created</span></div>
+      <div class="stat"><b id="cHeld">0</b><span>held</span></div>
+      <div class="stat"><b id="cSkipped">0</b><span>dedup skipped</span></div>
+      <div class="stat"><b id="cErrors">0</b><span>errors (log lines)</span></div>
+      <div class="stat"><b id="cRate">0</b><span>orders / hour</span></div>
+    </div>
+    <div class="status" id="curOrder"></div>
+    <ul class="feed" id="feed"></ul>
+  </div>
+</section>
+
+<!-- ============================ LOGS ============================ -->
+<section id="tab-logs" style="display:none">
+  <div class="card">
+    <h2>backfill.log tail</h2>
+    <button class="btn secondary" onclick="loadLogs()">Refresh</button>
+    <pre id="logBox">–</pre>
+  </div>
+  <div class="card">
+    <h2>Unrecovered failures (mirror/errors.csv)</h2>
+    <p class="hint">The real failure ledger. Log-line "errors" above can include recovered incidents; anything here needs attention.</p>
+    <pre id="errBox">–</pre>
+  </div>
+</section>
+</main>
+
+<script>
+const $=id=>document.getElementById(id);
+const tabs=document.querySelectorAll("nav button");
+tabs.forEach(b=>b.onclick=()=>{tabs.forEach(x=>x.classList.remove("active"));b.classList.add("active");
+  ["setup","run","dash","logs"].forEach(t=>$("tab-"+t).style.display=(b.dataset.tab===t)?"":"none");
+  if(b.dataset.tab==="logs")loadLogs();});
+const STEPS=5;let statuses=[],stages=[];
+function dots(n){$("dots").innerHTML=Array.from({length:STEPS},(_,i)=>`<i class="${i<=n?'done':''}"></i>`).join("");}
+function nextStep(n){document.querySelectorAll(".step").forEach(s=>s.classList.toggle("active",+s.dataset.step===n));dots(n);}
+dots(0);
+async function api(p,body){const r=await fetch(p,body?{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)}:{});return r.json();}
+
+async function refreshState(){
+  const s=await api("/api/state");
+  $("engineChip").textContent=s.engine_running?"engine running":(s.stop_file?"stopped (STOP)":"engine idle");
+  $("engineChip").className="chip "+(s.engine_running?"ok":"warn");
+  if(s.config_present&&s.config){
+    const c=s.config;
+    $("relayUrl").value=c.relay_url||"";$("sheetId").value=c.spreadsheet_id||"";$("driveId").value=c.drive_folder_id||"";
+    $("googleEnabled").value=String(!!c.google_enabled);$("bundlesEnabled").value=String(!!c.bundles_enabled);
+    $("slotHours").value=c.slot_hours||3;$("tz").value=c.salla_timezone_default||"Asia/Riyadh";
+  }
+  $("s2").innerHTML=`credentials.json: <b class="${s.google_credentials_present?'ok':'warn'}">${s.google_credentials_present?'present':'not found'}</b> · token cache: <b>${s.google_token_cached?'present':'—'}</b>`;
+  return s;
+}
+async function saveSecrets(){
+  $("s0").textContent="saving…";
+  await api("/api/secrets",{hubspot_token:$("hsToken").value,relay_secret:$("relaySecret").value});
+  const t=await api("/api/test/hubspot",{});
+  $("s0").innerHTML=t.ok?`<span class="ok">✓ HubSpot OK — portal ${t.portal_id} (${t.ui_domain})</span>`:`<span class="bad">✗ ${t.error}</span>`;
+  if(t.ok){$("hsToken").value="";$("relaySecret").value="";nextStep(1);}
+}
+async function testRelay(){
+  $("s1").textContent="testing… (first call can take ~10s)";
+  const t=await api("/api/test/relay",{relay_url:$("relayUrl").value});
+  if(t.ok){statuses=t.statuses;$("s1").innerHTML=`<span class="ok">✓ Relay OK — store exposes ${t.statuses.length} order statuses</span>`;nextStep(2);}
+  else $("s1").innerHTML=`<span class="bad">✗ ${t.error}</span>`;
+}
+async function loadMapping(){
+  $("s3").textContent="loading…";
+  const p=await api("/api/hubspot/pipelines");
+  if(!p.ok){$("s3").innerHTML=`<span class="bad">✗ ${p.error}</span>`;return;}
+  stages=p.pipelines.flatMap(pl=>pl.stages.map(s=>({...s,pipe:pl.label})));
+  const opts=stages.map(s=>`<option value="${s.id}">${s.pipe} · ${s.label}</option>`).join("");
+  const slugs=[...new Set(statuses.map(s=>s.slug))];
+  $("mapArea").innerHTML=`<label>Default creation stage</label><select id="defStage">${opts}</select>
+    <label style="margin-top:10px">Status → stage map</label>`+
+    slugs.map(sl=>`<div class="maprow"><span><code>${sl}</code></span>
+      <select data-slug="${sl}"><option value="">(default stage)</option>${opts}</select></div>`).join("");
+  $("s3").innerHTML=`<span class="ok">✓ ${stages.length} stages loaded, ${slugs.length} statuses from your store</span>`;
+}
+function bundleArea(){
+  $("bundleArea").innerHTML=$("bundlesEnabled").value!=="true"?"":`
+    <p class="hint">Object type IDs (find them via <button class="btn secondary" style="margin:0;padding:2px 8px" onclick="listSchemas()">list custom objects</button>) and USER_DEFINED association type IDs from your portal.</p>
+    <div class="row">
+      <div><label>Bundle template object</label><input id="objTpl" placeholder="2-…"></div>
+      <div><label>Bundle object</label><input id="objBundle" placeholder="2-…"></div>
+      <div><label>Component object</label><input id="objComp" placeholder="2-…"></div>
+    </div>
+    <div class="row">
+      <div><label>template→bundle assoc id</label><input id="aTpl" type="number"></div>
+      <div><label>bundle→order assoc id</label><input id="aOrd" type="number"></div>
+      <div><label>bundle→parent-LI assoc id</label><input id="aPar" type="number"></div>
+      <div><label>bundle→component-LI assoc id</label><input id="aCom" type="number"></div>
+    </div><pre id="schemaBox" style="display:none"></pre>`;
+}
+async function listSchemas(){
+  const r=await api("/api/hubspot/custom-objects");
+  $("schemaBox").style.display="";
+  $("schemaBox").textContent=r.ok?JSON.stringify(r.schemas,null,1):r.error;
+}
+async function saveConfig(){
+  const map={};document.querySelectorAll("[data-slug]").forEach(s=>{if(s.value)map[s.dataset.slug]=s.value;});
+  const cfg={
+    hubspot_base:"https://api.hubapi.com",relay_url:$("relayUrl").value.trim(),
+    relay_batch_size:12,relay_min_interval_s:1.5,
+    slot_hours:+$("slotHours").value||3,per_page:30,overflow_pages:18,
+    google_enabled:$("googleEnabled").value==="true",
+    spreadsheet_id:$("sheetId").value.trim(),audit_tab:"Order Audit Log",queue_tab:"Queue Log",
+    drive_folder_id:$("driveId").value.trim(),held_notify_url:"",
+    record_url_base:"",archive_dir:"archive",state_file:"cursor.json",
+    hs_search_per_s:3.5,hs_general_per_s:10,sheets_per_min:50,
+    salla_timezone_default:$("tz").value.trim()||"Asia/Riyadh",
+    bundles_enabled:$("bundlesEnabled").value==="true",
+    default_pipeline_stage:($("defStage")||{}).value||"",
+    status_stage_map:map,
+    object_type_ids:$("bundlesEnabled").value==="true"?{bundle_template:$("objTpl").value.trim(),bundle:$("objBundle").value.trim(),component:$("objComp").value.trim()}:{},
+    assoc_type_ids:$("bundlesEnabled").value==="true"?{order_contact:507,order_line_item:513,template_bundle:+$("aTpl").value||null,bundle_order:+$("aOrd").value||null,bundle_parent_li:+$("aPar").value||null,bundle_component_li:+$("aCom").value||null}:{order_contact:507,order_line_item:513},
+  };
+  const from=$("fromDate").value,to=$("toDate").value;
+  if(!from||!to){$("s4").innerHTML='<span class="bad">set the window dates</span>';return;}
+  const cursor={from_date:from.length===16?from+":00":from,to_date:to,next_page:1,total_pages:1,status:"running"};
+  const r=await api("/api/config",{config:cfg,cursor:cursor,overwrite_cursor:true});
+  $("s4").innerHTML=r.valid?'<span class="ok">✓ Saved and validated. Go to the Run tab.</span>':`<span class="bad">✗ saved but invalid: ${r.validation_error}</span>`;
+}
+async function startRun(){
+  const mode=$("runMode").value;
+  const r=await api("/api/run",{mode:mode,max_orders:$("maxOrders").value||null,confirm:$("confirmRun").value.trim()});
+  $("runStatus").innerHTML=r.ok?'<span class="ok">✓ started — watch the Dashboard tab</span>':`<span class="bad">✗ ${r.error}</span>`;
+}
+async function stopRun(){
+  const r=await api("/api/stop",{});
+  $("runStatus").innerHTML=`<span class="warn">${r.note}</span>`;
+}
+async function loadLogs(){
+  const l=await api("/api/log?lines=200");$("logBox").textContent=l.lines.join("\n")||"(empty)";
+  const e=await api("/api/errors");$("errBox").textContent=e.rows.length?e.rows.join("\n"):"none 🎉";
+  $("logBox").scrollTop=$("logBox").scrollHeight;
+}
+// live stream
+const es=new EventSource("/api/stream");
+es.onmessage=ev=>{
+  const d=JSON.parse(ev.data);
+  $("engineChip").textContent=d.engine_running?(d.stale_s>90?"engine silent "+d.stale_s+"s":"engine running"):"engine idle";
+  $("engineChip").className="chip "+(d.engine_running?(d.stale_s>90?"warn":"ok"):"warn");
+  $("dashPhase").textContent=d.engine_running?d.phase:"engine idle";
+  $("dashSlot").textContent=`slot ${d.slot}   page ${d.page}/${d.page_total||"?"}`;
+  const pct=d.page_orders?Math.round(100*d.page_done/d.page_orders):0;
+  $("pageBar").style.width=pct+"%";
+  $("pageTxt").textContent=`page orders ${d.page_done}/${d.page_orders}`;
+  $("cCreated").textContent=d.counts.created||0;$("cHeld").textContent=d.counts.held||0;
+  $("cSkipped").textContent=d.counts.skipped||0;$("cErrors").textContent=d.counts.errors||0;
+  $("cRate").textContent=d.rate_h||0;
+  $("curOrder").textContent=d.current?`order ${d.current.id} (ref ${d.current.ref}, ${d.current.items} items) — ${d.phase}`:(d.last_result||"");
+  $("feed").innerHTML=(d.recent||[]).map(r=>`<li>${r[0].slice(11)} ${r[1]} ${r[2]}</li>`).join("");
+};
+refreshState();
+</script>
+</body>
+</html>

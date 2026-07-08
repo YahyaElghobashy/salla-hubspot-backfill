@@ -1,0 +1,26 @@
+# Secrets and per-deployment config
+.env
+config.json
+credentials.json
+token.json
+
+# Run state and outputs (may contain customer PII — never publish)
+cursor.json
+cursor.tmp
+backfill.log
+supervisor.out
+engine.pid
+STOP
+STOP.retro
+mirror/
+archive/
+
+# Python
+venv/
+.venv/
+__pycache__/
+*.pyc
+
+# OS
+.DS_Store
+Thumbs.db

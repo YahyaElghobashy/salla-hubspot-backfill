@@ -1,0 +1,46 @@
+{
+  "hubspot_base": "https://api.hubapi.com",
+  "relay_url": "PASTE_YOUR_MAKE_RELAY_WEBHOOK_URL",
+  "relay_batch_size": 12,
+  "relay_min_interval_s": 1.5,
+  "slot_hours": 3,
+  "per_page": 30,
+  "overflow_pages": 18,
+  "google_enabled": false,
+  "spreadsheet_id": "",
+  "audit_tab": "Order Audit Log",
+  "queue_tab": "Queue Log",
+  "drive_folder_id": "",
+  "held_notify_url": "",
+  "record_url_base": "",
+  "archive_dir": "archive",
+  "state_file": "cursor.json",
+  "hs_search_per_s": 3.5,
+  "hs_general_per_s": 10,
+  "sheets_per_min": 50,
+  "salla_timezone_default": "Asia/Riyadh",
+  "bundles_enabled": false,
+  "default_pipeline_stage": "REPLACE_WITH_YOUR_ORDER_PIPELINE_STAGE_ID",
+  "status_stage_map": {
+    "delivered": "REPLACE_STAGE_ID",
+    "shipped": "REPLACE_STAGE_ID",
+    "delivering": "REPLACE_STAGE_ID",
+    "completed": "REPLACE_STAGE_ID",
+    "canceled": "REPLACE_STAGE_ID",
+    "restored": "REPLACE_STAGE_ID",
+    "restoring": "REPLACE_STAGE_ID"
+  },
+  "object_type_ids": {
+    "bundle_template": "",
+    "bundle": "",
+    "component": ""
+  },
+  "assoc_type_ids": {
+    "order_contact": 507,
+    "order_line_item": 513,
+    "template_bundle": null,
+    "bundle_order": null,
+    "bundle_parent_li": null,
+    "bundle_component_li": null
+  }
+}
