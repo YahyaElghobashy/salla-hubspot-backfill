@@ -38,9 +38,11 @@ import signal
 import socket
 import ssl
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -175,19 +177,27 @@ class AdaptiveLimiter:
         self.soft_decrease = soft_decrease
         self.soft_floor = soft_floor
         self.adaptive = adaptive
-        self._last = 0.0
         self._successes = 0
         self._cooldown_until = 0.0
+        # v1.5: worker lanes share each limiter. Reservation-based pacing: a
+        # caller atomically claims the next send slot under the lock, then
+        # sleeps outside it, so N lanes are collectively paced to the same
+        # global rate a single lane would be.
+        self._lock = threading.Lock()
+        self._next = 0.0
 
     @property
     def min_interval(self):
         return 1.0 / self.rate
 
     def wait(self):
-        delta = time.monotonic() - self._last
-        if delta < self.min_interval:
-            time.sleep(self.min_interval - delta)
-        self._last = time.monotonic()
+        now = time.monotonic()
+        with self._lock:
+            t = max(self._next, now)
+            self._next = t + self.min_interval
+        delay = t - now
+        if delay > 0:
+            time.sleep(delay)
 
     def _set_rate(self, new_rate, reason):
         new_rate = min(self.ceil, max(self.floor, new_rate))
@@ -200,10 +210,19 @@ class AdaptiveLimiter:
         """Provider throttled us (429 / RESOURCE_EXHAUSTED)."""
         if not self.adaptive:
             return
-        self._successes = 0
-        self._cooldown_until = time.monotonic() + self.cooldown_s
-        self._set_rate(self.rate * self.hard_decrease,
-                       f"throttled, retry_after={retry_after}")
+        with self._lock:
+            self._successes = 0
+            now = time.monotonic()
+            self._cooldown_until = now + self.cooldown_s
+            # v1.5: push the reservation head so slots already queued by other
+            # lanes do not fire straight into the throttle window.
+            try:
+                hold = float(retry_after) if retry_after else self.min_interval
+            except (TypeError, ValueError):
+                hold = self.min_interval
+            self._next = max(self._next, now + hold)
+            self._set_rate(self.rate * self.hard_decrease,
+                           f"throttled, retry_after={retry_after}")
 
     def on_result(self, remaining, cap):
         """Success WITH provider bucket telemetry (e.g. HubSpot rate headers)."""
@@ -212,22 +231,26 @@ class AdaptiveLimiter:
         if cap and cap > 0 and (remaining / cap) < self.soft_floor:
             # The shared bucket is nearly drained by all consumers combined
             # (this engine + live automations). Yield gently.
-            self._successes = 0
-            # extend, never shorten, an in-flight hard-throttle cooldown
-            self._cooldown_until = max(self._cooldown_until,
-                                       time.monotonic() + min(10.0, self.cooldown_s))
-            self._set_rate(self.rate * self.soft_decrease,
-                           f"bucket low {remaining}/{cap}")
+            with self._lock:
+                self._successes = 0
+                # extend, never shorten, an in-flight hard-throttle cooldown
+                self._cooldown_until = max(self._cooldown_until,
+                                           time.monotonic() + min(10.0, self.cooldown_s))
+                self._set_rate(self.rate * self.soft_decrease,
+                               f"bucket low {remaining}/{cap}")
             return
         self.on_success()
 
     def on_success(self):
-        if not self.adaptive or time.monotonic() < self._cooldown_until:
+        if not self.adaptive:
             return
-        self._successes += 1
-        if self._successes >= self.growth_every:
-            self._successes = 0
-            self._set_rate(self.rate + self.step, "recovery")
+        with self._lock:
+            if time.monotonic() < self._cooldown_until:
+                return
+            self._successes += 1
+            if self._successes >= self.growth_every:
+                self._successes = 0
+                self._set_rate(self.rate + self.step, "recovery")
 
     def snapshot(self):
         return f"{self.name}={self.rate:.2f}/s"
@@ -325,6 +348,11 @@ class Config:
     drive_start_per_min: float = 40.0
     drive_limit_per_min: float = 120.0        # self-imposed; Drive quota is far higher
     relay_floor_interval_s: float = 0.8       # fastest allowed relay call gap
+
+    # v1.5 concurrency: orders per page processed by this many worker lanes
+    # sharing the global adaptive limiters. Lanes saturate around 4 given the
+    # account-wide HubSpot search ceiling; higher values add only 429 risk.
+    workers: int = 1
 
     @staticmethod
     def load(path):
@@ -527,13 +555,15 @@ class HubSpot:
 
     def _req(self, method, path, body=None, is_search=False, what=""):
         limiter = self.search_rl if is_search else self.general_rl
-        limiter.wait()
         url = self.cfg.hubspot_base + path
         headers = {"Authorization": f"Bearer {self.token}",
                    "Content-Type": "application/json"}
         payload = json.dumps(body) if body is not None else None
 
         def go():
+            # v1.5: reserve a pacing slot on EVERY attempt (retries included),
+            # so a post-429 reservation push actually paces the retry storm.
+            limiter.wait()
             return http_request(method, url, headers=headers, body=payload)
 
         status, hdrs, text = with_retries(go, what or f"HS {method} {path}",
@@ -802,8 +832,8 @@ class GoogleIO:
     def __init__(self, cfg: Config, enabled: bool):
         self.cfg = cfg
         self.enabled = enabled
-        self.sheets = None
-        self.drive = None
+        self._creds_json = None   # v1.5: per-thread services built from this
+        self._tl = threading.local()
         util = cfg.adaptive_target_util
         # v1.4 adaptive pacing. Documented quotas (verified 2026-07-12):
         #   - Sheets API v4: 60 write requests/min/user (fixed ~60s refill
@@ -828,6 +858,28 @@ class GoogleIO:
             adaptive=cfg.adaptive_enabled)
         if enabled:
             self._auth()
+
+    # v1.5: googleapiclient services (and google-auth Credentials) are not
+    # thread-safe. Each worker lane builds its own service pair from the
+    # credentials captured during the main-thread _auth(); refresh tokens are
+    # reusable, so independent per-thread refreshes are harmless.
+    def _services(self):
+        if getattr(self._tl, "sheets", None) is None:
+            from google.oauth2.credentials import Credentials
+            from googleapiclient.discovery import build
+            creds = Credentials.from_authorized_user_info(
+                json.loads(self._creds_json), self.SCOPES)
+            self._tl.sheets = build("sheets", "v4", credentials=creds).spreadsheets()
+            self._tl.drive = build("drive", "v3", credentials=creds)
+        return self._tl.sheets, self._tl.drive
+
+    @property
+    def sheets(self):
+        return self._services()[0] if self.enabled else None
+
+    @property
+    def drive(self):
+        return self._services()[1] if self.enabled else None
 
     def _gexec(self, request, what, limiter):
         """v1.4: execute a googleapiclient request with quota-aware retries.
@@ -873,8 +925,8 @@ class GoogleIO:
                 flow = InstalledAppFlow.from_client_secrets_file("credentials.json", self.SCOPES)
                 creds = flow.run_local_server(port=0)
             Path("token.json").write_text(creds.to_json())
-        self.sheets = build("sheets", "v4", credentials=creds).spreadsheets()
-        self.drive = build("drive", "v3", credentials=creds)
+        self._creds_json = creds.to_json()
+        self._services()  # build the main thread's pair now (fail fast)
         log.info("Google authenticated (Sheets + Drive)")
 
     def drive_upload_json(self, filename, json_text):
@@ -991,6 +1043,7 @@ class LocalMirror:
         self.audit = self.dir / "audit_mirror.csv"
         self.queue = self.dir / "queue_mirror.csv"
         self.errors = self.dir / "errors.csv"
+        self._lock = threading.Lock()  # v1.5: lanes append concurrently
         for p, hdr in ((self.audit, ["ts", "event", "sheet_row"] + [f"c{i}" for i in range(AUDIT_WIDTH)]),
                        (self.queue, ["ts"] + [f"c{i}" for i in range(14)]),
                        (self.errors, ["ts", "salla_order_id", "stage", "detail"])):
@@ -999,7 +1052,7 @@ class LocalMirror:
                     csv.writer(f).writerow(hdr)
 
     def _write(self, path, row):
-        with open(path, "a", newline="") as f:
+        with self._lock, open(path, "a", newline="") as f:
             csv.writer(f).writerow(row)
 
     def audit_event(self, event, sheet_row, values_by_idx):
@@ -1037,34 +1090,74 @@ class Stats:
 
 
 class Engine:
-    def __init__(self, cfg, cursor, relay, hs, gio, mirror, live):
+    def __init__(self, cfg, cursor, relay, hs, gio, mirror, live, workers=None):
         self.cfg, self.cursor, self.relay = cfg, cursor, relay
         self.hs, self.gio, self.mirror = hs, gio, mirror
         self.live = live
         self.stats = Stats()
         self.stop = False
         self._next_rate_report = 0.0  # v1.4
+        # v1.5 concurrency: worker lanes share the global adaptive limiters.
+        # Clamped to 8: beyond lane saturation there is no throughput left,
+        # only 429 blast radius.
+        want = int(workers if workers is not None else getattr(cfg, "workers", 1))
+        self.workers = min(8, max(1, want))
+        if want != self.workers:
+            log.warning("workers=%d clamped to %d", want, self.workers)
+        self._stats_lock = threading.Lock()
+        self._phone_guard = threading.Lock()
+        self._phone_locks = {}
+        self._contact_cache = {}  # customer key -> resolved HubSpot contact id
+        self._in_flight = 0  # maintained by the main loop only
         signal.signal(signal.SIGINT, self._sigint)
 
+    def _bump(self, field, n=1):
+        """v1.5: dataclass += is not atomic across lanes."""
+        with self._stats_lock:
+            setattr(self.stats, field, getattr(self.stats, field) + n)
+
+    def _contact_key(self, order):
+        mobile = str(dig(order, "customer.mobile"))
+        return ((str(dig(order, "customer.mobile_code")), mobile) if mobile
+                else ("cust", str(dig(order, "customer.id"))))
+
+    def _contact_lock(self, key):
+        """v1.5: serialize contact search->create->guardrail per customer so
+        two lanes carrying orders of the same buyer cannot race each other
+        (the live-scenario race is still covered by the v1.1 guardrail)."""
+        with self._phone_guard:
+            lock = self._phone_locks.get(key)
+            if lock is None:
+                lock = self._phone_locks[key] = threading.Lock()
+        return lock
+
     def _rates_report(self):
-        """v1.4: periodic one-line snapshot of every adaptive rate."""
+        """v1.4: periodic snapshot; v1.5: current/ceiling pairs + lanes.
+        Called from the main loop only."""
         if time.monotonic() < self._next_rate_report:
             return
         self._next_rate_report = time.monotonic() + 60.0
-        log.info("RATES hs_search=%.2f/s hs_general=%.2f/s sheets=%.1f/min "
-                 "drive=%.1f/min relay_gap=%.2fs",
-                 self.hs.search_rl.rate, self.hs.general_rl.rate,
-                 self.gio.sheets_rl.rate * 60.0, self.gio.drive_rl.rate * 60.0,
-                 1.0 / self.relay._gap.rate)
+        log.info("RATES hs_search=%.2f/%.2f/s hs_general=%.2f/%.2f/s "
+                 "sheets=%.1f/%.1f/min drive=%.1f/%.1f/min relay_gap=%.2fs "
+                 "lanes=%d/%d",
+                 self.hs.search_rl.rate, self.hs.search_rl.ceil,
+                 self.hs.general_rl.rate, self.hs.general_rl.ceil,
+                 self.gio.sheets_rl.rate * 60.0, self.gio.sheets_rl.ceil * 60.0,
+                 self.gio.drive_rl.rate * 60.0, self.gio.drive_rl.ceil * 60.0,
+                 1.0 / self.relay._gap.rate, self._in_flight, self.workers)
 
     def _sigint(self, *_):
-        log.warning("SIGINT received: finishing current order, then stopping")
+        log.warning("SIGINT received: finishing %d in-flight order(s), then stopping",
+                    max(self._in_flight, 1))
         self.stop = True
 
     def _should_stop(self):
         if self.stop:
             return True
         if STOP_FILE.exists():
+            # Latch: once seen, the stop sticks even if the file is removed,
+            # so a page whose scan was cut short can never advance the cursor.
+            self.stop = True
             log.warning("STOP file present: halting gracefully")
             return True
         return False
@@ -1091,7 +1184,7 @@ class Engine:
     # -- HELD route [M244/M222/M224] ------------------------------------------
 
     def route_held(self, order, audit_row, unverified):
-        self.stats.held += 1
+        self._bump("held")
         upd = {11: "Held for Review", 12: "Items not yet approved in catalog",
                13: "FALSE", 19: "N/A", 20: "N/A", 21: "N/A", 22: "N/A", 23: "N/A",
                24: "Queued", 25: now_str()}
@@ -1132,43 +1225,61 @@ class Engine:
         # [M3-guardrail v1.1] create failure triggers a delayed re-search: the
         # competing customer-create scenario may have created the contact between
         # our search and our create. Mirrors the Resume-route retry in Make.
-        try:
-            found_id, total = self.hs.search_contact_by_phone(
-                dig(order, "customer.mobile_code"), dig(order, "customer.mobile"))
-        except Exception as e:  # [oe7 Resume]
-            log.error("Contact search failed for %s: %s", oid, e)
-            found_id, total = None, 0
-        if found_id is None:
-            customer_id = self.hs.create_contact(order)
-            if not customer_id:
-                log.warning("Contact create failed for order %s: re-searching in "
-                            "%ss (race guardrail)", oid, RACE_RETRY_WAIT_S)
-                time.sleep(RACE_RETRY_WAIT_S)
+        # v1.5: the whole resolution runs inside a per-customer lock so lanes
+        # carrying the same buyer serialize here (and only here). A resolved
+        # id is cached per customer: the next order of the same buyer reuses
+        # it directly, immune to CRM search-index lag on fresh contacts.
+        ckey = self._contact_key(order)
+        with self._contact_lock(ckey):
+            customer_id = self._contact_cache.get(ckey)
+            if customer_id:
+                # same buyer already resolved this run: reuse the id, no
+                # search (immune to CRM index lag on freshly created contacts)
+                total = 1
+                found_id = customer_id
+            else:
                 try:
-                    customer_id = self.hs.search_contact_retry(order)
-                except Exception as e:
-                    log.error("Guardrail re-search failed for %s: %s", oid, e)
-                    customer_id = None
-                if customer_id:
-                    log.info("Race guardrail resolved contact %s for order %s",
-                             customer_id, oid)
-        else:
-            customer_id = found_id
+                    found_id, total = self.hs.search_contact_by_phone(
+                        dig(order, "customer.mobile_code"), dig(order, "customer.mobile"))
+                except Exception as e:  # [oe7 Resume]
+                    log.error("Contact search failed for %s: %s", oid, e)
+                    found_id, total = None, 0
+            if found_id is None:
+                customer_id = self.hs.create_contact(order)
+                if not customer_id:
+                    log.warning("Contact create failed for order %s: re-searching in "
+                                "%ss (race guardrail)", oid, RACE_RETRY_WAIT_S)
+                    time.sleep(RACE_RETRY_WAIT_S)
+                    try:
+                        customer_id = self.hs.search_contact_retry(order)
+                    except Exception as e:
+                        log.error("Guardrail re-search failed for %s: %s", oid, e)
+                        customer_id = None
+                    if customer_id:
+                        log.info("Race guardrail resolved contact %s for order %s",
+                                 customer_id, oid)
+            else:
+                customer_id = found_id
+            if customer_id:
+                self._contact_cache[ckey] = customer_id
         if not customer_id:
             # In Make an empty Customer ID fails the order create and oe2 drops the
             # bundle. Same net effect here: no order created, loud local error.
             self.mirror.error(oid, "contact", "contact resolution failed, order not created")
-            self.stats.errors += 1
+            self._bump("errors")
             log.error("Order %s NOT created: contact resolution failed", oid)
             return
+        self._finish_create(order, audit_row, customer_id, total)
 
+    def _finish_create(self, order, audit_row, customer_id, total):
+        oid = str(order.get("id"))
         # [M2] order create
         order_id = self.hs.create_order(order, customer_id, self.cfg.salla_timezone_default)
         if not order_id:  # [oe2 Ignore]
             self.mirror.error(oid, "order_create", "createAnOrder failed after retries")
-            self.stats.errors += 1
+            self._bump("errors")
             return
-        self.stats.created += 1
+        self._bump("created")
         log.info("CREATED order %s -> HubSpot %s (%s contact %s)", oid, order_id,
                  "existing" if total > 0 else "new", customer_id)
 
@@ -1193,7 +1304,7 @@ class Engine:
                 self.process_item(order, order_id, item)
             except Exception as e:
                 self.mirror.error(oid, f"item {item.get('id')}", e)
-                self.stats.errors += 1
+                self._bump("errors")
                 log.error("Item %s on order %s raised: %s", item.get("id"), oid, e)
 
     def process_item(self, order, order_id, item):
@@ -1240,7 +1351,7 @@ class Engine:
             if not li:
                 self.flag_partial(order_id, "Module 110: Create LI standalone", "create failed")
                 return
-            self.stats.li_standalone += 1
+            self._bump("li_standalone")
             self.hs.patch_line_item(li, {"hs_product_id": p_first.get("id", "")},
                                     "stamp product on LI")            # [M232]
             self.hs.associate("order", "line_items", order_id, li,
@@ -1255,7 +1366,7 @@ class Engine:
                           "revenue_attribution_method": "standalone_revenue"})
             li = self.hs.create_line_item(props, "LI needs_review")
             if li:
-                self.stats.li_needs_review += 1
+                self._bump("li_needs_review")
                 self.hs.associate("order", "line_items", order_id, li,
                                   ASSOC_ORDER_LI, "HUBSPOT_DEFINED", "assoc order LI")
             self.flag_partial(order_id, "Route 4: Needs Review",
@@ -1315,7 +1426,7 @@ class Engine:
         if not parent_li:
             self.flag_partial(order_id, "Module 123: Create LI bundle parent", "create failed")
             return
-        self.stats.li_bundle_parent += 1
+        self._bump("li_bundle_parent")
         self.hs.patch_line_item(parent_li, {"hs_product_id": p_first.get("id", "")},
                                 "stamp parent LI")                                 # [M233]
         self.hs.associate("order", "line_items", order_id, parent_li,
@@ -1350,7 +1461,7 @@ class Engine:
                 self.flag_partial(order_id, "Module 128: Create LI bundle component",
                                   "create failed")
                 continue
-            self.stats.li_component += 1
+            self._bump("li_component")
             self.hs.patch_line_item(comp_li,
                                     {"hs_product_id": cp.get("component_hubspot_product_id", "")},
                                     "stamp component LI")                          # [M234]
@@ -1407,7 +1518,7 @@ class Engine:
             self.flag_partial(order_id, "Module 152: Create LI (bundle parent, Salla)",
                               "create failed")
             return
-        self.stats.li_bundle_parent += 1
+        self._bump("li_bundle_parent")
         self.hs.patch_line_item(parent_li, {"hs_product_id": p_first.get("id", "")},
                                 "stamp parent LI salla")                           # [M235]
         self.hs.associate("order", "line_items", order_id, parent_li,
@@ -1441,7 +1552,7 @@ class Engine:
                 self.flag_partial(order_id, "Module 156: Create LI (bundle component, Salla)",
                                   "create failed")
                 continue
-            self.stats.li_component += 1
+            self._bump("li_component")
             self.hs.associate("order", "line_items", order_id, comp_li,
                               ASSOC_ORDER_LI, "HUBSPOT_DEFINED", "assoc order comp")   # [M157]
             self.hs.associate(OBJ_BUNDLE, "line_items", bundle_id, comp_li,
@@ -1449,9 +1560,22 @@ class Engine:
 
     # -- one order end to end ---------------------------------------------------
 
+    def _process_one(self, oid, order):
+        """v1.5: worker-lane wrapper. Owns the per-order error handling so a
+        lane failure is recorded exactly like the sequential loop did."""
+        try:
+            self.process_order(order)
+        except Exception as e:
+            self._bump("errors")
+            log.exception("Order %s failed: %s", oid, e)
+            try:
+                self.mirror.error(oid, "process", e)
+            except Exception as m:
+                log.error("mirror ledger write failed for %s: %s "
+                          "(failure is still counted and logged above)", oid, m)
+
     def process_order(self, order):
         oid = str(order.get("id"))
-        self._rates_report()  # v1.4
         log.info("ORDER begin %s ref %s items=%d", oid,
                  ifempty(order.get("reference_id"), oid),
                  len(order.get("items", []) or []))  # v1.2 observability, log only
@@ -1536,7 +1660,7 @@ class Engine:
             body = self.relay.get_path(path)                    # [M302]
             total_pages = int(dig(body, "pagination.totalPages", 0) or 0)
             ids = [str(o.get("id")) for o in body.get("data", []) or []]
-            self.stats.pages += 1
+            self._bump("pages")
             log.info("Slot reports totalPages=%s, page has %s order(s)", total_pages, len(ids))
             if total_pages > self.cfg.overflow_pages:
                 log.error("OVERFLOW: slot %s reports %s pages (limit %s). Sticky flag set.",
@@ -1547,30 +1671,54 @@ class Engine:
                 if self._should_stop():
                     break
                 if self.hs.dedup_order_exists(oid):
-                    self.stats.skipped_existing += 1
+                    self._bump("skipped_existing")
                     log.debug("skip existing %s", oid)
                 else:
                     new_ids.append(oid)
-            self.stats.scanned += len(ids)
+            self._bump("scanned", len(ids))
 
+            new_ids = list(dict.fromkeys(new_ids))  # guard: page must not repeat an id
             orders = self.relay.fetch_orders(new_ids) if new_ids else {}  # [M304]
-            for oid in new_ids:
-                if self._should_stop():
-                    break
-                if max_orders is not None and orders_done >= max_orders:
-                    break
-                order = orders.get(oid)
-                if not order:
-                    self.mirror.error(oid, "fetch", "full order missing from relay batch")
-                    self.stats.errors += 1
-                    continue
-                try:
-                    self.process_order(order)
-                except Exception as e:
-                    self.mirror.error(oid, "process", e)
-                    self.stats.errors += 1
-                    log.exception("Order %s failed: %s", oid, e)
-                orders_done += 1
+            # v1.5: fan the page out over worker lanes. Bounded window: at most
+            # `workers` orders in flight, submission is main-thread-only, and
+            # a stop request waits only for the in-flight set (the concurrent
+            # equivalent of "finishing current order, then stopping"). The
+            # pool context manager guarantees a full drain before the cursor
+            # is advanced or the summary printed.
+            feed = iter(new_ids)
+            pending = {}  # Future -> salla oid
+            with ThreadPoolExecutor(max_workers=self.workers,
+                                    thread_name_prefix="lane") as pool:
+                while True:
+                    while (len(pending) < self.workers and not self._should_stop()
+                           and (max_orders is None
+                                or orders_done + len(pending) < max_orders)):
+                        oid = next(feed, None)
+                        if oid is None:
+                            break
+                        order = orders.get(oid)
+                        if not order:
+                            self.mirror.error(oid, "fetch",
+                                              "full order missing from relay batch")
+                            self._bump("errors")
+                            continue
+                        pending[pool.submit(self._process_one, oid, order)] = oid
+                        self._in_flight = len(pending)
+                    if not pending:
+                        break  # stopped, capped, or page exhausted
+                    done, _ = wait(pending, return_when=FIRST_COMPLETED)
+                    for fut in done:
+                        oid = pending.pop(fut)
+                        try:
+                            fut.result()  # workers handle their own errors;
+                        except Exception as e:  # belt and braces
+                            self.mirror.error(oid, "process", e)
+                            self._bump("errors")
+                            log.exception("Order %s failed: %s", oid, e)
+                        orders_done += 1
+                    self._in_flight = len(pending)
+                    self._rates_report()
+            self._in_flight = 0
 
             hit_order_cap = max_orders is not None and orders_done >= max_orders
             if self._should_stop() or hit_order_cap:
@@ -1594,6 +1742,12 @@ class Engine:
         log.info("line items: standalone=%d bundle_parent=%d component=%d needs_review=%d",
                  s.li_standalone, s.li_bundle_parent, s.li_component, s.li_needs_review)
         log.info("errors=%d (see %s)", s.errors, self.mirror.errors)
+        if s.errors:
+            log.error("UNRECOVERED FAILURES: %d order(s) need attention -- "
+                      "review %s, fix the cause, then re-run the window "
+                      "(dedup skips completed work, so a rescan is free). "
+                      "Nothing was silently dropped: every failure above has "
+                      "a ledger row.", s.errors, self.mirror.errors)
         log.info("cursor: %s", json.dumps(self.cursor.data))
         log.info("=" * 68)
 
@@ -1603,7 +1757,10 @@ class Engine:
 # ----------------------------------------------------------------------------
 
 def setup_logging(verbose):
-    fmt = "%(asctime)s %(levelname)-7s %(message)s"
+    # v1.5: the [threadName] token identifies the worker lane; the dashboards
+    # and web UI attribute per-order phases by it (old logs without the token
+    # still parse).
+    fmt = "%(asctime)s %(levelname)-7s [%(threadName)s] %(message)s"
     logging.basicConfig(level=logging.DEBUG, format=fmt,
                         handlers=[logging.FileHandler("backfill.log", encoding="utf-8")])
     console = logging.StreamHandler(sys.stdout)
@@ -1622,12 +1779,16 @@ def main():
     ap.add_argument("--max-orders", type=int, default=None,
                     help="Stop after processing N new orders (test gate)")
     ap.add_argument("--max-pages", type=int, default=None)
+    ap.add_argument("--workers", type=int, default=None,
+                    help="Concurrent order lanes (default: config workers; "
+                         "3-4 is the useful range)")
     ap.add_argument("--no-google", action="store_true",
                     help="Skip Drive and Sheets writes even in live mode (local mirrors only)")
     ap.add_argument("--status", action="store_true", help="Print cursor state and exit")
     ap.add_argument("--verbose", action="store_true", help="DEBUG on console")
     args = ap.parse_args()
 
+    threading.current_thread().name = "main"  # v1.5: stable lane tag in logs
     setup_logging(args.verbose)
     # v1.2.1: googleapiclient/httplib2 defaults to no socket timeout; a stalled
     # Drive/Sheets socket would hang the engine forever. Global floor:
@@ -1656,7 +1817,8 @@ def main():
     mirror = LocalMirror("mirror")
     relay = RelayClient(cfg, secret)
     hs = HubSpot(cfg, token, live=args.live)
-    engine = Engine(cfg, cursor, relay, hs, gio, mirror, live=args.live)
+    engine = Engine(cfg, cursor, relay, hs, gio, mirror, live=args.live,
+                    workers=args.workers)
     engine.run(max_pages=args.max_pages, max_orders=args.max_orders)
 
 

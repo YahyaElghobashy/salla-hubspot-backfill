@@ -46,6 +46,27 @@ pre{background:var(--bg);border:1px solid var(--line);border-radius:10px;padding
 .dots{display:flex;gap:6px;margin-bottom:14px}
 .dots i{width:26px;height:6px;border-radius:99px;background:var(--line)} .dots i.done{background:var(--accent)}
 .maprow{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:6px;align-items:center}
+/* v1.5 dashboard */
+.lanes{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:10px;margin:12px 0 4px}
+.lane{background:var(--bg);border:1px solid var(--line);border-radius:10px;padding:10px 12px;position:relative;overflow:hidden}
+.lane.busy::after{content:"";position:absolute;inset:0;border-radius:10px;border:1px solid var(--accent);opacity:.35;animation:pulse 1.6s ease-in-out infinite;pointer-events:none}
+@keyframes pulse{0%,100%{opacity:.12}50%{opacity:.5}}
+.lane b{font-size:13px;display:block}
+.lane .ph{color:var(--accent);font-size:12px;font-weight:600;margin-top:2px;display:block}
+.lane .meta{color:var(--muted);font-size:11.5px;display:block;margin-top:2px}
+.lane.idle{opacity:.55}
+.pace{margin:10px 0 2px}
+.pace .prow{display:grid;grid-template-columns:88px 1fr 120px;gap:10px;align-items:center;margin:5px 0;font-size:12px}
+.pace .prow .nm{font-weight:600;color:var(--muted)}
+.pace .pbar{height:7px;background:var(--line);border-radius:99px;overflow:hidden}
+.pace .pbar>i{display:block;height:100%;background:var(--ok);border-radius:99px;transition:width .6s ease, background .6s ease}
+.pace .prow .val{text-align:right;font-family:ui-monospace,Menlo,monospace;color:var(--muted)}
+.sparkwrap{margin-top:10px}
+.sparkwrap svg{width:100%;height:56px;display:block}
+.sparkwrap .cap{font-size:11.5px;color:var(--muted);margin-top:2px}
+details.adv{border:1px solid var(--line);border-radius:10px;padding:10px 14px;margin-top:14px;background:var(--bg)}
+details.adv summary{cursor:pointer;font-weight:650;font-size:13px;color:var(--muted)}
+.adapt-note{font-size:12px;color:var(--accent);font-family:ui-monospace,Menlo,monospace;margin-top:6px}
 </style>
 </head>
 <body>
@@ -121,6 +142,20 @@ pre{background:var(--bg);border:1px solid var(--line);border-radius:10px;padding
       <div><label>Slot hours</label><input id="slotHours" type="number" value="3" min="1" max="24"></div>
       <div><label>Store timezone</label><input id="tz" value="Asia/Riyadh"></div>
     </div>
+    <details class="adv">
+      <summary>Advanced — concurrency & adaptive pacing (safe defaults)</summary>
+      <div class="row">
+        <div><label>Worker lanes</label><input id="cfgWorkers" type="number" value="3" min="1" max="8"></div>
+        <div><label>Adaptive pacing</label><select id="cfgAdaptive"><option value="true">On — AIMD toward the ceilings</option><option value="false">Off — pin the starting rates</option></select></div>
+        <div><label>Target utilization (of documented limits)</label><input id="cfgUtil" type="number" value="0.92" min="0.5" max="0.95" step="0.01"></div>
+      </div>
+      <div class="row">
+        <div><label>HubSpot search limit /s (account-wide!)</label><input id="cfgHsSearch" type="number" value="5.0" step="0.1"></div>
+        <div><label>HubSpot burst limit /10s (per app)</label><input id="cfgHsGeneral" type="number" value="190"></div>
+        <div><label>Sheets write limit /min/user</label><input id="cfgSheets" type="number" value="60"></div>
+      </div>
+      <p class="hint">Lanes share the pacing globally, so N lanes never exceed one lane's budget. If other integrations search the same portal, lower the search limit to your fair share of the 5/s account pool.</p>
+    </details>
     <button class="btn" onclick="saveConfig()">Save configuration</button>
     <div class="status" id="s4"></div>
   </div>
@@ -134,8 +169,10 @@ pre{background:var(--bg);border:1px solid var(--line);border-radius:10px;padding
     <div class="row">
       <div><label>Mode</label><select id="runMode"><option value="dry">Dry run (no writes)</option><option value="live">LIVE (writes to HubSpot)</option></select></div>
       <div><label>Max orders (blank = all)</label><input id="maxOrders" type="number" min="1" placeholder="e.g. 2 for a test gate"></div>
+      <div><label>Worker lanes</label><input id="runWorkers" type="number" min="1" max="8" placeholder="config default"></div>
       <div><label>Type RUN to arm live mode</label><input id="confirmRun" placeholder="RUN"></div>
     </div>
+    <p class="hint">Lanes process different orders concurrently while sharing the same global rate pacing. 3–4 is the useful range — beyond that the account-wide HubSpot search ceiling is the wall and extra lanes add only 429 risk.</p>
     <button class="btn" onclick="startRun()">Start</button>
     <button class="btn danger" onclick="stopRun()">Graceful stop</button>
     <div class="status" id="runStatus"></div>
@@ -160,8 +197,26 @@ pre{background:var(--bg);border:1px solid var(--line);border-radius:10px;padding
       <div class="stat"><b id="cErrors">0</b><span>errors (log lines)</span></div>
       <div class="stat"><b id="cRate">0</b><span>orders / hour</span></div>
     </div>
-    <p class="hint" id="dashRates" style="font-family:ui-monospace,monospace"></p>
+  </div>
+
+  <div class="card">
+    <h2>Worker lanes <span class="muted" id="laneCount" style="font-size:12px;font-weight:500"></span></h2>
+    <div class="lanes" id="laneGrid"><div class="lane idle"><b>waiting for engine…</b></div></div>
     <div class="status" id="curOrder"></div>
+  </div>
+
+  <div class="card">
+    <h2>Adaptive pacing <span class="muted" style="font-size:12px;font-weight:500">current vs 90–95% ceiling</span></h2>
+    <div class="pace" id="paceArea"><p class="hint">waiting for the first RATES snapshot…</p></div>
+    <div class="adapt-note" id="adaptNote"></div>
+  </div>
+
+  <div class="card">
+    <h2>Throughput <span class="muted" id="sparkCap2" style="font-size:12px;font-weight:500"></span></h2>
+    <div class="sparkwrap">
+      <svg id="spark" viewBox="0 0 400 56" preserveAspectRatio="none"></svg>
+      <div class="cap" id="sparkCap">orders per minute, last 40 minutes</div>
+    </div>
     <ul class="feed" id="feed"></ul>
   </div>
 </section>
@@ -202,6 +257,12 @@ async function refreshState(){
     $("relayUrl").value=c.relay_url||"";$("sheetId").value=c.spreadsheet_id||"";$("driveId").value=c.drive_folder_id||"";
     $("googleEnabled").value=String(!!c.google_enabled);$("bundlesEnabled").value=String(!!c.bundles_enabled);
     $("slotHours").value=c.slot_hours||3;$("tz").value=c.salla_timezone_default||"Asia/Riyadh";
+    if(c.workers)$("cfgWorkers").value=c.workers;
+    if(c.adaptive_enabled!==undefined)$("cfgAdaptive").value=String(!!c.adaptive_enabled);
+    if(c.adaptive_target_util)$("cfgUtil").value=c.adaptive_target_util;
+    if(c.hs_search_limit_per_s)$("cfgHsSearch").value=c.hs_search_limit_per_s;
+    if(c.hs_general_limit_per_10s)$("cfgHsGeneral").value=c.hs_general_limit_per_10s;
+    if(c.sheets_limit_per_min)$("cfgSheets").value=c.sheets_limit_per_min;
   }
   $("s2").innerHTML=`credentials.json: <b class="${s.google_credentials_present?'ok':'warn'}">${s.google_credentials_present?'present':'not found'}</b> · token cache: <b>${s.google_token_cached?'present':'—'}</b>`;
   return s;
@@ -263,6 +324,13 @@ async function saveConfig(){
     drive_folder_id:$("driveId").value.trim(),held_notify_url:"",
     record_url_base:"",archive_dir:"archive",state_file:"cursor.json",
     hs_search_per_s:3.5,hs_general_per_s:10,sheets_per_min:50,
+    adaptive_enabled:$("cfgAdaptive").value==="true",
+    adaptive_target_util:+$("cfgUtil").value||0.92,
+    hs_search_limit_per_s:+$("cfgHsSearch").value||5.0,
+    hs_general_limit_per_10s:+$("cfgHsGeneral").value||190,
+    sheets_limit_per_min:+$("cfgSheets").value||60,
+    drive_start_per_min:40,drive_limit_per_min:120,relay_floor_interval_s:0.8,
+    workers:Math.min(8,Math.max(1,+$("cfgWorkers").value||3)),
     salla_timezone_default:$("tz").value.trim()||"Asia/Riyadh",
     bundles_enabled:$("bundlesEnabled").value==="true",
     default_pipeline_stage:($("defStage")||{}).value||"",
@@ -278,7 +346,8 @@ async function saveConfig(){
 }
 async function startRun(){
   const mode=$("runMode").value;
-  const r=await api("/api/run",{mode:mode,max_orders:$("maxOrders").value||null,confirm:$("confirmRun").value.trim()});
+  const r=await api("/api/run",{mode:mode,max_orders:$("maxOrders").value||null,
+    workers:$("runWorkers").value||null,confirm:$("confirmRun").value.trim()});
   $("runStatus").innerHTML=r.ok?'<span class="ok">✓ started — watch the Dashboard tab</span>':`<span class="bad">✗ ${r.error}</span>`;
 }
 async function stopRun(){
@@ -291,12 +360,51 @@ async function loadLogs(){
   $("logBox").scrollTop=$("logBox").scrollHeight;
 }
 // live stream
+function esc(x){return String(x).replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));}
+function renderLanes(d){
+  const max=d.lanes_max||((d.lanes||[]).length)||0;
+  $("laneCount").textContent=max?`${(d.lanes||[]).length} busy / ${max} configured`:"";
+  const busy=(d.lanes||[]).map(l=>`
+    <div class="lane busy">
+      <b>${esc(l.id)}</b>
+      <span class="ph">⟳ ${esc(l.phase)}</span>
+      <span class="meta">${esc(l.lane).replace("lane_","lane ")} · ref ${esc(l.ref)} · ${esc(l.items)} item(s) · ${l.age_s}s</span>
+    </div>`);
+  const idle=Math.max(0,max-(d.lanes||[]).length);
+  const idles=Array.from({length:idle},()=>'<div class="lane idle"><b>—</b><span class="ph">waiting for next order</span></div>');
+  $("laneGrid").innerHTML=busy.concat(idles).join("")||'<div class="lane idle"><b>engine idle</b></div>';
+}
+function renderPace(d){
+  const p=d.pacing||{};
+  if(!Object.keys(p).length){return;}
+  const rows=Object.entries(p).map(([k,v])=>{
+    const frac=v.ceil>0?Math.min(1,v.cur/v.ceil):0;
+    const col=frac<0.7?"var(--ok)":(frac<0.92?"var(--warn)":"var(--bad)");
+    return `<div class="prow"><span class="nm">${esc(k)}</span>
+      <span class="pbar"><i style="width:${Math.round(frac*100)}%;background:${col}"></i></span>
+      <span class="val">${v.cur.toFixed(2)} / ${v.ceil.toFixed(2)}${esc(v.unit)}</span></div>`;
+  });
+  if(d.relay_gap!=null)rows.push(`<div class="prow"><span class="nm">relay gap</span><span class="pbar"></span><span class="val">${d.relay_gap.toFixed(2)}s</span></div>`);
+  $("paceArea").innerHTML=rows.join("");
+  $("adaptNote").textContent=d.last_adapt||"";
+}
+function renderSpark(d){
+  const data=d.spark||[];
+  if(!data.length)return;
+  const peak=Math.max(1,...data);
+  const w=400,h=56,bw=w/data.length;
+  $("spark").innerHTML=data.map((v,i)=>{
+    const bh=Math.max(v?2:0,v/peak*(h-4));
+    return `<rect x="${(i*bw+1).toFixed(1)}" y="${(h-bh).toFixed(1)}" width="${(bw-2).toFixed(1)}" height="${bh.toFixed(1)}" rx="1.5" fill="var(--accent)" opacity="${0.35+0.65*(i/data.length)}"/>`;
+  }).join("");
+  $("sparkCap2").textContent=`peak ${peak}/min · now ${(d.rate_h/60).toFixed(1)}/min`;
+}
 const es=new EventSource("/api/stream");
 es.onmessage=ev=>{
   const d=JSON.parse(ev.data);
   $("engineChip").textContent=d.engine_running?(d.stale_s>90?"engine silent "+d.stale_s+"s":"engine running"):"engine idle";
   $("engineChip").className="chip "+(d.engine_running?(d.stale_s>90?"warn":"ok"):"warn");
-  $("dashPhase").textContent=d.engine_running?d.phase:"engine idle";
+  $("dashPhase").textContent=d.engine_running?(d.lanes&&d.lanes.length?`processing ${d.lanes.length} order(s)`:d.phase):"engine idle";
   $("dashSlot").textContent=`slot ${d.slot}   page ${d.page}/${d.page_total||"?"}`;
   const pct=d.page_orders?Math.round(100*d.page_done/d.page_orders):0;
   $("pageBar").style.width=pct+"%";
@@ -304,9 +412,9 @@ es.onmessage=ev=>{
   $("cCreated").textContent=d.counts.created||0;$("cHeld").textContent=d.counts.held||0;
   $("cSkipped").textContent=d.counts.skipped||0;$("cErrors").textContent=d.counts.errors||0;
   $("cRate").textContent=d.rate_h||0;
-  $("dashRates").textContent=d.rates?("adaptive pacing  "+d.rates):"";
-  $("curOrder").textContent=d.current?`order ${d.current.id} (ref ${d.current.ref}, ${d.current.items} items) — ${d.phase}`:(d.last_result||"");
-  $("feed").innerHTML=(d.recent||[]).map(r=>`<li>${r[0].slice(11)} ${r[1]} ${r[2]}</li>`).join("");
+  renderLanes(d);renderPace(d);renderSpark(d);
+  $("curOrder").textContent=d.last_result?("last: "+d.last_result):"";
+  $("feed").innerHTML=(d.recent||[]).map(r=>`<li>${esc(r[0].slice(11))} ${esc(r[1])} ${esc(r[2])}</li>`).join("");
 };
 refreshState();
 </script>
