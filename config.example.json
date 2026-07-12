@@ -50,5 +50,6 @@
     "bundle_order": null,
     "bundle_parent_li": null,
     "bundle_component_li": null
-  }
+  },
+  "workers": 3
 }

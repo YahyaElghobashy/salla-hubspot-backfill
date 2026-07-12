@@ -229,6 +229,8 @@ def create_app():
             cmd += ["--max-orders", str(int(body["max_orders"]))]
         if body.get("no_google"):
             cmd.append("--no-google")
+        if body.get("workers"):
+            cmd += ["--workers", str(int(body["workers"]))]
         logf = open(ROOT / "supervisor.out", "a")
         subprocess.Popen(cmd, stdout=logf, stderr=logf,
                          start_new_session=True)  # survives the web UI closing
@@ -263,16 +265,28 @@ def create_app():
                 now = time.time()
                 if now - last_emit >= 1.0:
                     last_emit = now
+                    lanes = st.lanes_list()
                     payload = {
                         "engine_running": engine_running(),
-                        "phase": st.phase, "slot": st.slot,
+                        # legacy fields (phase/current) mirror the busiest lane
+                        "phase": lanes[0]["phase"] if lanes else "idle",
+                        "slot": st.slot,
                         "page": st.page, "page_total": st.page_total,
                         "page_orders": st.page_orders, "page_done": st.page_done,
                         "counts": dict(st.counts), "rate_h": round(st.rate_h(), 1),
-                        "current": st.cur, "last_result": st.last_result,
+                        "current": ({"id": lanes[0]["id"], "ref": lanes[0]["ref"],
+                                     "items": lanes[0]["items"]} if lanes else None),
+                        "last_result": st.last_result,
                         "recent": list(st.recent)[:10],
                         "stale_s": int(now - st.last_line),
                         "rates": st.rates,
+                        "lanes": lanes,
+                        "lanes_max": st.lanes_max,
+                        "pacing": {k: {"cur": v[0], "ceil": v[1], "unit": v[2]}
+                                   for k, v in st.pacing.items()},
+                        "relay_gap": getattr(st, "relay_gap", None),
+                        "last_adapt": st.last_adapt,
+                        "spark": st.spark_counts(40),
                     }
                     yield f"data: {json.dumps(payload)}\n\n"
                 time.sleep(0.25)

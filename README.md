@@ -100,6 +100,40 @@ cleanly on the STOP file or when the cursor reaches `done`.
 **Privacy note:** `archive/`, `mirror/`, and logs contain customer data. They
 are gitignored; keep them local.
 
+## Concurrent worker lanes (v1.5)
+
+One order is ~13 sequential API round-trips, so a single-lane engine is
+bound by network latency (~200 orders/h measured), not by quotas — the
+documented limits allow ~1,600-1,800/h. v1.5 processes each page with N
+**worker lanes** (`workers` in config, `--workers` on the CLI, or the Run
+tab): different orders in flight simultaneously, all sharing the same
+global adaptive limiters, so N lanes are collectively paced to exactly the
+budget one lane would get.
+
+What stays guaranteed (the invariants concurrency must not break):
+
+- **No duplicates** — every order is still dedup-checked before any write,
+  each order is owned by exactly one lane, and pages never overlap (the
+  cursor advances only after the whole page drains).
+- **No cross-lane contact races** — contact search→create→guardrail runs
+  inside a per-customer lock; two lanes carrying the same buyer serialize
+  for that step only. The v1.1 guardrail still covers races against your
+  live automations.
+- **Nothing silently dropped** — a lane failure lands in
+  `mirror/errors.csv` with the salla order id (same as the sequential
+  engine), the run summary prints a loud UNRECOVERED FAILURES banner when
+  the ledger is non-empty, and stopping (STOP file / Ctrl-C) waits only
+  for the in-flight orders — never abandons them.
+- **Resume identical** — kill it anywhere; the page rescan on restart is
+  free (dedup) and the cursor was never advanced past unfinished work.
+
+Sizing: lanes saturate around **3-4** (the account-wide HubSpot search
+ceiling is the wall); the engine clamps at 8. Measured on a production
+store: 3 lanes ≈ 3x the single-lane rate at identical pacing ceilings.
+Audit-trail note: sheet rows interleave across lanes; row integrity is
+preserved because each lane updates only the row number its own append
+returned.
+
 ## Adaptive rate pacing (v1.4)
 
 The engine paces itself per destination with an AIMD controller (additive

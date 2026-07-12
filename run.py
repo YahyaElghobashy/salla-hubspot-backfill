@@ -94,6 +94,8 @@ def main():
     ap.add_argument("--max-orders", type=int, default=None)
     ap.add_argument("--max-pages", type=int, default=None)
     ap.add_argument("--no-google", action="store_true")
+    ap.add_argument("--workers", type=int, default=None,
+                    help="concurrent order lanes (default: config workers)")
     ap.add_argument("--max-restarts", type=int, default=50)
     ap.add_argument("--yes", action="store_true",
                     help="skip the interactive RUN confirmation (use from the web UI)")
@@ -123,6 +125,8 @@ def main():
         cmd += ["--max-pages", str(args.max_pages)]
     if args.no_google:
         cmd.append("--no-google")
+    if args.workers is not None:
+        cmd += ["--workers", str(args.workers)]
 
     with KeepAwake():
         for attempt in range(1, args.max_restarts + 1):

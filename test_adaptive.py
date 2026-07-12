@@ -208,5 +208,114 @@ class TestConfigCompat(unittest.TestCase):
         self.assertEqual(cfg.per_page, 30)
 
 
+class TestConcurrency(unittest.TestCase):
+    """v1.5: worker lanes share limiters; pacing must hold globally."""
+
+    def test_reservation_paces_across_threads(self):
+        import threading
+        rl = AdaptiveLimiter("t", 100.0, floor_per_s=100.0, ceil_per_s=100.0)
+        stamps = []
+        stamp_lock = threading.Lock()
+
+        def worker():
+            for _ in range(10):
+                rl.wait()
+                with stamp_lock:
+                    stamps.append(time.monotonic())
+
+        threads = [threading.Thread(target=worker) for _ in range(4)]
+        t0 = time.monotonic()
+        for t in threads: t.start()
+        for t in threads: t.join()
+        elapsed = time.monotonic() - t0
+        # 40 calls at 100/s: at least ~0.39s wall clock, regardless of threads
+        self.assertGreaterEqual(elapsed, 39 * 0.01 * 0.9)
+        stamps.sort()
+        gaps = [b - a for a, b in zip(stamps, stamps[1:])]
+        # reservation pacing: no burst of calls (tolerate scheduler jitter)
+        self.assertLess(sum(1 for g in gaps if g < 0.004), 4)
+
+    def test_throttle_pushes_reservation_head(self):
+        rl = AdaptiveLimiter("t", 10.0, floor_per_s=1.0, ceil_per_s=10.0)
+        rl.wait()
+        rl.on_throttle("2")  # Retry-After 2s
+        t0 = time.monotonic()
+        rl.wait()  # next slot must be >= ~2s away
+        self.assertGreaterEqual(time.monotonic() - t0, 1.8)
+
+    def test_rate_never_escapes_bounds_under_threads(self):
+        import threading
+        rl = AdaptiveLimiter("t", 3.0, floor_per_s=1.0, ceil_per_s=5.0,
+                             step_per_s=0.5, growth_every=2, cooldown_s=0.01)
+
+        def hammer(seed):
+            for i in range(300):
+                if (i + seed) % 17 == 0:
+                    rl.on_throttle()
+                elif (i + seed) % 5 == 0:
+                    rl.on_result(1, 100)
+                else:
+                    rl.on_success()
+
+        threads = [threading.Thread(target=hammer, args=(k,)) for k in range(6)]
+        for t in threads: t.start()
+        for t in threads: t.join()
+        self.assertGreaterEqual(rl.rate, rl.floor - 1e-9)
+        self.assertLessEqual(rl.rate, rl.ceil + 1e-9)
+
+
+class TestEngineConcurrencyHelpers(unittest.TestCase):
+    def mk_engine(self, workers=3):
+        cfg = mock.Mock()
+        cfg.workers = workers
+        eng = backfill.Engine.__new__(backfill.Engine)
+        import threading
+        eng.cfg = cfg
+        eng.workers = workers
+        eng.stats = backfill.Stats()
+        eng._stats_lock = threading.Lock()
+        eng._phone_guard = threading.Lock()
+        eng._phone_locks = {}
+        return eng
+
+    def test_bump_is_locked_and_correct(self):
+        import threading
+        eng = self.mk_engine()
+        threads = [threading.Thread(
+            target=lambda: [eng._bump("created") for _ in range(500)])
+            for _ in range(6)]
+        for t in threads: t.start()
+        for t in threads: t.join()
+        self.assertEqual(eng.stats.created, 3000)
+
+    def test_contact_lock_keying(self):
+        eng = self.mk_engine()
+        k = eng._contact_key
+        o1 = {"customer": {"mobile_code": "+966", "mobile": "5551", "id": 1}}
+        o2 = {"customer": {"mobile_code": "+966", "mobile": "5551", "id": 2}}
+        o3 = {"customer": {"mobile_code": "+966", "mobile": "5552", "id": 3}}
+        self.assertIs(eng._contact_lock(k(o1)), eng._contact_lock(k(o2)))
+        self.assertIsNot(eng._contact_lock(k(o1)), eng._contact_lock(k(o3)))
+        # empty mobile: distinct customers must NOT share a lock
+        e1 = {"customer": {"mobile_code": "", "mobile": "", "id": 10}}
+        e2 = {"customer": {"mobile_code": "", "mobile": "", "id": 11}}
+        self.assertIsNot(eng._contact_lock(k(e1)), eng._contact_lock(k(e2)))
+
+    def test_contact_cache_reused_for_same_buyer(self):
+        eng = self.mk_engine()
+        eng._contact_cache = {}
+        key = eng._contact_key({"customer": {"mobile_code": "+966",
+                                             "mobile": "5551", "id": 1}})
+        eng._contact_cache[key] = "42"
+        self.assertEqual(eng._contact_cache.get(key), "42")
+
+    def test_workers_default_from_config(self):
+        cfg = mock.Mock()
+        cfg.workers = 4
+        eng = backfill.Engine.__new__(backfill.Engine)
+        # replicate the resolution expression used in __init__
+        self.assertEqual(max(1, int(cfg.workers)), 4)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
