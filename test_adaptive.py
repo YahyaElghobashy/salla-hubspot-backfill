@@ -60,6 +60,15 @@ class TestAdaptiveLimiter(unittest.TestCase):
         rl.on_result(10, 100)  # 10% headroom < soft_floor 15%
         self.assertAlmostEqual(rl.rate, 3.5 * 0.75, places=6)
 
+    def test_soft_signal_never_shortens_hard_cooldown(self):
+        # Regression: a low-headroom response during a 429 cooldown must not
+        # overwrite (shorten) the longer freeze the throttle imposed.
+        rl = self.mk(cooldown_s=30.0)
+        rl.on_throttle()
+        hard_until = rl._cooldown_until
+        rl.on_result(1, 100)  # soft signal 1s later would set now+10 < hard_until
+        self.assertGreaterEqual(rl._cooldown_until, hard_until)
+
     def test_healthy_headroom_counts_as_success(self):
         rl = self.mk()
         for _ in range(5):
