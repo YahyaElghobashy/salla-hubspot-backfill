@@ -160,6 +160,7 @@ pre{background:var(--bg);border:1px solid var(--line);border-radius:10px;padding
       <div class="stat"><b id="cErrors">0</b><span>errors (log lines)</span></div>
       <div class="stat"><b id="cRate">0</b><span>orders / hour</span></div>
     </div>
+    <p class="hint" id="dashRates" style="font-family:ui-monospace,monospace"></p>
     <div class="status" id="curOrder"></div>
     <ul class="feed" id="feed"></ul>
   </div>
@@ -303,6 +304,7 @@ es.onmessage=ev=>{
   $("cCreated").textContent=d.counts.created||0;$("cHeld").textContent=d.counts.held||0;
   $("cSkipped").textContent=d.counts.skipped||0;$("cErrors").textContent=d.counts.errors||0;
   $("cRate").textContent=d.rate_h||0;
+  $("dashRates").textContent=d.rates?("adaptive pacing  "+d.rates):"";
   $("curOrder").textContent=d.current?`order ${d.current.id} (ref ${d.current.ref}, ${d.current.items} items) — ${d.phase}`:(d.last_result||"");
   $("feed").innerHTML=(d.recent||[]).map(r=>`<li>${r[0].slice(11)} ${r[1]} ${r[2]}</li>`).join("");
 };

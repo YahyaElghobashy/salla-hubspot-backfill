@@ -272,6 +272,7 @@ def create_app():
                         "current": st.cur, "last_result": st.last_result,
                         "recent": list(st.recent)[:10],
                         "stale_s": int(now - st.last_line),
+                        "rates": st.rates,
                     }
                     yield f"data: {json.dumps(payload)}\n\n"
                 time.sleep(0.25)

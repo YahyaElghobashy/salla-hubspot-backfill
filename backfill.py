@@ -127,18 +127,116 @@ def now_str():
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
-class RateLimiter:
-    """Simple min-interval limiter (thread free, script is sequential)."""
+class AdaptiveLimiter:
+    """v1.4: AIMD (additive-increase / multiplicative-decrease) min-interval
+    limiter. Thread free — the engine is sequential.
 
-    def __init__(self, per_second: float):
-        self.min_interval = 1.0 / per_second if per_second > 0 else 0.0
+    The rate starts at `start_per_s` and always stays within
+    [floor_per_s, ceil_per_s]. The ceiling is the documented provider limit
+    scaled by the configured target utilization (default 0.92, i.e. the
+    90-95%% band), so even fully "warmed up" the engine leaves headroom for
+    live automations sharing the same quota.
+
+    Feedback:
+      on_throttle(retry_after)  provider returned 429/quota-exceeded ->
+                                rate *= hard_decrease, growth frozen for
+                                `cooldown_s` (sized to the provider's window).
+      on_result(remaining, cap) provider bucket telemetry (HubSpot headers).
+                                Headroom below `soft_floor` means OTHER
+                                consumers are eating the shared bucket ->
+                                rate *= soft_decrease with a short cooldown.
+      on_success()              after `growth_every` consecutive successes
+                                outside a cooldown, rate += step_per_s.
+
+    With adaptive=False the rate is pinned at start_per_s (legacy behavior).
+    """
+
+    def __init__(self, name, start_per_s, floor_per_s=None, ceil_per_s=None,
+                 step_per_s=0.1, growth_every=25, cooldown_s=30.0,
+                 hard_decrease=0.5, soft_decrease=0.75, soft_floor=0.15,
+                 adaptive=True):
+        self.name = name
+        self.rate = max(start_per_s, 0.001)
+        ceil = ceil_per_s if ceil_per_s is not None else self.rate
+        floor = floor_per_s if floor_per_s is not None else self.rate
+        # Invariant: floor <= start <= ceil. A ceiling below the start caps the
+        # start; a floor above the start would defeat multiplicative decrease
+        # (and with floor > ceil even freeze the rate at the ceiling), so the
+        # floor is clamped to the effective start.
+        self.ceil = max(ceil, 0.001)
+        self.rate = min(self.rate, self.ceil)
+        self.floor = min(max(floor, 0.001), self.rate)
+        if not adaptive:
+            self.floor = self.ceil = self.rate
+        self.step = step_per_s
+        self.growth_every = max(1, growth_every)
+        self.cooldown_s = cooldown_s
+        self.hard_decrease = hard_decrease
+        self.soft_decrease = soft_decrease
+        self.soft_floor = soft_floor
+        self.adaptive = adaptive
         self._last = 0.0
+        self._successes = 0
+        self._cooldown_until = 0.0
+
+    @property
+    def min_interval(self):
+        return 1.0 / self.rate
 
     def wait(self):
         delta = time.monotonic() - self._last
         if delta < self.min_interval:
             time.sleep(self.min_interval - delta)
         self._last = time.monotonic()
+
+    def _set_rate(self, new_rate, reason):
+        new_rate = min(self.ceil, max(self.floor, new_rate))
+        if abs(new_rate - self.rate) < 1e-9:
+            return
+        log.info("ADAPT %s %.3f->%.3f/s (%s)", self.name, self.rate, new_rate, reason)
+        self.rate = new_rate
+
+    def on_throttle(self, retry_after=None):
+        """Provider throttled us (429 / RESOURCE_EXHAUSTED)."""
+        if not self.adaptive:
+            return
+        self._successes = 0
+        self._cooldown_until = time.monotonic() + self.cooldown_s
+        self._set_rate(self.rate * self.hard_decrease,
+                       f"throttled, retry_after={retry_after}")
+
+    def on_result(self, remaining, cap):
+        """Success WITH provider bucket telemetry (e.g. HubSpot rate headers)."""
+        if not self.adaptive:
+            return
+        if cap and cap > 0 and (remaining / cap) < self.soft_floor:
+            # The shared bucket is nearly drained by all consumers combined
+            # (this engine + live automations). Yield gently.
+            self._successes = 0
+            self._cooldown_until = time.monotonic() + min(10.0, self.cooldown_s)
+            self._set_rate(self.rate * self.soft_decrease,
+                           f"bucket low {remaining}/{cap}")
+            return
+        self.on_success()
+
+    def on_success(self):
+        if not self.adaptive or time.monotonic() < self._cooldown_until:
+            return
+        self._successes += 1
+        if self._successes >= self.growth_every:
+            self._successes = 0
+            self._set_rate(self.rate + self.step, "recovery")
+
+    def snapshot(self):
+        return f"{self.name}={self.rate:.2f}/s"
+
+
+# Backward-compatible alias: a plain fixed-rate limiter is an AdaptiveLimiter
+# with adaptation off.
+def RateLimiter(per_second):
+    if per_second <= 0:
+        per_second = 1e9  # effectively no pacing, matching the old behavior
+    return AdaptiveLimiter("fixed", per_second, adaptive=False)
 
 
 def http_request(method, url, headers=None, body=None, timeout=90):
@@ -155,10 +253,19 @@ def http_request(method, url, headers=None, body=None, timeout=90):
         return 0, {}, f"NETWORK_ERROR: {e}"
 
 
-def with_retries(fn, what, retries=5, retry_statuses=(429, 500, 502, 503, 504, 0)):
-    """Retry wrapper with exponential backoff and jitter. Honors Retry-After."""
+def with_retries(fn, what, retries=5, retry_statuses=(429, 500, 502, 503, 504, 0),
+                 feedback=None):
+    """Retry wrapper with exponential backoff and jitter. Honors Retry-After.
+    v1.4: `feedback(status, headers)` is invoked on EVERY attempt (including
+    throttled ones that this wrapper absorbs), so an AdaptiveLimiter learns
+    about 429s even when the call ultimately succeeds."""
     for attempt in range(1, retries + 1):
         status, headers, text = fn()
+        if feedback:
+            try:
+                feedback(status, headers)
+            except Exception as e:  # feedback must never break the request path
+                log.debug("rate feedback error: %s", e)
         if status not in retry_statuses:
             return status, headers, text
         wait = min(60.0, (2 ** attempt) + random.uniform(0, 1))
@@ -202,6 +309,20 @@ class Config:
     status_stage_map: dict = None
     object_type_ids: dict = None
     assoc_type_ids: dict = None
+
+    # v1.4 adaptive pacing. The *_per_s / *_per_min fields above become the
+    # STARTING rates; ceilings are documented provider limits scaled by
+    # adaptive_target_util (the 90-95% band). If other engines/integrations
+    # share your HubSpot account's 5/s search pool, lower
+    # hs_search_limit_per_s to your fair share of it.
+    adaptive_enabled: bool = True
+    adaptive_target_util: float = 0.92
+    hs_search_limit_per_s: float = 5.0        # HubSpot CRM search cap per ACCOUNT
+    hs_general_limit_per_10s: float = 190.0   # HubSpot private-app burst (Pro/Ent)
+    sheets_limit_per_min: float = 60.0        # Sheets API write requests /min/user
+    drive_start_per_min: float = 40.0
+    drive_limit_per_min: float = 120.0        # self-imposed; Drive quota is far higher
+    relay_floor_interval_s: float = 0.8       # fastest allowed relay call gap
 
     @staticmethod
     def load(path):
@@ -272,10 +393,19 @@ class RelayClient:
     def __init__(self, cfg: Config, secret: str):
         self.cfg = cfg
         self.secret = secret
-        self._gap = RateLimiter(1.0 / max(cfg.relay_min_interval_s, 0.05))
+        # v1.4: the relay gap adapts between relay_floor_interval_s (fast) and
+        # 4x the configured interval (slow). Transient relay responses (Make
+        # async ACK under queue pressure, HTTP failures) slow it down; sustained
+        # clean responses speed it back up.
+        base = 1.0 / max(cfg.relay_min_interval_s, 0.05)
+        self._gap = AdaptiveLimiter(
+            "relay", base,
+            floor_per_s=base / 4.0,
+            ceil_per_s=1.0 / max(cfg.relay_floor_interval_s, 0.05),
+            step_per_s=0.05, growth_every=8, cooldown_s=20.0,
+            adaptive=cfg.adaptive_enabled)
 
     def _call(self, payload, what):
-        self._gap.wait()
         body = json.dumps(payload)
 
         def go():
@@ -283,16 +413,32 @@ class RelayClient:
                                 headers={"Content-Type": "application/json"},
                                 body=body, timeout=180)
 
-        status, _, text = with_retries(go, what)
-        if status != 200:
-            raise RelayError(f"{what}: relay HTTP {status}: {text[:300]}")
-        try:
-            parsed = json.loads(text)
-        except json.JSONDecodeError:
-            raise RelayError(f"{what}: relay returned non JSON: {text[:300]}")
-        if not parsed.get("ok"):
-            raise RelayError(f"{what}: relay ok=false: {text[:300]}")
-        return parsed
+        # v1.3.1: Make sometimes ACKs the webhook asynchronously ("Accepted",
+        # plain text, HTTP 200) instead of running WebhookRespond synchronously,
+        # under queue pressure. That is transient: retry with backoff before
+        # giving up. Retries also cover HTTP-status failures via with_retries.
+        last = ""
+        for attempt in range(1, 7):
+            self._gap.wait()
+            status, _, text = with_retries(go, what)
+            if status != 200:
+                last = f"relay HTTP {status}: {text[:300]}"
+            else:
+                try:
+                    parsed = json.loads(text)
+                except json.JSONDecodeError:
+                    last = f"relay returned non JSON: {text[:200]}"
+                else:
+                    if parsed.get("ok"):
+                        self._gap.on_success()  # v1.4 adaptive feedback
+                        return parsed
+                    last = f"relay ok=false: {text[:300]}"
+            self._gap.on_throttle()  # v1.4: transient response -> widen the gap
+            wait = min(45.0, (2 ** attempt) + random.uniform(0, 1))
+            log.warning("%s transient relay response (attempt %d/6): %s; retry in %.1fs",
+                        what, attempt, last, wait)
+            time.sleep(wait)
+        raise RelayError(f"{what}: {last}")
 
     def get_path(self, path):
         """Single Salla GET, e.g. the slot list page. [M300/M302 equivalent]"""
@@ -332,11 +478,54 @@ class HubSpot:
         self.cfg = cfg
         self.token = token
         self.live = live
-        self.search_rl = RateLimiter(cfg.hs_search_per_s)
-        self.general_rl = RateLimiter(cfg.hs_general_per_s)
+        util = cfg.adaptive_target_util
+        # v1.4 adaptive pacing. Documented limits (developers.hubspot.com
+        # usage guidelines, verified 2026-07-12):
+        #   - CRM search: 5 req/s PER ACCOUNT (shared with every live
+        #     integration on the portal), and search responses carry NO rate
+        #     headers -- so the search limiter adapts on 429s alone.
+        #   - General API: 190 req/10s per private app (Pro/Enterprise);
+        #     responses carry X-HubSpot-RateLimit-Max/-Remaining for the
+        #     10s window, which the general limiter reads as a shared-bucket
+        #     headroom signal.
+        self.search_rl = AdaptiveLimiter(
+            "hs_search", cfg.hs_search_per_s,
+            floor_per_s=1.0,
+            ceil_per_s=cfg.hs_search_limit_per_s * util,
+            step_per_s=0.1, growth_every=25, cooldown_s=30.0,
+            adaptive=cfg.adaptive_enabled)
+        self.general_rl = AdaptiveLimiter(
+            "hs_general", cfg.hs_general_per_s,
+            floor_per_s=3.0,
+            ceil_per_s=cfg.hs_general_limit_per_10s / 10.0 * util,
+            step_per_s=0.5, growth_every=25, cooldown_s=15.0,
+            adaptive=cfg.adaptive_enabled)
+
+    def _rl_feedback(self, limiter, is_search):
+        """v1.4: translate HubSpot responses into limiter feedback."""
+        def cb(status, headers):
+            if status == 429:
+                h = {k.lower(): str(v) for k, v in (headers or {}).items()}
+                limiter.on_throttle(h.get("retry-after"))
+                return
+            if not status or status >= 300:
+                return  # 5xx/network: the retry layer handles it; not a rate signal
+            if is_search:
+                limiter.on_success()  # search responses have no rate headers
+                return
+            h = {k.lower(): str(v) for k, v in (headers or {}).items()}
+            try:
+                rem = int(h["x-hubspot-ratelimit-remaining"])
+                cap = int(h["x-hubspot-ratelimit-max"])
+            except (KeyError, ValueError):
+                limiter.on_success()
+                return
+            limiter.on_result(rem, cap)
+        return cb
 
     def _req(self, method, path, body=None, is_search=False, what=""):
-        (self.search_rl if is_search else self.general_rl).wait()
+        limiter = self.search_rl if is_search else self.general_rl
+        limiter.wait()
         url = self.cfg.hubspot_base + path
         headers = {"Authorization": f"Bearer {self.token}",
                    "Content-Type": "application/json"}
@@ -345,7 +534,8 @@ class HubSpot:
         def go():
             return http_request(method, url, headers=headers, body=payload)
 
-        status, hdrs, text = with_retries(go, what or f"HS {method} {path}")
+        status, hdrs, text = with_retries(go, what or f"HS {method} {path}",
+                                          feedback=self._rl_feedback(limiter, is_search))
         log.debug("HS %s %s -> %s %s", method, path, status, text[:400])
         try:
             data = json.loads(text) if text else {}
@@ -612,9 +802,54 @@ class GoogleIO:
         self.enabled = enabled
         self.sheets = None
         self.drive = None
-        self.rl = RateLimiter(cfg.sheets_per_min / 60.0)
+        util = cfg.adaptive_target_util
+        # v1.4 adaptive pacing. Documented quotas (verified 2026-07-12):
+        #   - Sheets API v4: 60 write requests/min/user (fixed ~60s refill
+        #     window, no Retry-After header) -> ceiling 0.92*60 = ~55/min,
+        #     65s cooldown after a 429 so the window can actually refill.
+        #   - Drive API v3 (unit model, May 2026): 325,000 units/min/user,
+        #     files.create = 50 units -> quota allows ~6,500 uploads/min.
+        #     The ceiling below is self-imposed; upload latency, not quota,
+        #     is Drive's real constraint. Drive no longer shares the Sheets
+        #     limiter (pre-v1.4 it needlessly did).
+        self.sheets_rl = AdaptiveLimiter(
+            "sheets", cfg.sheets_per_min / 60.0,
+            floor_per_s=20.0 / 60.0,
+            ceil_per_s=cfg.sheets_limit_per_min / 60.0 * util,
+            step_per_s=1.0 / 60.0, growth_every=20, cooldown_s=65.0,
+            adaptive=cfg.adaptive_enabled)
+        self.drive_rl = AdaptiveLimiter(
+            "drive", cfg.drive_start_per_min / 60.0,
+            floor_per_s=10.0 / 60.0,
+            ceil_per_s=cfg.drive_limit_per_min / 60.0,
+            step_per_s=5.0 / 60.0, growth_every=10, cooldown_s=65.0,
+            adaptive=cfg.adaptive_enabled)
         if enabled:
             self._auth()
+
+    def _gexec(self, request, what, limiter):
+        """v1.4: execute a googleapiclient request with quota-aware retries.
+        429s (and rate-flavored 403s) feed the AdaptiveLimiter and retry with
+        truncated exponential backoff per Google's documented recommendation;
+        anything else propagates to the caller's existing error semantics."""
+        from googleapiclient.errors import HttpError
+        for attempt in range(1, 5):
+            limiter.wait()
+            try:
+                out = request.execute()
+                limiter.on_success()
+                return out
+            except HttpError as e:
+                code = getattr(getattr(e, "resp", None), "status", None)
+                throttled = code == 429 or (
+                    code == 403 and "ratelimitexceeded" in str(e).lower())
+                if not throttled or attempt == 4:
+                    raise
+                limiter.on_throttle()
+                wait = min(64.0, (2 ** attempt) + random.uniform(0, 1))
+                log.warning("%s got %s (attempt %d/4), backing off %.1fs",
+                            what, code, attempt, wait)
+                time.sleep(wait)
 
     def _auth(self):
         from google.auth.transport.requests import Request
@@ -641,14 +876,13 @@ class GoogleIO:
             return ""
         log.debug("PHASE drive upload %s", filename)  # v1.2 observability
         from googleapiclient.http import MediaInMemoryUpload
-        self.rl.wait()
         try:
             media = MediaInMemoryUpload(json_text.encode("utf-8"),
                                         mimetype="application/json")
-            f = self.drive.files().create(
+            f = self._gexec(self.drive.files().create(
                 body={"name": filename, "parents": [self.cfg.drive_folder_id]},
                 media_body=media, fields="id, webViewLink",
-                supportsAllDrives=True).execute()
+                supportsAllDrives=True), "drive upload", self.drive_rl)
             return f.get("webViewLink", "")
         except Exception as e:  # [oe255] Ignore semantics: continue without link
             log.error("Drive upload failed for %s: %s", filename, e)
@@ -662,14 +896,13 @@ class GoogleIO:
         if not self.enabled:
             return -1
         log.debug("PHASE sheet append")  # v1.2 observability
-        self.rl.wait()
         try:
-            resp = self.sheets.values().append(
+            resp = self._gexec(self.sheets.values().append(
                 spreadsheetId=self.cfg.spreadsheet_id,
                 range=f"'{self.cfg.audit_tab}'!A:AE",
                 valueInputOption="USER_ENTERED",
                 insertDataOption="INSERT_ROWS",
-                body={"values": [row]}).execute()
+                body={"values": [row]}), "audit append", self.sheets_rl)
             rng = resp.get("updates", {}).get("updatedRange", "")
             m = re.search(r"![A-Z]+(\d+)", rng)
             return int(m.group(1)) if m else -1
@@ -681,12 +914,12 @@ class GoogleIO:
                 row = [""] * AUDIT_WIDTH
                 for idx, val in fb.items():
                     row[idx] = val
-                resp = self.sheets.values().append(
+                resp = self._gexec(self.sheets.values().append(
                     spreadsheetId=self.cfg.spreadsheet_id,
                     range=f"'{self.cfg.audit_tab}'!A:AE",
                     valueInputOption="USER_ENTERED",
                     insertDataOption="INSERT_ROWS",
-                    body={"values": [row]}).execute()
+                    body={"values": [row]}), "audit fallback append", self.sheets_rl)
                 rng = resp.get("updates", {}).get("updatedRange", "")
                 m = re.search(r"![A-Z]+(\d+)", rng)
                 return int(m.group(1)) if m else -1
@@ -715,11 +948,11 @@ class GoogleIO:
                    f"{col_letter(r[-1])}{row_number}")
             data.append({"range": rng,
                          "values": [[values_by_idx[i] for i in r]]})
-        self.rl.wait()
         try:
-            self.sheets.values().batchUpdate(
+            self._gexec(self.sheets.values().batchUpdate(
                 spreadsheetId=self.cfg.spreadsheet_id,
-                body={"valueInputOption": "USER_ENTERED", "data": data}).execute()
+                body={"valueInputOption": "USER_ENTERED", "data": data}),
+                f"audit update {what}", self.sheets_rl)
         except Exception as e:  # [oe240 Resume / oe244 Ignore]
             log.error("Audit update (%s) failed on row %s: %s", what, row_number, e)
 
@@ -730,14 +963,13 @@ class GoogleIO:
         row = [""] * 14
         for idx, val in values_by_idx.items():
             row[idx] = val
-        self.rl.wait()
         try:
-            self.sheets.values().append(
+            self._gexec(self.sheets.values().append(
                 spreadsheetId=self.cfg.spreadsheet_id,
                 range=f"'{self.cfg.queue_tab}'!A:N",
                 valueInputOption="USER_ENTERED",
                 insertDataOption="INSERT_ROWS",
-                body={"values": [row]}).execute()
+                body={"values": [row]}), "queue append", self.sheets_rl)
         except Exception as e:
             log.error("Queue Log append failed: %s", e)
 
@@ -804,7 +1036,19 @@ class Engine:
         self.live = live
         self.stats = Stats()
         self.stop = False
+        self._next_rate_report = 0.0  # v1.4
         signal.signal(signal.SIGINT, self._sigint)
+
+    def _rates_report(self):
+        """v1.4: periodic one-line snapshot of every adaptive rate."""
+        if time.monotonic() < self._next_rate_report:
+            return
+        self._next_rate_report = time.monotonic() + 60.0
+        log.info("RATES hs_search=%.2f/s hs_general=%.2f/s sheets=%.1f/min "
+                 "drive=%.1f/min relay_gap=%.2fs",
+                 self.hs.search_rl.rate, self.hs.general_rl.rate,
+                 self.gio.sheets_rl.rate * 60.0, self.gio.drive_rl.rate * 60.0,
+                 1.0 / self.relay._gap.rate)
 
     def _sigint(self, *_):
         log.warning("SIGINT received: finishing current order, then stopping")
@@ -1200,6 +1444,7 @@ class Engine:
 
     def process_order(self, order):
         oid = str(order.get("id"))
+        self._rates_report()  # v1.4
         log.info("ORDER begin %s ref %s items=%d", oid,
                  ifempty(order.get("reference_id"), oid),
                  len(order.get("items", []) or []))  # v1.2 observability, log only
@@ -1280,6 +1525,7 @@ class Engine:
                     f"&to_date={end.strftime('%Y-%m-%dT%H:%M:%S')}"
                     f"&per_page={self.cfg.per_page}&format=light&page={page}")
             log.info("PAGE slot %s -> %s page %s", start, end, page)
+            self._rates_report()  # v1.4
             body = self.relay.get_path(path)                    # [M302]
             total_pages = int(dig(body, "pagination.totalPages", 0) or 0)
             ids = [str(o.get("id")) for o in body.get("data", []) or []]

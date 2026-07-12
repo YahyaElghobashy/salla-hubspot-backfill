@@ -51,6 +51,7 @@ R_CREATED = re.compile(r"CREATED order (\S+) -> HubSpot (\S+) \((\w+) contact (\
 R_HELD = re.compile(r"HELD order (\S+)")
 R_SKIP = re.compile(r"skip existing (\S+)")
 R_SUMMARY = re.compile(r"RUN SUMMARY")
+R_RATES = re.compile(r"RATES (hs_search=\S+ hs_general=\S+ sheets=\S+ drive=\S+ relay_gap=\S+)")  # v1.4
 
 
 class State:
@@ -71,6 +72,7 @@ class State:
         self.recent = deque(maxlen=8)
         self.done_ts = deque(maxlen=150)
         self.last_result = ""
+        self.rates = ""            # v1.4 adaptive pacing snapshot
         self.spin_i = 0
 
     def feed(self, ts, level, msg):
@@ -123,6 +125,10 @@ class State:
             self.engine = "STOPPED (summary in backfill.log)"
             self.phase = "finished"
             self.cur = None
+            return
+        m = R_RATES.search(msg)
+        if m:
+            self.rates = m.group(1)
             return
         for rx, name in PHASES:
             if rx.search(msg):
@@ -192,6 +198,7 @@ class State:
             pagebar,
             Text(""),
             Text(cursor_line, style="dim"),
+            Text(f"pacing {self.rates}" if self.rates else "", style="dim cyan"),
         )
 
         if self.cur:
@@ -227,7 +234,7 @@ class State:
         root = Layout()
         root.split_column(
             Layout(Panel(head, border_style="cyan"), size=4),
-            Layout(name="mid", size=11),
+            Layout(name="mid", size=12),
             Layout(Panel(recent, title="recent", border_style="dim"), size=10),
         )
         root["mid"].split_row(

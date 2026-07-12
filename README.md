@@ -100,6 +100,32 @@ cleanly on the STOP file or when the cursor reaches `done`.
 **Privacy note:** `archive/`, `mirror/`, and logs contain customer data. They
 are gitignored; keep them local.
 
+## Adaptive rate pacing (v1.4)
+
+The engine paces itself per destination with an AIMD controller (additive
+increase, multiplicative decrease — the same family TCP uses), targeting
+**90–95% of each provider's documented limit** and never more:
+
+| Bucket | Documented limit | Default ceiling (×0.92) | Feedback signals |
+|---|---|---|---|
+| HubSpot search | 5 req/s **per account** | 4.6/s | 429s only (search responses carry no rate headers) |
+| HubSpot general | 190 req/10s per private app (Pro/Ent) | 17.5/s | 429s + `X-HubSpot-RateLimit-Max/-Remaining` (10s window) |
+| Sheets writes | 60 req/min/user (fixed ~60s window) | 55/min | 429s, 65s cooldown so the window refills |
+| Drive uploads | 325k units/min/user (create = 50 units) | 120/min (self-imposed) | 429/403 rate errors |
+| Make relay | webhook 300 req/10s; scenario latency dominates | gap ≥ `relay_floor_interval_s` | transient/async-ACK responses widen the gap |
+
+How it behaves: rates start at your configured `*_per_s` / `*_per_min`
+values, climb slowly after sustained clean streaks, halve immediately on a
+429 (then cool down before growing again), and yield gently when HubSpot's
+shared-bucket headers show other integrations draining the same pool. Every
+change is logged as an `ADAPT` line and a `RATES` snapshot appears about
+once a minute (both dashboards display it live).
+
+Sharing the portal with live automations? The 5/s search pool is
+account-wide — set `hs_search_limit_per_s` to your fair share of it (e.g.
+`3.0` if a live integration needs the rest). Set `adaptive_enabled: false`
+to pin every rate at its starting value (pre-v1.4 behavior).
+
 ## Verification tools
 
 - `tools/qa_spot_check.py N` — random-sample deep verification of created
