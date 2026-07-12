@@ -11,6 +11,8 @@ engine at ~2.3 credits per order (~94% cheaper) while keeping a complete audit
 trail. The engine has processed real stores end to end with per-slot
 reconciliation against Salla's own counts.
 
+![Live dashboard](docs/screenshots/dashboard.png)
+
 ## How it works
 
 ```
@@ -77,6 +79,81 @@ Prefer terminals? Everything works without the UI:
 (macOS `caffeinate` / Windows `SetThreadExecutionState` / Linux
 `systemd-inhibit`), relaunches the engine if it's killed abnormally, and stops
 cleanly on the STOP file or when the cursor reaches `done`.
+
+## The web UI, page by page
+
+Everything below runs locally (`python serve.py`), talks only to your own
+HubSpot portal, Make relay, and Google account, and never sends data
+anywhere else. The screenshots use synthetic demo data.
+
+### 1 · Setup — a five-step wizard that builds your config for you
+
+![Setup wizard](docs/screenshots/setup.png)
+
+**Purpose:** produce a valid `config.json` and `.env` without hand-editing
+files. The progress dots at the top track the five steps:
+
+1. **Credentials** — paste your HubSpot private-app token and relay secret.
+   Both are written only to a local `.env` (0600) and never echoed back to
+   the browser; the button live-tests the token and shows your portal id.
+2. **Salla relay** — paste the Make webhook URL; the test fetches your
+   store's order-status list through it, proving the whole relay path works
+   before any real run.
+3. **Google Sheets & Drive (optional)** — enable the live audit sheet and
+   JSON archive, or skip and rely on the always-on local CSV mirrors.
+4. **Pipeline mapping** — pulls your portal's order-pipeline stages and
+   your store's statuses, and lets you click the status→stage map together.
+   Unmapped statuses fall back to the default stage.
+5. **Backfill window & save** — the date range to sweep, plus an
+   **Advanced** panel for concurrency and adaptive pacing (worker lanes,
+   target utilization, per-provider limits — the safe defaults match the
+   documented quotas). Save validates the config through the engine's own
+   loader before you can run anything.
+
+### 2 · Run — guarded start/stop, never a foot-gun
+
+![Run control](docs/screenshots/run.png)
+
+**Purpose:** launch and stop the engine with the same guardrails the
+terminal path has. Dry run is the default and writes nothing — it prints a
+would-create plan per order. Live mode refuses to start until you type
+`RUN`. **Max orders** gives you cheap test gates (the recommended first
+flight: dry run of 2 → live run of 2 → verify in HubSpot → full run).
+**Worker lanes** controls concurrency for this run (3–4 is the useful
+range). **Graceful stop** finishes the in-flight orders, keeps the cursor
+safe, and makes resume free — it is never a kill.
+
+### 3 · Dashboard — watch every lane, limit, and order live
+
+![Live dashboard](docs/screenshots/dashboard.png)
+
+**Purpose:** a read-only live view of the run, streamed from the engine's
+log (the web layer never touches the APIs). From top to bottom:
+
+- **Header card** — current slot and page, page progress bar, and session
+  counters: created, held (catalog gate), dedup skipped, error log lines,
+  and the rolling orders/hour rate.
+- **Worker lanes** — one card per lane showing the order it is carrying,
+  the exact phase it is in (dedup search → contact → order → line items →
+  associations → Drive/Sheets), and how long it has been at it. Idle cards
+  mean the lane is waiting for the next order.
+- **Adaptive pacing** — per-provider bars of the current request rate
+  against its 90–95% ceiling. Green = cruising, amber = warming up, red =
+  riding the ceiling (that is the goal, not a problem). The line under the
+  bars is the latest ADAPT decision the engine made and why.
+- **Throughput** — orders per minute over the last 40 minutes, plus a
+  per-lane feed of the most recent completions.
+
+### 4 · Logs — the raw truth, and the ledger that must stay empty
+
+![Logs and failure ledger](docs/screenshots/logs.png)
+
+**Purpose:** the same `backfill.log` the terminal tools read, with the
+lane token visible on every line — and below it the **unrecovered-failure
+ledger** (`mirror/errors.csv`). The distinction matters: log-line "errors"
+can include incidents the engine already retried and recovered; anything
+in the ledger genuinely needs attention, and the engine ends a run with a
+loud banner if it is non-empty. `none 🎉` is the state you want.
 
 ## The Make relay (one-time, ~5 minutes)
 
