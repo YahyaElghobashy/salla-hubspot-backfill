@@ -213,7 +213,9 @@ class AdaptiveLimiter:
             # The shared bucket is nearly drained by all consumers combined
             # (this engine + live automations). Yield gently.
             self._successes = 0
-            self._cooldown_until = time.monotonic() + min(10.0, self.cooldown_s)
+            # extend, never shorten, an in-flight hard-throttle cooldown
+            self._cooldown_until = max(self._cooldown_until,
+                                       time.monotonic() + min(10.0, self.cooldown_s))
             self._set_rate(self.rate * self.soft_decrease,
                            f"bucket low {remaining}/{cap}")
             return
@@ -833,7 +835,10 @@ class GoogleIO:
         truncated exponential backoff per Google's documented recommendation;
         anything else propagates to the caller's existing error semantics."""
         from googleapiclient.errors import HttpError
-        for attempt in range(1, 5):
+        # 6 attempts: cumulative backoff (~2+4+8+16+32s) outlasts the Sheets
+        # fixed 60s quota window, so a write survives a window drained by
+        # other consumers of the same Google user.
+        for attempt in range(1, 7):
             limiter.wait()
             try:
                 out = request.execute()
@@ -843,11 +848,13 @@ class GoogleIO:
                 code = getattr(getattr(e, "resp", None), "status", None)
                 throttled = code == 429 or (
                     code == 403 and "ratelimitexceeded" in str(e).lower())
-                if not throttled or attempt == 4:
+                if not throttled:
                     raise
-                limiter.on_throttle()
+                limiter.on_throttle()  # the limiter learns even on the last attempt
+                if attempt == 6:
+                    raise
                 wait = min(64.0, (2 ** attempt) + random.uniform(0, 1))
-                log.warning("%s got %s (attempt %d/4), backing off %.1fs",
+                log.warning("%s got %s (attempt %d/6), backing off %.1fs",
                             what, code, attempt, wait)
                 time.sleep(wait)
 
