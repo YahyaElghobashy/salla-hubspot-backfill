@@ -28,6 +28,12 @@ from rich.text import Text
 LOG = Path("backfill.log")
 CURSOR = Path("cursor.json")
 SPIN = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+
+
+def _ts_epoch(ts):
+    """Log-line timestamp -> epoch. Using the LOG time (not parse time) keeps
+    throughput/rate math correct for both live tails and replayed logs."""
+    return time.mktime(time.strptime(ts, "%Y-%m-%d %H:%M:%S"))
 BLOCKS = " ▁▂▃▄▅▆▇█"
 
 LINE = re.compile(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}),\d+ (\w+)\s+"
@@ -119,7 +125,7 @@ class State:
         if m:
             self.counts["created"] += 1
             self.page_done += 1
-            self.done_ts.append(time.time())
+            self.done_ts.append(_ts_epoch(ts))
             self.last_result = f"✓ {m.group(1)} → HS {m.group(2)} ({m.group(3)} contact)"
             self.recent.appendleft((ts, "✓", f"{lane}  {m.group(1)} → HS {m.group(2)} ({m.group(3)} contact)"))
             self.lanes.pop(lane, None)
@@ -128,7 +134,7 @@ class State:
         if m:
             self.counts["held"] += 1
             self.page_done += 1
-            self.done_ts.append(time.time())
+            self.done_ts.append(_ts_epoch(ts))
             self.last_result = f"◼ {m.group(1)} HELD (catalog)"
             self.recent.appendleft((ts, "◼", f"{lane}  HELD {m.group(1)} — unverified item"))
             self.lanes.pop(lane, None)

@@ -58,8 +58,176 @@ def hs_get(path, token):
         return json.loads(r.read())
 
 
+class LogHistory:
+    """v1.6: incremental parser over backfill.log. Extracts every completed
+    run (RUN SUMMARY blocks) and a rolling window of human-readable events.
+    Tolerates both log formats (with/without the [lane] token) and log files
+    in the hundreds of MB: the file is scanned once, then only appended bytes
+    are read on subsequent calls."""
+
+    R_LINE = re.compile(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}),\d+ (\w+)\s+"
+                        r"(?:\[([\w-]+)\] )?(.*)$")
+    R_SUM = re.compile(r"RUN SUMMARY\s+duration=([\d.]+) min\s+live=(\w+)")
+    R_COUNTS = re.compile(r"pages=(\d+) scanned=(\d+) skipped_existing=(\d+) "
+                          r"created=(\d+) held=(\d+)")
+    R_LI = re.compile(r"line items: standalone=(\d+) bundle_parent=(\d+) "
+                      r"component=(\d+) needs_review=(\d+)")
+    R_ERR = re.compile(r"errors=(\d+) \(see")
+    R_CURSOR = re.compile(r'cursor: ({.*})')
+    R_CREATED = re.compile(r"CREATED order (\S+) -> HubSpot (\S+) \((\w+) contact")
+    R_HELD = re.compile(r"HELD order (\S+) \((\d+) unverified")
+    R_SKIP = re.compile(r"skip existing (\S+)")
+    R_PAGE = re.compile(r"PAGE slot (\S+ \S+) -> \S+ (\S+) page (\d+)")
+    R_ADAPT = re.compile(r"ADAPT (\S+) ([\d.]+)->([\d.]+)/s \((.*)\)")
+    R_WORKERS = re.compile(r"lanes=\d+/(\d+)")
+
+    EVENT_CAP = 4000
+
+    def __init__(self, path):
+        self.path = path
+        self._offset = 0
+        self._runs = []
+        self._events = []
+        self._pending = None  # run summary being assembled
+        # lifetime line-counts: run summaries only exist for graceful exits,
+        # so the true all-time totals come from counting the lines themselves
+        self.total_created = 0
+        self.total_held = 0
+        self.first_ts = ""
+        self.last_ts = ""
+
+    def _push(self, ts, kind, text, raw=""):
+        self._events.append({"ts": ts, "kind": kind, "text": text, "raw": raw})
+        if len(self._events) > self.EVENT_CAP:
+            del self._events[: len(self._events) - self.EVENT_CAP]
+
+    def _feed(self, line):
+        m = self.R_LINE.match(line)
+        if not m:
+            return
+        ts, level, _lane, msg = m.groups()
+        lane = _lane or ""
+        if self._pending is not None:
+            c = self.R_COUNTS.search(msg)
+            if c:
+                self._pending.update(pages=int(c.group(1)), scanned=int(c.group(2)),
+                                     skipped=int(c.group(3)), created=int(c.group(4)),
+                                     held=int(c.group(5)))
+                return
+            li = self.R_LI.search(msg)
+            if li:
+                self._pending["line_items"] = dict(
+                    standalone=int(li.group(1)), bundle_parent=int(li.group(2)),
+                    component=int(li.group(3)), needs_review=int(li.group(4)))
+                return
+            e = self.R_ERR.search(msg)
+            if e:
+                self._pending["errors"] = int(e.group(1))
+                return
+            cu = self.R_CURSOR.search(msg)
+            if cu:
+                try:
+                    cur = json.loads(cu.group(1))
+                    self._pending["window_from"] = cur.get("from_date", "")
+                    self._pending["window_to"] = cur.get("to_date", "")
+                    self._pending["cursor_status"] = cur.get("status", "")
+                except json.JSONDecodeError:
+                    pass
+                r = self._pending
+                dur = max(r["duration_min"], 0.01)
+                r["rate_h"] = round((r["created"] + r["held"]) / dur * 60, 1)
+                self._runs.append(r)
+                self._push(r["end_ts"], "system",
+                           f"Run finished: {r['created']:,} created, {r['held']} held, "
+                           f"{r['errors']} errors in {r['duration_min']:.0f} min "
+                           f"({'live' if r['live'] else 'dry run'})")
+                self._pending = None
+                return
+            return
+        s = self.R_SUM.search(msg)
+        if s:
+            self._pending = {"end_ts": ts, "duration_min": float(s.group(1)),
+                             "live": s.group(2) == "True", "pages": 0, "scanned": 0,
+                             "skipped": 0, "created": 0, "held": 0, "errors": 0,
+                             "line_items": {}, "window_from": "", "window_to": "",
+                             "cursor_status": "", "workers": self._last_workers}
+            return
+        m2 = self.R_CREATED.search(msg)
+        if m2:
+            self.total_created += 1
+            if not self.first_ts:
+                self.first_ts = ts
+            self.last_ts = ts
+            self._push(ts, "created",
+                       f"Order {m2.group(1)} created in HubSpot ({m2.group(3)} contact)"
+                       + (f" — {lane.replace('_', ' ')}" if lane.startswith("lane") else ""),
+                       raw=line)
+            return
+        m2 = self.R_HELD.search(msg)
+        if m2:
+            self.total_held += 1
+            self._push(ts, "held",
+                       f"Order {m2.group(1)} held — {m2.group(2)} item(s) not yet "
+                       f"approved in the catalog", raw=line)
+            return
+        m2 = self.R_SKIP.search(msg)
+        if m2:
+            self._push(ts, "skip", f"Order {m2.group(1)} already in HubSpot — skipped "
+                       f"(deduplication)", raw=line)
+            return
+        m2 = self.R_PAGE.search(msg)
+        if m2:
+            self._push(ts, "system",
+                       f"Scanning slot {m2.group(1)} → {m2.group(2)[:5]}, "
+                       f"page {m2.group(3)}", raw=line)
+            return
+        m2 = self.R_ADAPT.search(msg)
+        if m2:
+            up = float(m2.group(3)) > float(m2.group(2))
+            self._push(ts, "pacing",
+                       f"Pacing {'increased' if up else 'reduced'}: {m2.group(1)} "
+                       f"{m2.group(2)}→{m2.group(3)}/s ({m2.group(4)})", raw=line)
+            return
+        w = self.R_WORKERS.search(msg)
+        if w:
+            self._last_workers = int(w.group(1))
+        if level == "ERROR":
+            self._push(ts, "error", msg[:180], raw=line)
+        elif level == "WARNING" and ("429" in msg or "STOP" in msg or "SIGINT" in msg
+                                     or "Halting" in msg):
+            self._push(ts, "system", msg[:180], raw=line)
+
+    _last_workers = 0
+
+    def _refresh(self):
+        if not self.path.exists():
+            return
+        size = self.path.stat().st_size
+        if size < self._offset:  # rotated/truncated: rescan
+            self._offset, self._runs, self._events, self._pending = 0, [], [], None
+            self.total_created = self.total_held = 0
+            self.first_ts = self.last_ts = ""
+        if size == self._offset:
+            return
+        with open(self.path, "r", encoding="utf-8", errors="replace") as f:
+            f.seek(self._offset)
+            for line in f:
+                if line.endswith("\n"):
+                    self._feed(line.rstrip("\n"))
+            self._offset = f.tell()
+
+    def get(self):
+        self._refresh()
+        return list(self._runs)
+
+    def events(self):
+        self._refresh()
+        return list(self._events)
+
+
 def create_app():
     app = Flask(__name__, static_folder=str(ROOT / "webui" / "static"))
+    history = LogHistory(LOG)
 
     @app.get("/")
     def index():
@@ -300,6 +468,45 @@ def create_app():
             return jsonify({"lines": []})
         lines = LOG.read_text(encoding="utf-8", errors="replace").splitlines()[-n:]
         return jsonify({"lines": lines})
+
+    # ---- run history + readable events (v1.6) -------------------------------
+
+    @app.get("/api/runs")
+    def runs():
+        """Every completed run parsed from backfill.log RUN SUMMARY blocks,
+        newest first, plus holistic totals across all history."""
+        hist = history.get()
+        totals = {
+            "runs": len(hist),
+            # lifetime truth = counted CREATED/HELD lines (covers sessions
+            # that never printed a summary and the currently running one)
+            "created": max(history.total_created, sum(r["created"] for r in hist)),
+            "held": max(history.total_held, sum(r["held"] for r in hist)),
+            "scanned": sum(r["scanned"] for r in hist),
+            "skipped": sum(r["skipped"] for r in hist),
+            "errors": sum(r["errors"] for r in hist),
+            "hours": round(sum(r["duration_min"] for r in hist) / 60.0, 1),
+            "best_rate_h": max((r["rate_h"] for r in hist), default=0),
+            "first_ts": history.first_ts, "last_ts": history.last_ts,
+        }
+        return jsonify({"runs": hist[::-1], "totals": totals})
+
+    @app.get("/api/events")
+    def events():
+        """Human-readable event feed from the recent log, filterable."""
+        kind = request.args.get("kind", "")     # created|held|skip|error|pacing|system
+        q = request.args.get("q", "").strip().lower()
+        limit = min(int(request.args.get("limit", 300)), 1000)
+        out = []
+        for ev in reversed(history.events()):
+            if kind and ev["kind"] != kind:
+                continue
+            if q and q not in ev["text"].lower() and q not in ev.get("raw", "").lower():
+                continue
+            out.append(ev)
+            if len(out) >= limit:
+                break
+        return jsonify({"events": out})
 
     @app.get("/api/errors")
     def errors():

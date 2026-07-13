@@ -5,68 +5,141 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Salla → HubSpot Backfill</title>
 <style>
+/* ============ Clara design language: quiet-luxury minimal ============
+   black/white editorial surfaces · sage green as the single positive
+   accent · blush tint for highlights · coral reserved for real errors */
 :root{
-  --bg:#f6f7f9; --panel:#ffffff; --text:#16181d; --muted:#6b7280; --line:#e5e7eb;
-  --accent:#4f46e5; --ok:#059669; --warn:#d97706; --bad:#dc2626; --chip:#eef0ff;
+  --bg:#fafafa; --panel:#ffffff; --text:#141414; --muted:#757272;
+  --line:#ebebeb; --line-soft:#f3f3f3;
+  --sage:#84bd9b; --sage-strong:#5ea380; --sage-soft:#e4f3e9;
+  --blush:#ffe5f2; --rose:#d789ad; --gold:#e2b13c; --gold-soft:#fdf6e3;
+  --bad:#f55157; --bad-soft:#fdecec;
+  --chip:#f5f2f4; --shadow:0 1px 2px rgba(0,0,0,.04), 0 8px 24px rgba(0,0,0,.05);
 }
 @media (prefers-color-scheme: dark){
-  :root{ --bg:#0e1013; --panel:#171a1f; --text:#e7e9ee; --muted:#9aa1ad; --line:#272b33;
-         --accent:#818cf8; --ok:#34d399; --warn:#fbbf24; --bad:#f87171; --chip:#23263a; }
+  :root{
+    --bg:#0f0f10; --panel:#1a1a1c; --text:#f2f2f2; --muted:#9a9aa0;
+    --line:#28282c; --line-soft:#222226;
+    --sage:#9ccfaf; --sage-strong:#84bd9b; --sage-soft:rgba(132,189,155,.14);
+    --blush:rgba(255,229,242,.10); --rose:#e8a8c8; --gold:#f5c142;
+    --gold-soft:rgba(245,193,66,.12);
+    --bad:#f55157; --bad-soft:rgba(245,81,87,.12);
+    --chip:#242427; --shadow:0 1px 2px rgba(0,0,0,.4), 0 8px 24px rgba(0,0,0,.25);
+  }
 }
-*{box-sizing:border-box} body{margin:0;font:14px/1.5 -apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;background:var(--bg);color:var(--text)}
-header{display:flex;align-items:center;gap:12px;padding:14px 20px;border-bottom:1px solid var(--line);background:var(--panel);position:sticky;top:0;z-index:5}
-header h1{font-size:16px;margin:0;font-weight:650}
-.chip{padding:2px 10px;border-radius:999px;font-size:12px;font-weight:600;background:var(--chip)}
-.chip.ok{color:var(--ok)} .chip.bad{color:var(--bad)} .chip.warn{color:var(--warn)}
-nav{display:flex;gap:4px;margin-left:auto}
-nav button{border:0;background:transparent;color:var(--muted);padding:8px 14px;border-radius:8px;cursor:pointer;font-weight:600}
-nav button.active{background:var(--chip);color:var(--text)}
-main{max-width:1060px;margin:0 auto;padding:20px}
-.card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:18px 20px;margin-bottom:16px}
-.card h2{margin:0 0 4px;font-size:15px} .card p.hint{margin:2px 0 12px;color:var(--muted);font-size:13px}
+*{box-sizing:border-box}
+body{margin:0;font:14px/1.55 -apple-system,"SF Pro Text","Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif;
+     background:var(--bg);color:var(--text);-webkit-font-smoothing:antialiased}
+header{display:flex;align-items:center;gap:14px;padding:14px 24px;border-bottom:1px solid var(--line);
+       background:color-mix(in srgb, var(--panel) 88%, transparent);backdrop-filter:blur(10px);
+       position:sticky;top:0;z-index:9}
+header h1{font-size:15px;margin:0;font-weight:650;letter-spacing:.01em}
+.chip{padding:3px 12px;border-radius:999px;font-size:12px;font-weight:600;background:var(--chip)}
+.chip.ok{background:var(--sage-soft);color:var(--sage-strong)}
+.chip.bad{background:var(--bad-soft);color:var(--bad)}
+.chip.warn{background:var(--gold-soft);color:var(--gold)}
+nav{display:flex;gap:2px;margin-left:auto;background:var(--chip);border-radius:10px;padding:3px}
+nav button{border:0;background:transparent;color:var(--muted);padding:7px 16px;border-radius:8px;
+           cursor:pointer;font-weight:600;font-size:13px;transition:all .15s}
+nav button.active{background:var(--panel);color:var(--text);box-shadow:var(--shadow)}
+main{max-width:1180px;margin:0 auto;padding:24px 20px 60px}
+.eyebrow{font-size:11px;font-weight:700;letter-spacing:.09em;text-transform:uppercase;color:var(--muted);margin:0 0 6px}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:16px;padding:20px 22px;
+      margin-bottom:16px;box-shadow:var(--shadow)}
+.card h2{margin:0 0 4px;font-size:15px;font-weight:650}
+.card p.hint{margin:2px 0 12px;color:var(--muted);font-size:13px}
 label{display:block;font-size:12px;font-weight:600;color:var(--muted);margin:10px 0 4px}
-input,select{width:100%;padding:8px 10px;border:1px solid var(--line);border-radius:8px;background:var(--bg);color:var(--text);font-size:14px}
-.row{display:flex;gap:12px;flex-wrap:wrap} .row>div{flex:1;min-width:180px}
-button.btn{background:var(--accent);color:#fff;border:0;border-radius:8px;padding:9px 16px;font-weight:650;cursor:pointer;margin-top:12px}
+input,select{width:100%;padding:9px 12px;border:1px solid var(--line);border-radius:10px;
+             background:var(--bg);color:var(--text);font-size:14px;transition:border-color .15s}
+input:focus,select:focus{outline:none;border-color:var(--sage)}
+.row{display:flex;gap:12px;flex-wrap:wrap}.row>div{flex:1;min-width:170px}
+button.btn{background:var(--text);color:var(--panel);border:0;border-radius:10px;padding:10px 18px;
+           font-weight:650;cursor:pointer;margin-top:12px;font-size:13.5px;transition:opacity .15s}
+button.btn:hover{opacity:.85}
+button.btn.primary{background:var(--sage-strong);color:#fff}
 button.btn.secondary{background:var(--chip);color:var(--text)}
-button.btn.danger{background:var(--bad)}
-button.btn:disabled{opacity:.5;cursor:default}
+button.btn.danger{background:var(--bad);color:#fff}
+button.btn:disabled{opacity:.4;cursor:default}
 .status{font-size:13px;margin-top:8px;white-space:pre-wrap}
-.ok{color:var(--ok)} .bad{color:var(--bad)} .warn{color:var(--warn)} .muted{color:var(--muted)}
-table{width:100%;border-collapse:collapse;font-size:13px} td,th{padding:6px 8px;border-bottom:1px solid var(--line);text-align:left}
-.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:10px;margin:10px 0}
-.stat{background:var(--bg);border:1px solid var(--line);border-radius:10px;padding:10px 12px}
-.stat b{display:block;font-size:20px} .stat span{font-size:12px;color:var(--muted)}
-.bar{height:8px;background:var(--line);border-radius:99px;overflow:hidden;margin:6px 0}
-.bar>i{display:block;height:100%;background:var(--accent)}
-pre{background:var(--bg);border:1px solid var(--line);border-radius:10px;padding:12px;overflow:auto;font-size:12px;max-height:420px}
-.feed{list-style:none;margin:8px 0 0;padding:0;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12.5px}
-.feed li{padding:3px 0;border-bottom:1px dashed var(--line)}
-.step{display:none}.step.active{display:block}
-.dots{display:flex;gap:6px;margin-bottom:14px}
-.dots i{width:26px;height:6px;border-radius:99px;background:var(--line)} .dots i.done{background:var(--accent)}
+.ok{color:var(--sage-strong)}.bad{color:var(--bad)}.warn{color:var(--gold)}.muted{color:var(--muted)}
+table{width:100%;border-collapse:collapse;font-size:13px}
+td,th{padding:8px 10px;border-bottom:1px solid var(--line-soft);text-align:left;font-variant-numeric:tabular-nums}
+th{font-size:11.5px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);cursor:pointer;user-select:none;white-space:nowrap}
+th.sorted::after{content:" ↓";color:var(--sage-strong)} th.sorted.asc::after{content:" ↑"}
+pre{background:var(--bg);border:1px solid var(--line);border-radius:12px;padding:12px;overflow:auto;
+    font-size:12px;max-height:420px;font-family:ui-monospace,Menlo,Consolas,monospace}
+.step{border:1px solid var(--line);border-radius:14px;margin-bottom:10px;background:var(--panel);overflow:hidden}
+.step>summary{display:flex;align-items:center;gap:10px;padding:14px 18px;cursor:pointer;font-weight:650;
+              font-size:14px;list-style:none}
+.step>summary::-webkit-details-marker{display:none}
+.step .dot{width:9px;height:9px;border-radius:99px;background:var(--line);flex-shrink:0}
+.step .dot.on{background:var(--sage)}
+.step .body{padding:2px 18px 16px}
 .maprow{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:6px;align-items:center}
-/* v1.5 dashboard */
-.lanes{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:10px;margin:12px 0 4px}
-.lane{background:var(--bg);border:1px solid var(--line);border-radius:10px;padding:10px 12px;position:relative;overflow:hidden}
-.lane.busy::after{content:"";position:absolute;inset:0;border-radius:10px;border:1px solid var(--accent);opacity:.35;animation:pulse 1.6s ease-in-out infinite;pointer-events:none}
-@keyframes pulse{0%,100%{opacity:.12}50%{opacity:.5}}
-.lane b{font-size:13px;display:block}
-.lane .ph{color:var(--accent);font-size:12px;font-weight:600;margin-top:2px;display:block}
+.controlgrid{display:grid;grid-template-columns:1fr 360px;gap:18px;align-items:start}
+@media(max-width:900px){.controlgrid{grid-template-columns:1fr}}
+.runcard{position:sticky;top:74px}
+.seg{display:flex;background:var(--chip);border-radius:10px;padding:3px;margin-top:4px}
+.seg button{flex:1;border:0;background:transparent;padding:8px;border-radius:8px;font-weight:650;
+            color:var(--muted);cursor:pointer;font-size:13px}
+.seg button.active{background:var(--panel);color:var(--text);box-shadow:var(--shadow)}
+.seg button.live.active{background:var(--sage-strong);color:#fff}
+.checklist{display:flex;gap:8px;flex-wrap:wrap;margin:2px 0 14px}
+.metric{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:14px 16px;box-shadow:var(--shadow)}
+.metric b{display:block;font-size:24px;font-weight:700;font-variant-numeric:tabular-nums;letter-spacing:-.01em}
+.metric span{font-size:12px;color:var(--muted)}
+.metric .sub{font-size:11.5px;color:var(--sage-strong);font-weight:600}
+.grid5{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px}
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+@media(max-width:900px){.grid2{grid-template-columns:1fr}}
+.lanes{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:10px;margin-top:10px}
+.lane{background:var(--bg);border:1px solid var(--line);border-radius:12px;padding:11px 13px;position:relative}
+.lane.busy{border-color:color-mix(in srgb, var(--sage) 55%, var(--line))}
+.lane.busy::before{content:"";position:absolute;top:12px;right:12px;width:7px;height:7px;border-radius:99px;
+                   background:var(--sage);animation:pulse 1.5s ease-in-out infinite}
+@keyframes pulse{0%,100%{opacity:.25}50%{opacity:1}}
+.lane b{font-size:13px;display:block;font-variant-numeric:tabular-nums}
+.lane .ph{color:var(--sage-strong);font-size:12px;font-weight:600;margin-top:2px;display:block}
 .lane .meta{color:var(--muted);font-size:11.5px;display:block;margin-top:2px}
-.lane.idle{opacity:.55}
-.pace{margin:10px 0 2px}
-.pace .prow{display:grid;grid-template-columns:88px 1fr 120px;gap:10px;align-items:center;margin:5px 0;font-size:12px}
-.pace .prow .nm{font-weight:600;color:var(--muted)}
-.pace .pbar{height:7px;background:var(--line);border-radius:99px;overflow:hidden}
-.pace .pbar>i{display:block;height:100%;background:var(--ok);border-radius:99px;transition:width .6s ease, background .6s ease}
-.pace .prow .val{text-align:right;font-family:ui-monospace,Menlo,monospace;color:var(--muted)}
-.sparkwrap{margin-top:10px}
-.sparkwrap svg{width:100%;height:56px;display:block}
-.sparkwrap .cap{font-size:11.5px;color:var(--muted);margin-top:2px}
-details.adv{border:1px solid var(--line);border-radius:10px;padding:10px 14px;margin-top:14px;background:var(--bg)}
-details.adv summary{cursor:pointer;font-weight:650;font-size:13px;color:var(--muted)}
-.adapt-note{font-size:12px;color:var(--accent);font-family:ui-monospace,Menlo,monospace;margin-top:6px}
+.lane.idle{opacity:.5}
+.pace .prow{display:grid;grid-template-columns:92px 1fr 130px;gap:12px;align-items:center;margin:7px 0;font-size:12.5px}
+.pace .nm{font-weight:600;color:var(--muted)}
+.pace .pbar{height:8px;background:var(--line-soft);border-radius:99px;overflow:hidden}
+.pace .pbar>i{display:block;height:100%;border-radius:99px;background:var(--sage);
+              transition:width .8s cubic-bezier(.4,0,.2,1), background .8s}
+.pace .val{text-align:right;font-family:ui-monospace,Menlo,monospace;color:var(--muted);font-size:11.5px}
+.fullutil{font-size:11px;font-weight:700;color:var(--sage-strong)}
+.chartwrap{position:relative;margin-top:8px}
+.chartwrap svg{width:100%;height:150px;display:block}
+.tooltip{position:absolute;pointer-events:none;background:var(--text);color:var(--panel);font-size:11.5px;
+         padding:5px 9px;border-radius:8px;transform:translate(-50%,-130%);white-space:nowrap;display:none;
+         font-variant-numeric:tabular-nums;z-index:3}
+.feed{list-style:none;margin:8px 0 0;padding:0;font-size:13px}
+.feed li{display:flex;gap:10px;padding:7px 4px;border-bottom:1px solid var(--line-soft);align-items:baseline}
+.feed .t{color:var(--muted);font-size:11.5px;font-variant-numeric:tabular-nums;flex-shrink:0}
+.evt-icon{width:22px;height:22px;border-radius:99px;display:inline-flex;align-items:center;justify-content:center;
+          font-size:11px;flex-shrink:0;transform:translateY(3px)}
+.evt-created{background:var(--sage-soft);color:var(--sage-strong)}
+.evt-held{background:var(--gold-soft);color:var(--gold)}
+.evt-skip{background:var(--chip);color:var(--muted)}
+.evt-error{background:var(--bad-soft);color:var(--bad)}
+.evt-pacing{background:var(--blush);color:var(--rose)}
+.evt-system{background:var(--chip);color:var(--muted)}
+.filters{display:flex;gap:6px;flex-wrap:wrap;margin:10px 0}
+.filters button{border:1px solid var(--line);background:var(--panel);border-radius:999px;padding:5px 13px;
+                font-size:12px;font-weight:600;color:var(--muted);cursor:pointer}
+.filters button.active{background:var(--text);color:var(--panel);border-color:var(--text)}
+.evrow{cursor:pointer}
+.evrow .raw{display:none;font-family:ui-monospace,Menlo,monospace;font-size:11px;color:var(--muted);
+            padding:6px 10px;background:var(--bg);border-radius:8px;margin-top:5px;word-break:break-all}
+.evrow.open .raw{display:block}
+.searchbar{display:flex;gap:8px;align-items:center}
+.searchbar input{max-width:260px}
+.pagebar{height:7px;background:var(--line-soft);border-radius:99px;overflow:hidden;margin:8px 0 4px}
+.pagebar>i{display:block;height:100%;background:var(--sage);border-radius:99px;transition:width .5s}
+.kv{display:flex;justify-content:space-between;font-size:13px;padding:4px 0}
+.kv span:first-child{color:var(--muted)}
+.kv span:last-child{font-variant-numeric:tabular-nums;font-weight:600}
 </style>
 </head>
 <body>
@@ -74,184 +147,286 @@ details.adv summary{cursor:pointer;font-weight:650;font-size:13px;color:var(--mu
   <h1>Salla → HubSpot Backfill</h1>
   <span id="engineChip" class="chip">…</span>
   <nav>
-    <button data-tab="setup" class="active">Setup</button>
-    <button data-tab="run">Run</button>
+    <button data-tab="control" class="active">Control</button>
     <button data-tab="dash">Dashboard</button>
-    <button data-tab="logs">Logs</button>
+    <button data-tab="activity">Activity</button>
   </nav>
 </header>
 <main>
 
-<!-- ============================ SETUP ============================ -->
-<section id="tab-setup">
-  <div class="dots" id="dots"></div>
+<!-- ============================ CONTROL (setup + run) ============================ -->
+<section id="tab-control">
+  <p class="eyebrow">Readiness</p>
+  <div class="checklist" id="checklist"></div>
 
-  <div class="card step active" data-step="0">
-    <h2>1 · Credentials</h2>
-    <p class="hint">The HubSpot private-app token needs CRM read/write scopes (contacts, orders/commerce, line items, custom objects). The relay secret is the random string inside your Make relay scenario's filters.</p>
-    <div class="row">
-      <div><label>HubSpot private app token</label><input id="hsToken" type="password" placeholder="pat-…  (leave blank to keep saved)"></div>
-      <div><label>Relay shared secret</label><input id="relaySecret" type="password" placeholder="leave blank to keep saved"></div>
+  <div class="controlgrid">
+    <div>
+      <p class="eyebrow">Setup</p>
+
+      <details class="step" open id="step0">
+        <summary><span class="dot" id="d0"></span>1 · Connect HubSpot &amp; relay secret</summary>
+        <div class="body">
+          <p class="hint">The HubSpot private-app token needs CRM read/write scopes (contacts, orders/commerce, line items, custom objects). Secrets are stored only in a local <code>.env</code> and never shown again.</p>
+          <div class="row">
+            <div><label>HubSpot private app token</label><input id="hsToken" type="password" placeholder="pat-…  (blank = keep saved)"></div>
+            <div><label>Relay shared secret</label><input id="relaySecret" type="password" placeholder="blank = keep saved"></div>
+          </div>
+          <button class="btn" onclick="saveSecrets()">Save &amp; test HubSpot</button>
+          <div class="status" id="s0"></div>
+        </div>
+      </details>
+
+      <details class="step" id="step1">
+        <summary><span class="dot" id="d1"></span>2 · Salla relay</summary>
+        <div class="body">
+          <p class="hint">Import <code>relay/relay_blueprint.template.json</code> into Make, select your Salla connection, turn it ON, paste the webhook URL. The test pulls your store's order-status list through it.</p>
+          <label>Relay webhook URL</label><input id="relayUrl" placeholder="https://hook.….make.com/…">
+          <button class="btn" onclick="testRelay()">Test relay</button>
+          <div class="status" id="s1"></div>
+        </div>
+      </details>
+
+      <details class="step" id="step2">
+        <summary><span class="dot" id="d2"></span>3 · Google Sheets &amp; Drive <span class="muted" style="font-weight:500">(optional)</span></summary>
+        <div class="body">
+          <p class="hint">Live audit rows and order-JSON archive. Skip it and the engine keeps complete local CSV mirrors instead. Needs <code>credentials.json</code> (OAuth desktop client) next to <code>serve.py</code>.</p>
+          <div class="row">
+            <div><label>Enable Google writes</label>
+              <select id="googleEnabled"><option value="false">No — local mirrors only</option><option value="true">Yes — Sheets + Drive</option></select></div>
+            <div><label>Spreadsheet ID</label><input id="sheetId" placeholder="only if enabled"></div>
+            <div><label>Drive folder ID</label><input id="driveId" placeholder="only if enabled"></div>
+          </div>
+          <div class="status" id="s2"></div>
+        </div>
+      </details>
+
+      <details class="step" id="step3">
+        <summary><span class="dot" id="d3"></span>4 · Pipeline mapping</summary>
+        <div class="body">
+          <p class="hint">Pick the order-pipeline stage used at creation, then map each Salla status to a stage. Unmapped statuses fall back to the default stage.</p>
+          <button class="btn secondary" onclick="loadMapping()">Load stages &amp; statuses</button>
+          <div id="mapArea"></div>
+          <label style="margin-top:14px">Bundles (custom objects)</label>
+          <select id="bundlesEnabled" onchange="bundleArea()">
+            <option value="false">Disabled — orders + line items only</option>
+            <option value="true">Enabled — bundle custom objects</option>
+          </select>
+          <div id="bundleArea"></div>
+          <div class="status" id="s3"></div>
+        </div>
+      </details>
+
+      <details class="step" id="step4">
+        <summary><span class="dot" id="d4"></span>5 · Window, pacing &amp; save</summary>
+        <div class="body">
+          <p class="hint">The engine sweeps this window in fixed slots, oldest first, and keeps its position in <code>cursor.json</code>. Stop and resume any time; deduplication makes rescans free.</p>
+          <div class="row">
+            <div><label>From (first order date)</label><input id="fromDate" type="datetime-local"></div>
+            <div><label>To (exclusive)</label><input id="toDate" type="date"></div>
+            <div><label>Slot hours</label><input id="slotHours" type="number" value="3" min="1" max="24"></div>
+            <div><label>Store timezone</label><input id="tz" value="Asia/Riyadh"></div>
+          </div>
+          <div class="row">
+            <div><label>Worker lanes</label><input id="cfgWorkers" type="number" value="3" min="1" max="8"></div>
+            <div><label>Adaptive pacing</label><select id="cfgAdaptive"><option value="true">On — AIMD toward ceilings</option><option value="false">Off — pin starting rates</option></select></div>
+            <div><label>Target utilization</label><input id="cfgUtil" type="number" value="0.92" min="0.5" max="0.95" step="0.01"></div>
+          </div>
+          <div class="row">
+            <div><label>HubSpot search limit /s (account-wide)</label><input id="cfgHsSearch" type="number" value="5.0" step="0.1"></div>
+            <div><label>HubSpot burst /10s (per app)</label><input id="cfgHsGeneral" type="number" value="190"></div>
+            <div><label>Sheets writes /min/user</label><input id="cfgSheets" type="number" value="60"></div>
+          </div>
+          <p class="hint">Lanes share pacing globally — N lanes never exceed one lane's budget. If other integrations search the same portal, lower the search limit to your fair share of the 5/s pool.</p>
+          <button class="btn" onclick="saveConfig()">Save configuration</button>
+          <div class="status" id="s4"></div>
+        </div>
+      </details>
     </div>
-    <button class="btn" onclick="saveSecrets()">Save & test HubSpot</button>
-    <div class="status" id="s0"></div>
-  </div>
 
-  <div class="card step" data-step="1">
-    <h2>2 · Salla relay</h2>
-    <p class="hint">Import <code>relay/relay_blueprint.template.json</code> into Make (replace the secret placeholder and select your Salla connection on both modules), turn it ON, and paste the webhook URL here. The test fetches your store's order-status list through it.</p>
-    <label>Relay webhook URL</label><input id="relayUrl" placeholder="https://hook.….make.com/…">
-    <button class="btn" onclick="testRelay()">Test relay</button>
-    <div class="status" id="s1"></div>
-  </div>
-
-  <div class="card step" data-step="2">
-    <h2>3 · Google Sheets & Drive (optional)</h2>
-    <p class="hint">Live audit rows and order-JSON archive. Skip it and the engine keeps complete local CSV mirrors instead. To enable: create an OAuth Desktop client in Google Cloud Console (Sheets + Drive APIs), download it as <code>credentials.json</code> next to <code>serve.py</code>.</p>
-    <div class="row">
-      <div><label>Enable Google writes</label>
-        <select id="googleEnabled"><option value="false">No — local mirrors only</option><option value="true">Yes — Sheets + Drive</option></select></div>
-      <div><label>Spreadsheet ID</label><input id="sheetId" placeholder="only if enabled"></div>
-      <div><label>Drive folder ID</label><input id="driveId" placeholder="only if enabled"></div>
-    </div>
-    <div class="status" id="s2"></div>
-    <button class="btn secondary" onclick="nextStep(3)">Continue</button>
-  </div>
-
-  <div class="card step" data-step="3">
-    <h2>4 · Pipeline mapping</h2>
-    <p class="hint">Pick the order pipeline stage used at creation, then map each Salla status to a stage (statuses come from your store via the relay test; stages from your portal). Unmapped statuses fall back to the default stage.</p>
-    <button class="btn secondary" onclick="loadMapping()">Load stages & statuses</button>
-    <div id="mapArea"></div>
-    <label style="margin-top:14px">Bundles (custom objects)</label>
-    <select id="bundlesEnabled" onchange="bundleArea()">
-      <option value="false">Disabled — orders + line items only</option>
-      <option value="true">Enabled — bundle template / bundle / component custom objects</option>
-    </select>
-    <div id="bundleArea"></div>
-    <div class="status" id="s3"></div>
-    <button class="btn secondary" onclick="nextStep(4)">Continue</button>
-  </div>
-
-  <div class="card step" data-step="4">
-    <h2>5 · Backfill window & save</h2>
-    <p class="hint">The engine sweeps this window in fixed slots, oldest first, and keeps its position in <code>cursor.json</code>. Stop and resume any time; deduplication makes rescans free.</p>
-    <div class="row">
-      <div><label>From (first order date)</label><input id="fromDate" type="datetime-local"></div>
-      <div><label>To (exclusive)</label><input id="toDate" type="date"></div>
-      <div><label>Slot hours</label><input id="slotHours" type="number" value="3" min="1" max="24"></div>
-      <div><label>Store timezone</label><input id="tz" value="Asia/Riyadh"></div>
-    </div>
-    <details class="adv">
-      <summary>Advanced — concurrency & adaptive pacing (safe defaults)</summary>
-      <div class="row">
-        <div><label>Worker lanes</label><input id="cfgWorkers" type="number" value="3" min="1" max="8"></div>
-        <div><label>Adaptive pacing</label><select id="cfgAdaptive"><option value="true">On — AIMD toward the ceilings</option><option value="false">Off — pin the starting rates</option></select></div>
-        <div><label>Target utilization (of documented limits)</label><input id="cfgUtil" type="number" value="0.92" min="0.5" max="0.95" step="0.01"></div>
+    <div class="runcard">
+      <p class="eyebrow">Run</p>
+      <div class="card">
+        <h2>Run control</h2>
+        <p class="hint">Dry run reads everything, writes nothing. Stop is always graceful — in-flight orders finish, the cursor stays safe, resume is free.</p>
+        <label>Mode</label>
+        <div class="seg" id="modeSeg">
+          <button class="active" data-mode="dry">Dry run</button>
+          <button class="live" data-mode="live">LIVE</button>
+        </div>
+        <div class="row">
+          <div><label>Max orders <span class="muted">(blank = all)</span></label><input id="maxOrders" type="number" min="1" placeholder="e.g. 2"></div>
+          <div><label>Worker lanes</label><input id="runWorkers" type="number" min="1" max="8" placeholder="config"></div>
+        </div>
+        <div id="confirmWrap" style="display:none">
+          <label>Type <b>RUN</b> to arm live mode</label>
+          <input id="confirmRun" placeholder="RUN" autocomplete="off">
+        </div>
+        <button class="btn primary" style="width:100%" onclick="startRun()">Start</button>
+        <button class="btn danger" style="width:100%" onclick="stopRun()">Graceful stop</button>
+        <div class="status" id="runStatus"></div>
       </div>
-      <div class="row">
-        <div><label>HubSpot search limit /s (account-wide!)</label><input id="cfgHsSearch" type="number" value="5.0" step="0.1"></div>
-        <div><label>HubSpot burst limit /10s (per app)</label><input id="cfgHsGeneral" type="number" value="190"></div>
-        <div><label>Sheets write limit /min/user</label><input id="cfgSheets" type="number" value="60"></div>
+      <div class="card">
+        <h2 style="font-size:13.5px">Recommended first flight</h2>
+        <p class="hint" style="margin-bottom:0">① Dry run, max 2 — read the plan in Activity. ② LIVE, max 2 — verify both orders in HubSpot. ③ LIVE, no cap. Mirrors the tested production rollout.</p>
       </div>
-      <p class="hint">Lanes share the pacing globally, so N lanes never exceed one lane's budget. If other integrations search the same portal, lower the search limit to your fair share of the 5/s account pool.</p>
-    </details>
-    <button class="btn" onclick="saveConfig()">Save configuration</button>
-    <div class="status" id="s4"></div>
-  </div>
-</section>
-
-<!-- ============================ RUN ============================ -->
-<section id="tab-run" style="display:none">
-  <div class="card">
-    <h2>Run control</h2>
-    <p class="hint">Dry run reads everything and writes nothing — it prints a would-create plan per order. Live runs sit behind the same RUN confirmation the terminal uses. Stop is always graceful: the engine finishes the current order, the cursor stays safe, resume is free.</p>
-    <div class="row">
-      <div><label>Mode</label><select id="runMode"><option value="dry">Dry run (no writes)</option><option value="live">LIVE (writes to HubSpot)</option></select></div>
-      <div><label>Max orders (blank = all)</label><input id="maxOrders" type="number" min="1" placeholder="e.g. 2 for a test gate"></div>
-      <div><label>Worker lanes</label><input id="runWorkers" type="number" min="1" max="8" placeholder="config default"></div>
-      <div><label>Type RUN to arm live mode</label><input id="confirmRun" placeholder="RUN"></div>
     </div>
-    <p class="hint">Lanes process different orders concurrently while sharing the same global rate pacing. 3–4 is the useful range — beyond that the account-wide HubSpot search ceiling is the wall and extra lanes add only 429 risk.</p>
-    <button class="btn" onclick="startRun()">Start</button>
-    <button class="btn danger" onclick="stopRun()">Graceful stop</button>
-    <div class="status" id="runStatus"></div>
-  </div>
-  <div class="card">
-    <h2>Recommended first flight</h2>
-    <p class="hint">1) Dry run with max orders 2 — review the plan in Logs. 2) Live with max orders 2 — verify both orders in HubSpot (name, stage, contact, line items). 3) Live, no cap. This mirrors the tested production rollout of this engine.</p>
   </div>
 </section>
 
 <!-- ============================ DASHBOARD ============================ -->
 <section id="tab-dash" style="display:none">
-  <div class="card">
-    <h2 id="dashPhase">idle</h2>
-    <p class="hint" id="dashSlot">–</p>
-    <div class="bar"><i id="pageBar" style="width:0%"></i></div>
-    <p class="hint" id="pageTxt">–</p>
-    <div class="grid">
-      <div class="stat"><b id="cCreated">0</b><span>created</span></div>
-      <div class="stat"><b id="cHeld">0</b><span>held</span></div>
-      <div class="stat"><b id="cSkipped">0</b><span>dedup skipped</span></div>
-      <div class="stat"><b id="cErrors">0</b><span>errors (log lines)</span></div>
-      <div class="stat"><b id="cRate">0</b><span>orders / hour</span></div>
+  <p class="eyebrow">All-time · every backfill run</p>
+  <div class="grid5" style="margin-bottom:18px">
+    <div class="metric"><b id="hCreated">–</b><span>orders created</span></div>
+    <div class="metric"><b id="hHeld">–</b><span>held for catalog</span></div>
+    <div class="metric"><b id="hRuns">–</b><span>runs · <span id="hHours">–</span>h engine time</span></div>
+    <div class="metric"><b id="hBest">–</b><span>best rate, orders/h</span></div>
+    <div class="metric"><b id="hErrors">–</b><span>error events (ledger may be 0)</span></div>
+  </div>
+
+  <div class="grid2">
+    <div class="card">
+      <p class="eyebrow">Current period</p>
+      <h2 id="winTitle">–</h2>
+      <div class="pagebar"><i id="winBar" style="width:0%"></i></div>
+      <div class="kv"><span>window</span><span id="winRange">–</span></div>
+      <div class="kv"><span>cursor position</span><span id="winCursor">–</span></div>
+      <div class="kv"><span>session created / held</span><span id="winCounts">–</span></div>
+      <div class="kv"><span>rate</span><span id="winRate">–</span></div>
+    </div>
+    <div class="card">
+      <p class="eyebrow">Current slot</p>
+      <h2 id="slotTitle">–</h2>
+      <div class="pagebar"><i id="pageBar" style="width:0%"></i></div>
+      <div class="kv"><span>page</span><span id="slotPage">–</span></div>
+      <div class="kv"><span>orders on page</span><span id="slotOrders">–</span></div>
+      <div class="kv"><span>dedup skipped (session)</span><span id="slotSkipped">–</span></div>
+      <div class="kv"><span>errors (session log lines)</span><span id="slotErrors">–</span></div>
     </div>
   </div>
 
   <div class="card">
-    <h2>Worker lanes <span class="muted" id="laneCount" style="font-size:12px;font-weight:500"></span></h2>
+    <p class="eyebrow">Worker lanes</p>
+    <h2 id="laneTitle">– <span class="muted" id="laneCount" style="font-size:12px;font-weight:500"></span></h2>
     <div class="lanes" id="laneGrid"><div class="lane idle"><b>waiting for engine…</b></div></div>
     <div class="status" id="curOrder"></div>
   </div>
 
-  <div class="card">
-    <h2>Adaptive pacing <span class="muted" style="font-size:12px;font-weight:500">current vs 90–95% ceiling</span></h2>
-    <div class="pace" id="paceArea"><p class="hint">waiting for the first RATES snapshot…</p></div>
-    <div class="adapt-note" id="adaptNote"></div>
+  <div class="grid2">
+    <div class="card">
+      <p class="eyebrow">Adaptive pacing</p>
+      <h2 style="font-size:13.5px">Request rate vs its 90–95% ceiling <span class="fullutil" id="utilBadge"></span></h2>
+      <div class="pace" id="paceArea"><p class="hint">waiting for the first pacing snapshot…</p></div>
+      <div class="status" id="adaptNote" style="font-family:ui-monospace,Menlo,monospace;font-size:12px;color:var(--rose)"></div>
+    </div>
+    <div class="card">
+      <p class="eyebrow">Throughput</p>
+      <h2 style="font-size:13.5px"><span id="tpNow">–</span> <span class="muted" style="font-weight:500;font-size:12px">orders/min now · peak <span id="tpPeak">–</span> · hover for detail</span></h2>
+      <div class="chartwrap">
+        <svg id="tpChart" viewBox="0 0 600 150" preserveAspectRatio="none"></svg>
+        <div class="tooltip" id="tpTip"></div>
+      </div>
+    </div>
   </div>
 
   <div class="card">
-    <h2>Throughput <span class="muted" id="sparkCap2" style="font-size:12px;font-weight:500"></span></h2>
-    <div class="sparkwrap">
-      <svg id="spark" viewBox="0 0 400 56" preserveAspectRatio="none"></svg>
-      <div class="cap" id="sparkCap">orders per minute, last 40 minutes</div>
-    </div>
+    <p class="eyebrow">Latest completions</p>
     <ul class="feed" id="feed"></ul>
   </div>
 </section>
 
-<!-- ============================ LOGS ============================ -->
-<section id="tab-logs" style="display:none">
+<!-- ============================ ACTIVITY ============================ -->
+<section id="tab-activity" style="display:none">
+  <div class="card" id="ledgerCard">
+    <p class="eyebrow">Unrecovered failures — the ledger that must stay empty</p>
+    <h2 id="ledgerTitle">–</h2>
+    <p class="hint">Log "error" events can include incidents the engine already retried and recovered. Anything here genuinely needs attention (<code>mirror/errors.csv</code>).</p>
+    <pre id="errBox" style="max-height:160px">–</pre>
+  </div>
+
   <div class="card">
-    <h2>backfill.log tail</h2>
-    <button class="btn secondary" onclick="loadLogs()">Refresh</button>
+    <p class="eyebrow">Run history · every backfill ever</p>
+    <h2>Runs <span class="muted" id="runsMeta" style="font-size:12px;font-weight:500"></span></h2>
+    <div style="overflow-x:auto">
+    <table id="runsTable">
+      <thead><tr>
+        <th data-k="end_ts" class="sorted">Ended</th><th data-k="window_from">Window</th>
+        <th data-k="live">Mode</th><th data-k="duration_min">Duration</th>
+        <th data-k="created">Created</th><th data-k="held">Held</th>
+        <th data-k="skipped">Skipped</th><th data-k="errors">Errors</th>
+        <th data-k="rate_h">Rate /h</th>
+      </tr></thead>
+      <tbody id="runsBody"></tbody>
+    </table>
+    </div>
+  </div>
+
+  <div class="card">
+    <p class="eyebrow">Live activity · human-readable</p>
+    <div class="searchbar">
+      <h2 style="margin:0">Events</h2>
+      <input id="evSearch" placeholder="search order id, text…" oninput="evDebounce()">
+      <button class="btn secondary" style="margin:0;padding:6px 12px" onclick="evOrder=evOrder==='desc'?'asc':'desc';renderEvents()">
+        <span id="evOrderLbl">newest first</span></button>
+    </div>
+    <div class="filters" id="evFilters">
+      <button class="active" data-kind="">All</button>
+      <button data-kind="created">Created</button>
+      <button data-kind="held">Held</button>
+      <button data-kind="skip">Skipped</button>
+      <button data-kind="error">Errors</button>
+      <button data-kind="pacing">Pacing</button>
+      <button data-kind="system">System</button>
+    </div>
+    <ul class="feed" id="evList"><li class="muted">loading…</li></ul>
+  </div>
+
+  <details class="card" style="padding:14px 22px">
+    <summary style="cursor:pointer;font-weight:650">Raw log tail (for debugging)</summary>
+    <button class="btn secondary" onclick="loadRaw()">Refresh</button>
     <pre id="logBox">–</pre>
-  </div>
-  <div class="card">
-    <h2>Unrecovered failures (mirror/errors.csv)</h2>
-    <p class="hint">The real failure ledger. Log-line "errors" above can include recovered incidents; anything here needs attention.</p>
-    <pre id="errBox">–</pre>
-  </div>
+  </details>
 </section>
 </main>
 
 <script>
 const $=id=>document.getElementById(id);
-const tabs=document.querySelectorAll("nav button");
-tabs.forEach(b=>b.onclick=()=>{tabs.forEach(x=>x.classList.remove("active"));b.classList.add("active");
-  ["setup","run","dash","logs"].forEach(t=>$("tab-"+t).style.display=(b.dataset.tab===t)?"":"none");
-  if(b.dataset.tab==="logs")loadLogs();});
-const STEPS=5;let statuses=[],stages=[];
-function dots(n){$("dots").innerHTML=Array.from({length:STEPS},(_,i)=>`<i class="${i<=n?'done':''}"></i>`).join("");}
-function nextStep(n){document.querySelectorAll(".step").forEach(s=>s.classList.toggle("active",+s.dataset.step===n));dots(n);}
-dots(0);
+const esc=x=>String(x).replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
 async function api(p,body){const r=await fetch(p,body?{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)}:{});return r.json();}
 
+/* ---- tabs ---- */
+const tabs=document.querySelectorAll("nav button");
+tabs.forEach(b=>b.onclick=()=>{tabs.forEach(x=>x.classList.remove("active"));b.classList.add("active");
+  ["control","dash","activity"].forEach(t=>$("tab-"+t).style.display=(b.dataset.tab===t)?"":"none");
+  if(b.dataset.tab==="activity"){loadRuns();loadEvents();loadLedger();}
+  if(b.dataset.tab==="dash"){loadRuns();}});
+
+/* ---- mode segment ---- */
+let runMode="dry";
+document.querySelectorAll("#modeSeg button").forEach(b=>b.onclick=()=>{
+  document.querySelectorAll("#modeSeg button").forEach(x=>x.classList.remove("active"));
+  b.classList.add("active");runMode=b.dataset.mode;
+  $("confirmWrap").style.display=runMode==="live"?"":"none";});
+
+/* ---- readiness checklist ---- */
+function chip(ok,labelOk,labelBad,warn){return `<span class="chip ${ok?'ok':(warn?'warn':'bad')}">${ok?'✓':(warn?'○':'✗')} ${ok?labelOk:labelBad}</span>`;}
+let statuses=[],stages=[];
 async function refreshState(){
   const s=await api("/api/state");
   $("engineChip").textContent=s.engine_running?"engine running":(s.stop_file?"stopped (STOP)":"engine idle");
   $("engineChip").className="chip "+(s.engine_running?"ok":"warn");
+  $("checklist").innerHTML=[
+    chip(s.secrets.hubspot_token,"HubSpot token saved","HubSpot token missing"),
+    chip(s.secrets.relay_secret,"relay secret saved","relay secret missing"),
+    chip(s.config_present&&s.config.relay_url,"relay URL configured","relay URL missing"),
+    chip(!s.config.google_enabled||s.google_credentials_present,"Google ready","credentials.json missing",!s.config.google_enabled),
+    chip(s.config_present,"config saved","config not saved yet"),
+    chip(!!(s.cursor&&s.cursor.from_date),"cursor: "+((s.cursor||{}).from_date||"")," no cursor yet",true),
+  ].join("");
+  ["d0","d1"].forEach((d,i)=>$(d).classList.toggle("on",[s.secrets.hubspot_token,!!s.config.relay_url][i]));
+  $("d2").classList.toggle("on",!s.config.google_enabled||s.google_credentials_present);
+  $("d3").classList.toggle("on",!!(s.config.default_pipeline_stage||Object.keys(s.config.status_stage_map||{}).length));
+  $("d4").classList.toggle("on",s.config_present);
   if(s.config_present&&s.config){
     const c=s.config;
     $("relayUrl").value=c.relay_url||"";$("sheetId").value=c.spreadsheet_id||"";$("driveId").value=c.drive_folder_id||"";
@@ -267,35 +442,37 @@ async function refreshState(){
   $("s2").innerHTML=`credentials.json: <b class="${s.google_credentials_present?'ok':'warn'}">${s.google_credentials_present?'present':'not found'}</b> · token cache: <b>${s.google_token_cached?'present':'—'}</b>`;
   return s;
 }
+
+/* ---- wizard actions (unchanged contracts) ---- */
 async function saveSecrets(){
   $("s0").textContent="saving…";
   await api("/api/secrets",{hubspot_token:$("hsToken").value,relay_secret:$("relaySecret").value});
   const t=await api("/api/test/hubspot",{});
-  $("s0").innerHTML=t.ok?`<span class="ok">✓ HubSpot OK — portal ${t.portal_id} (${t.ui_domain})</span>`:`<span class="bad">✗ ${t.error}</span>`;
-  if(t.ok){$("hsToken").value="";$("relaySecret").value="";nextStep(1);}
+  $("s0").innerHTML=t.ok?`<span class="ok">✓ HubSpot OK — portal ${t.portal_id} (${t.ui_domain})</span>`:`<span class="bad">✗ ${esc(t.error)}</span>`;
+  if(t.ok){$("hsToken").value="";$("relaySecret").value="";$("step1").open=true;refreshState();}
 }
 async function testRelay(){
   $("s1").textContent="testing… (first call can take ~10s)";
   const t=await api("/api/test/relay",{relay_url:$("relayUrl").value});
-  if(t.ok){statuses=t.statuses;$("s1").innerHTML=`<span class="ok">✓ Relay OK — store exposes ${t.statuses.length} order statuses</span>`;nextStep(2);}
-  else $("s1").innerHTML=`<span class="bad">✗ ${t.error}</span>`;
+  if(t.ok){statuses=t.statuses;$("s1").innerHTML=`<span class="ok">✓ Relay OK — store exposes ${t.statuses.length} order statuses</span>`;$("step2").open=true;refreshState();}
+  else $("s1").innerHTML=`<span class="bad">✗ ${esc(t.error)}</span>`;
 }
 async function loadMapping(){
   $("s3").textContent="loading…";
   const p=await api("/api/hubspot/pipelines");
-  if(!p.ok){$("s3").innerHTML=`<span class="bad">✗ ${p.error}</span>`;return;}
+  if(!p.ok){$("s3").innerHTML=`<span class="bad">✗ ${esc(p.error)}</span>`;return;}
   stages=p.pipelines.flatMap(pl=>pl.stages.map(s=>({...s,pipe:pl.label})));
-  const opts=stages.map(s=>`<option value="${s.id}">${s.pipe} · ${s.label}</option>`).join("");
+  const opts=stages.map(s=>`<option value="${s.id}">${esc(s.pipe)} · ${esc(s.label)}</option>`).join("");
   const slugs=[...new Set(statuses.map(s=>s.slug))];
   $("mapArea").innerHTML=`<label>Default creation stage</label><select id="defStage">${opts}</select>
     <label style="margin-top:10px">Status → stage map</label>`+
-    slugs.map(sl=>`<div class="maprow"><span><code>${sl}</code></span>
-      <select data-slug="${sl}"><option value="">(default stage)</option>${opts}</select></div>`).join("");
+    slugs.map(sl=>`<div class="maprow"><span><code>${esc(sl)}</code></span>
+      <select data-slug="${esc(sl)}"><option value="">(default stage)</option>${opts}</select></div>`).join("");
   $("s3").innerHTML=`<span class="ok">✓ ${stages.length} stages loaded, ${slugs.length} statuses from your store</span>`;
 }
 function bundleArea(){
   $("bundleArea").innerHTML=$("bundlesEnabled").value!=="true"?"":`
-    <p class="hint">Object type IDs (find them via <button class="btn secondary" style="margin:0;padding:2px 8px" onclick="listSchemas()">list custom objects</button>) and USER_DEFINED association type IDs from your portal.</p>
+    <p class="hint">Object type IDs (<button class="btn secondary" style="margin:0;padding:2px 8px" onclick="listSchemas()">list custom objects</button>) and USER_DEFINED association type IDs from your portal.</p>
     <div class="row">
       <div><label>Bundle template object</label><input id="objTpl" placeholder="2-…"></div>
       <div><label>Bundle object</label><input id="objBundle" placeholder="2-…"></div>
@@ -342,32 +519,96 @@ async function saveConfig(){
   if(!from||!to){$("s4").innerHTML='<span class="bad">set the window dates</span>';return;}
   const cursor={from_date:from.length===16?from+":00":from,to_date:to,next_page:1,total_pages:1,status:"running"};
   const r=await api("/api/config",{config:cfg,cursor:cursor,overwrite_cursor:true});
-  $("s4").innerHTML=r.valid?'<span class="ok">✓ Saved and validated. Go to the Run tab.</span>':`<span class="bad">✗ saved but invalid: ${r.validation_error}</span>`;
+  $("s4").innerHTML=r.valid?'<span class="ok">✓ Saved and validated — use the Run panel on the right.</span>':`<span class="bad">✗ saved but invalid: ${esc(r.validation_error)}</span>`;
+  refreshState();
 }
 async function startRun(){
-  const mode=$("runMode").value;
-  const r=await api("/api/run",{mode:mode,max_orders:$("maxOrders").value||null,
-    workers:$("runWorkers").value||null,confirm:$("confirmRun").value.trim()});
-  $("runStatus").innerHTML=r.ok?'<span class="ok">✓ started — watch the Dashboard tab</span>':`<span class="bad">✗ ${r.error}</span>`;
+  const r=await api("/api/run",{mode:runMode,max_orders:$("maxOrders").value||null,
+    workers:$("runWorkers").value||null,confirm:($("confirmRun")||{value:""}).value.trim()});
+  $("runStatus").innerHTML=r.ok?'<span class="ok">✓ started — watch the Dashboard tab</span>':`<span class="bad">✗ ${esc(r.error)}</span>`;
 }
 async function stopRun(){
   const r=await api("/api/stop",{});
-  $("runStatus").innerHTML=`<span class="warn">${r.note}</span>`;
+  $("runStatus").innerHTML=`<span class="warn">${esc(r.note)}</span>`;
 }
-async function loadLogs(){
-  const l=await api("/api/log?lines=200");$("logBox").textContent=l.lines.join("\n")||"(empty)";
-  const e=await api("/api/errors");$("errBox").textContent=e.rows.length?e.rows.join("\n"):"none 🎉";
+
+/* ---- run history (holistic) ---- */
+let runsCache=[],sortKey="end_ts",sortAsc=false;
+async function loadRuns(){
+  const r=await api("/api/runs");
+  runsCache=r.runs||[];
+  const t=r.totals||{};
+  $("hCreated").textContent=(t.created??0).toLocaleString();
+  $("hHeld").textContent=(t.held??0).toLocaleString();
+  $("hRuns").textContent=t.runs??0;$("hHours").textContent=t.hours??0;
+  $("hBest").textContent=(t.best_rate_h??0).toLocaleString();
+  $("hErrors").textContent=(t.errors??0).toLocaleString();
+  $("runsMeta").textContent=`${t.runs||0} completed · ${(t.created||0).toLocaleString()} orders lifetime`;
+  renderRuns();
+}
+function renderRuns(){
+  const rows=[...runsCache].sort((a,b)=>{
+    const va=a[sortKey],vb=b[sortKey];
+    return (va<vb?-1:va>vb?1:0)*(sortAsc?1:-1);});
+  $("runsBody").innerHTML=rows.map(r=>`<tr>
+    <td>${esc(r.end_ts)}</td>
+    <td>${esc((r.window_from||"").slice(0,10))} → ${esc(r.window_to||"")}</td>
+    <td>${r.live?'<span class="chip ok" style="padding:1px 9px">live</span>':'<span class="chip" style="padding:1px 9px">dry</span>'}</td>
+    <td>${r.duration_min>=90?(r.duration_min/60).toFixed(1)+" h":r.duration_min.toFixed(0)+" min"}</td>
+    <td><b>${r.created.toLocaleString()}</b></td><td>${r.held}</td>
+    <td>${r.skipped.toLocaleString()}</td>
+    <td>${r.errors?`<span class="bad">${r.errors}</span>`:"0"}</td>
+    <td>${r.rate_h.toLocaleString()}</td></tr>`).join("")
+    ||'<tr><td colspan="9" class="muted">no completed runs yet</td></tr>';
+  document.querySelectorAll("#runsTable th").forEach(th=>{
+    th.classList.toggle("sorted",th.dataset.k===sortKey);
+    th.classList.toggle("asc",th.dataset.k===sortKey&&sortAsc);});
+}
+document.querySelectorAll("#runsTable th").forEach(th=>th.onclick=()=>{
+  if(sortKey===th.dataset.k)sortAsc=!sortAsc;else{sortKey=th.dataset.k;sortAsc=false;}
+  renderRuns();});
+
+/* ---- events feed ---- */
+let evKind="",evOrder="desc",evTimer=null,evCache=[];
+document.querySelectorAll("#evFilters button").forEach(b=>b.onclick=()=>{
+  document.querySelectorAll("#evFilters button").forEach(x=>x.classList.remove("active"));
+  b.classList.add("active");evKind=b.dataset.kind;loadEvents();});
+function evDebounce(){clearTimeout(evTimer);evTimer=setTimeout(loadEvents,300);}
+async function loadEvents(){
+  const q=encodeURIComponent($("evSearch").value.trim());
+  const r=await api(`/api/events?kind=${evKind}&q=${q}&limit=300`);
+  evCache=r.events||[];renderEvents();
+}
+const EV_ICON={created:"✓",held:"◼",skip:"↷",error:"✗",pacing:"≈",system:"·"};
+function renderEvents(){
+  $("evOrderLbl").textContent=evOrder==="desc"?"newest first":"oldest first";
+  const evs=evOrder==="desc"?evCache:[...evCache].reverse();
+  $("evList").innerHTML=evs.map((e,i)=>`<li class="evrow" onclick="this.classList.toggle('open')">
+     <span class="t">${esc(e.ts.slice(5))}</span>
+     <span class="evt-icon evt-${esc(e.kind)}">${EV_ICON[e.kind]||"·"}</span>
+     <div style="flex:1">${esc(e.text)}${e.raw?`<div class="raw">${esc(e.raw)}</div>`:""}</div></li>`).join("")
+   ||'<li class="muted">nothing matches</li>';
+}
+async function loadLedger(){
+  const e=await api("/api/errors");
+  const n=(e.rows||[]).length;
+  $("ledgerTitle").innerHTML=n?`<span class="bad">${n} unrecovered failure(s)</span>`:'<span class="ok">Empty — every order accounted for ✓</span>';
+  $("errBox").textContent=n?e.rows.join("\n"):"none 🎉";
+}
+async function loadRaw(){
+  const l=await api("/api/log?lines=300");$("logBox").textContent=l.lines.join("\n")||"(empty)";
   $("logBox").scrollTop=$("logBox").scrollHeight;
 }
-// live stream
-function esc(x){return String(x).replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));}
+
+/* ---- dashboard live rendering ---- */
 function renderLanes(d){
   const max=d.lanes_max||((d.lanes||[]).length)||0;
+  $("laneTitle").firstChild.textContent=(d.lanes||[]).length?`${(d.lanes||[]).length} order(s) in flight `:"idle ";
   $("laneCount").textContent=max?`${(d.lanes||[]).length} busy / ${max} configured`:"";
   const busy=(d.lanes||[]).map(l=>`
     <div class="lane busy">
       <b>${esc(l.id)}</b>
-      <span class="ph">⟳ ${esc(l.phase)}</span>
+      <span class="ph">${esc(l.phase)}</span>
       <span class="meta">${esc(l.lane).replace("lane_","lane ")} · ref ${esc(l.ref)} · ${esc(l.items)} item(s) · ${l.age_s}s</span>
     </div>`);
   const idle=Math.max(0,max-(d.lanes||[]).length);
@@ -376,47 +617,120 @@ function renderLanes(d){
 }
 function renderPace(d){
   const p=d.pacing||{};
-  if(!Object.keys(p).length){return;}
-  const rows=Object.entries(p).map(([k,v])=>{
+  if(!Object.keys(p).length)return;
+  let atCeil=0,rows=Object.entries(p).map(([k,v])=>{
     const frac=v.ceil>0?Math.min(1,v.cur/v.ceil):0;
-    const col=frac<0.7?"var(--ok)":(frac<0.92?"var(--warn)":"var(--bad)");
+    if(frac>=0.97)atCeil++;
+    /* sage deepens as utilization rises — full bar = full utility = the goal */
+    const col=`color-mix(in srgb, var(--sage-strong) ${Math.round(40+60*frac)}%, var(--line))`;
     return `<div class="prow"><span class="nm">${esc(k)}</span>
       <span class="pbar"><i style="width:${Math.round(frac*100)}%;background:${col}"></i></span>
       <span class="val">${v.cur.toFixed(2)} / ${v.ceil.toFixed(2)}${esc(v.unit)}</span></div>`;
   });
   if(d.relay_gap!=null)rows.push(`<div class="prow"><span class="nm">relay gap</span><span class="pbar"></span><span class="val">${d.relay_gap.toFixed(2)}s</span></div>`);
   $("paceArea").innerHTML=rows.join("");
+  $("utilBadge").textContent=atCeil>=3?"✦ full utilization — exactly where we want to be":"";
   $("adaptNote").textContent=d.last_adapt||"";
 }
+/* line chart with hover */
+let sparkData=[],sparkTimes=[];
 function renderSpark(d){
   const data=d.spark||[];
   if(!data.length)return;
+  sparkData=data;
+  const now=Date.now();
+  sparkTimes=data.map((_,i)=>new Date(now-(data.length-1-i)*60000));
   const peak=Math.max(1,...data);
-  const w=400,h=56,bw=w/data.length;
-  $("spark").innerHTML=data.map((v,i)=>{
-    const bh=Math.max(v?2:0,v/peak*(h-4));
-    return `<rect x="${(i*bw+1).toFixed(1)}" y="${(h-bh).toFixed(1)}" width="${(bw-2).toFixed(1)}" height="${bh.toFixed(1)}" rx="1.5" fill="var(--accent)" opacity="${0.35+0.65*(i/data.length)}"/>`;
-  }).join("");
-  $("sparkCap2").textContent=`peak ${peak}/min · now ${(d.rate_h/60).toFixed(1)}/min`;
+  const W=600,H=150,P=6;
+  const x=i=>P+i*(W-2*P)/(data.length-1);
+  const y=v=>H-P-(v/peak)*(H-2*P-14);
+  const pts=data.map((v,i)=>`${x(i).toFixed(1)},${y(v).toFixed(1)}`);
+  const line=`M${pts.join(" L")}`;
+  const area=`${line} L${x(data.length-1).toFixed(1)},${H-P} L${x(0).toFixed(1)},${H-P} Z`;
+  $("tpChart").innerHTML=`
+    <defs><linearGradient id="tg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="var(--sage)" stop-opacity="0.35"/>
+      <stop offset="1" stop-color="var(--sage)" stop-opacity="0.02"/></linearGradient></defs>
+    <path d="${area}" fill="url(#tg)"/>
+    <path d="${line}" fill="none" stroke="var(--sage-strong)" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
+    <circle id="tpDot" r="4" fill="var(--sage-strong)" stroke="var(--panel)" stroke-width="2" style="display:none"/>`;
+  $("tpPeak").textContent=peak+"/min";
+  $("tpNow").textContent=(d.rate_h/60).toFixed(1);
 }
+const chartEl=$("tpChart");
+chartEl.addEventListener("mousemove",ev=>{
+  if(!sparkData.length)return;
+  const r=chartEl.getBoundingClientRect();
+  const i=Math.round((ev.clientX-r.left)/r.width*(sparkData.length-1));
+  const idx=Math.max(0,Math.min(sparkData.length-1,i));
+  const W=600,H=150,P=6,peak=Math.max(1,...sparkData);
+  const cx=P+idx*(W-2*P)/(sparkData.length-1);
+  const cy=H-P-(sparkData[idx]/peak)*(H-2*P-14);
+  const dot=$("tpDot");
+  if(dot){dot.setAttribute("cx",cx);dot.setAttribute("cy",cy);dot.style.display="";}
+  const tip=$("tpTip");
+  tip.style.display="block";
+  tip.style.left=(cx/W*r.width)+"px";
+  tip.style.top=(cy/H*r.height)+"px";
+  const t=sparkTimes[idx];
+  tip.textContent=`${t.getHours().toString().padStart(2,"0")}:${t.getMinutes().toString().padStart(2,"0")} — ${sparkData[idx]} order${sparkData[idx]===1?"":"s"}/min`;
+});
+chartEl.addEventListener("mouseleave",()=>{$("tpTip").style.display="none";const d=$("tpDot");if(d)d.style.display="none";});
+
+/* window/day math for the period card */
+function renderWindow(d,cursor){
+  if(!cursor||!cursor.from_date){$("winTitle").textContent="no window configured";return;}
+  const from=new Date(cursor.from_date), to=new Date(cursor.to_date+"T00:00:00");
+  $("winRange").textContent=`${cursor.from_date.slice(0,10)} → ${cursor.to_date}`;
+  $("winCursor").textContent=`${cursor.from_date.replace("T"," ")} · page ${cursor.next_page}/${cursor.total_pages} · ${cursor.status}`;
+  const start=windowStart(cursor), span=(to-start), donept=(from-start);
+  const pct=span>0?Math.max(0,Math.min(100,donept/span*100)):0;
+  $("winBar").style.width=pct.toFixed(1)+"%";
+  const daysLeft=Math.max(0,(to-from)/864e5);
+  $("winTitle").textContent=`${pct.toFixed(0)}% of the window swept · ${daysLeft.toFixed(1)} day(s) of orders remaining`;
+  $("winCounts").textContent=`${(lastD.counts?.created||0).toLocaleString()} / ${(lastD.counts?.held||0)}`;
+  $("winRate").textContent=`${lastD.rate_h||0} orders/h`;
+}
+let winStartCache=null;
+function windowStart(cursor){
+  /* earliest run in history with the same window end = window start */
+  if(winStartCache&&winStartCache.to===cursor.to_date)return winStartCache.d;
+  let d=new Date(cursor.from_date);
+  for(const r of runsCache)
+    if(r.window_to===cursor.to_date&&r.window_from){
+      const c=new Date(r.window_from); if(c<d)d=c;}
+  winStartCache={to:cursor.to_date,d};
+  return d;
+}
+
+/* ---- SSE ---- */
+let lastD={},cursorCache=null;
 const es=new EventSource("/api/stream");
 es.onmessage=ev=>{
-  const d=JSON.parse(ev.data);
+  const d=JSON.parse(ev.data);lastD=d;
   $("engineChip").textContent=d.engine_running?(d.stale_s>90?"engine silent "+d.stale_s+"s":"engine running"):"engine idle";
   $("engineChip").className="chip "+(d.engine_running?(d.stale_s>90?"warn":"ok"):"warn");
-  $("dashPhase").textContent=d.engine_running?(d.lanes&&d.lanes.length?`processing ${d.lanes.length} order(s)`:d.phase):"engine idle";
-  $("dashSlot").textContent=`slot ${d.slot}   page ${d.page}/${d.page_total||"?"}`;
+  $("slotTitle").textContent=d.slot&&d.slot!=="-"?`slot ${d.slot}`:"between slots";
+  $("slotPage").textContent=`${d.page} of ${d.page_total||"?"}`;
+  $("slotOrders").textContent=`${d.page_done} done / ${d.page_orders}`;
+  $("slotSkipped").textContent=d.counts.skipped||0;
+  $("slotErrors").textContent=d.counts.errors||0;
   const pct=d.page_orders?Math.round(100*d.page_done/d.page_orders):0;
   $("pageBar").style.width=pct+"%";
-  $("pageTxt").textContent=`page orders ${d.page_done}/${d.page_orders}`;
-  $("cCreated").textContent=d.counts.created||0;$("cHeld").textContent=d.counts.held||0;
-  $("cSkipped").textContent=d.counts.skipped||0;$("cErrors").textContent=d.counts.errors||0;
-  $("cRate").textContent=d.rate_h||0;
   renderLanes(d);renderPace(d);renderSpark(d);
+  if(cursorCache)renderWindow(d,cursorCache);
   $("curOrder").textContent=d.last_result?("last: "+d.last_result):"";
-  $("feed").innerHTML=(d.recent||[]).map(r=>`<li>${esc(r[0].slice(11))} ${esc(r[1])} ${esc(r[2])}</li>`).join("");
+  $("feed").innerHTML=(d.recent||[]).map(r=>`<li><span class="t">${esc(r[0].slice(11))}</span><span class="evt-icon evt-${r[1]==="✓"?"created":r[1]==="◼"?"held":"error"}">${esc(r[1])}</span><div>${esc(r[2])}</div></li>`).join("");
 };
-refreshState();
+async function pollCursor(){
+  const s=await api("/api/state");cursorCache=s.cursor||null;
+  if(cursorCache&&lastD)renderWindow(lastD,cursorCache);
+}
+setInterval(pollCursor,5000);
+setInterval(()=>{if($("tab-activity").style.display!=="none")loadEvents();},7000);
+setInterval(()=>{loadRuns();},30000);
+
+refreshState();loadRuns();pollCursor();
 </script>
 </body>
 </html>
