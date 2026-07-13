@@ -55,16 +55,13 @@ python3 -m venv venv
 
 `serve.py` opens the **web UI** (any modern browser, macOS / Windows / Linux):
 
-1. **Setup wizard** — paste your HubSpot private-app token and relay secret
-   (stored only in a local `.env`), test both live, let it pull your order
-   pipeline stages and your store's status list, click your status→stage
-   mapping together, set the backfill window, save.
-2. **Run tab** — dry run first (writes nothing, prints a would-create plan),
-   then a capped live test (e.g. 2 orders), then the full run. Graceful stop
-   any time.
-3. **Dashboard tab** — live phase per order (dedup → archive → catalog gate →
-   contact → order → line items → associations), counters, rate, recent feed.
-4. **Logs tab** — raw log tail plus the real-failure ledger.
+1. **Control** — the five-step setup wizard (credentials, relay, Google,
+   status→stage mapping, window + pacing) and the run panel side by side:
+   dry run → capped live test → full run, graceful stop any time.
+2. **Dashboard** — lifetime metrics, current period and slot, live worker
+   lanes, adaptive-pacing bars, and a hoverable throughput line chart.
+3. **Activity** — the failure ledger, a sortable history of every run ever,
+   and the log as filterable human-readable events.
 
 Prefer terminals? Everything works without the UI:
 
@@ -82,78 +79,67 @@ cleanly on the STOP file or when the cursor reaches `done`.
 
 ## The web UI, page by page
 
-Everything below runs locally (`python serve.py`), talks only to your own
-HubSpot portal, Make relay, and Google account, and never sends data
-anywhere else. The screenshots use synthetic demo data.
+Everything runs locally (`python serve.py`), talks only to your own HubSpot
+portal, Make relay, and Google account, and never sends data anywhere else.
+Three pages: **Control** to set up and launch, **Dashboard** to watch,
+**Activity** to audit. All screenshots use synthetic demo data.
 
-### 1 · Setup — a five-step wizard that builds your config for you
+### Control — set up and run from one place
 
-![Setup wizard](docs/screenshots/setup.png)
+![Control page](docs/screenshots/control.png)
 
-**Purpose:** produce a valid `config.json` and `.env` without hand-editing
-files. The progress dots at the top track the five steps:
+The readiness strip at the top tells you at a glance what is still missing
+before a run can start. Below it, the five setup steps live in collapsible
+cards — each with a status dot — and the sticky **Run** panel sits beside
+them so configuration and launch never drift apart:
 
-1. **Credentials** — paste your HubSpot private-app token and relay secret.
-   Both are written only to a local `.env` (0600) and never echoed back to
-   the browser; the button live-tests the token and shows your portal id.
-2. **Salla relay** — paste the Make webhook URL; the test fetches your
-   store's order-status list through it, proving the whole relay path works
-   before any real run.
-3. **Google Sheets & Drive (optional)** — enable the live audit sheet and
-   JSON archive, or skip and rely on the always-on local CSV mirrors.
-4. **Pipeline mapping** — pulls your portal's order-pipeline stages and
-   your store's statuses, and lets you click the status→stage map together.
-   Unmapped statuses fall back to the default stage.
-5. **Backfill window & save** — the date range to sweep, plus an
-   **Advanced** panel for concurrency and adaptive pacing (worker lanes,
-   target utilization, per-provider limits — the safe defaults match the
-   documented quotas). Save validates the config through the engine's own
-   loader before you can run anything.
+1. **Connect** — HubSpot private-app token + relay secret. Stored only in a
+   local `.env` (0600), never echoed back; the button live-tests the token.
+2. **Salla relay** — paste the Make webhook URL; the test pulls your store's
+   order-status list through it, proving the entire relay path.
+3. **Google Sheets & Drive** *(optional)* — live audit sheet + JSON archive,
+   or skip and rely on the always-on local CSV mirrors.
+4. **Pipeline mapping** — pulls your portal's stages and your store's
+   statuses; click the status→stage map together.
+5. **Window, pacing & save** — date range, worker lanes, adaptive-pacing
+   limits (safe defaults match the documented quotas), validated through
+   the engine's own loader.
 
-### 2 · Run — guarded start/stop, never a foot-gun
+The Run panel: **Dry run** is the default and writes nothing; **LIVE** only
+arms after you type `RUN`; max-orders gives cheap test gates; stop is always
+graceful (in-flight orders finish, the cursor stays safe, resume is free).
 
-![Run control](docs/screenshots/run.png)
+### Dashboard — every lane, limit, and order, live
 
-**Purpose:** launch and stop the engine with the same guardrails the
-terminal path has. Dry run is the default and writes nothing — it prints a
-would-create plan per order. Live mode refuses to start until you type
-`RUN`. **Max orders** gives you cheap test gates (the recommended first
-flight: dry run of 2 → live run of 2 → verify in HubSpot → full run).
-**Worker lanes** controls concurrency for this run (3–4 is the useful
-range). **Graceful stop** finishes the in-flight orders, keeps the cursor
-safe, and makes resume free — it is never a kill.
+![Dashboard](docs/screenshots/dashboard.png)
 
-### 3 · Dashboard — watch every lane, limit, and order live
+- **All-time strip** — lifetime metrics across *every* backfill run ever:
+  orders created, held, run count and engine hours, best rate.
+- **Current period** — how much of the configured window is swept, cursor
+  position, session counts, live rate.
+- **Current slot** — the exact time-slot and page being processed right now.
+- **Worker lanes** — one card per lane: the order it carries, its live
+  phase, and how long it has been at it.
+- **Adaptive pacing** — request rate vs the 90–95% ceiling per provider.
+  The bars deepen toward sage green as utilization rises: **a full bar is
+  the goal** (full utility), not a warning. Throttle events appear in the
+  ticker below.
+- **Throughput** — a continuous line chart of orders/minute, live-updating;
+  hover anywhere for the exact minute and count.
 
-![Live dashboard](docs/screenshots/dashboard.png)
+### Activity — the human-readable history of everything
 
-**Purpose:** a read-only live view of the run, streamed from the engine's
-log (the web layer never touches the APIs). From top to bottom:
+![Activity page](docs/screenshots/activity.png)
 
-- **Header card** — current slot and page, page progress bar, and session
-  counters: created, held (catalog gate), dedup skipped, error log lines,
-  and the rolling orders/hour rate.
-- **Worker lanes** — one card per lane showing the order it is carrying,
-  the exact phase it is in (dedup search → contact → order → line items →
-  associations → Drive/Sheets), and how long it has been at it. Idle cards
-  mean the lane is waiting for the next order.
-- **Adaptive pacing** — per-provider bars of the current request rate
-  against its 90–95% ceiling. Green = cruising, amber = warming up, red =
-  riding the ceiling (that is the goal, not a problem). The line under the
-  bars is the latest ADAPT decision the engine made and why.
-- **Throughput** — orders per minute over the last 40 minutes, plus a
-  per-lane feed of the most recent completions.
-
-### 4 · Logs — the raw truth, and the ledger that must stay empty
-
-![Logs and failure ledger](docs/screenshots/logs.png)
-
-**Purpose:** the same `backfill.log` the terminal tools read, with the
-lane token visible on every line — and below it the **unrecovered-failure
-ledger** (`mirror/errors.csv`). The distinction matters: log-line "errors"
-can include incidents the engine already retried and recovered; anything
-in the ledger genuinely needs attention, and the engine ends a run with a
-loud banner if it is non-empty. `none 🎉` is the state you want.
+- **Unrecovered failures** — the ledger that must stay empty, front and
+  center. Log "errors" can be recovered incidents; this cannot.
+- **Run history** — every backfill ever, parsed from the log: window, mode,
+  duration, created/held/skipped/errors, rate. Click any column to sort.
+- **Events** — the log translated into plain sentences ("Order X created in
+  HubSpot (new contact) — lane 2"), with filter chips (created / held /
+  skipped / errors / pacing / system), free-text search, newest/oldest
+  toggle, and click-to-expand raw log lines for any event.
+- **Raw log tail** — still there for debugging, one click away.
 
 ## The Make relay (one-time, ~5 minutes)
 
