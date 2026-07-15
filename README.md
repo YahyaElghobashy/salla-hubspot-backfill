@@ -11,7 +11,16 @@ engine at ~2.3 credits per order (~94% cheaper) while keeping a complete audit
 trail. The engine has processed real stores end to end with per-slot
 reconciliation against Salla's own counts.
 
-![Live dashboard](docs/screenshots/dashboard.png)
+**Two engines, one codebase:** a **backfill** that sweeps a historical window,
+and a **live sync** that mirrors new orders 24/7 (§ [Live sync](#live-sync-mode-v18--247-order-syncing-without-the-big-scenario)).
+They can run **together** and coordinate over the shared HubSpot rate budget.
+
+> **Current version: v1.9.** For the full engineering deep-dive — how the relay,
+> both engines, idempotency, adaptive pacing, and live-priority coordination fit
+> together, plus a **real ~50× efficiency calculation with an interactive
+> calculator** and **GCP deployment** — see **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)**.
+
+![Consolidated dashboard — both engines live at once](docs/img/dashboard-consolidated.png)
 
 ## How it works
 
@@ -109,17 +118,25 @@ The Run panel: **Dry run** is the default and writes nothing; **LIVE** only
 arms after you type `RUN`; max-orders gives cheap test gates; stop is always
 graceful (in-flight orders finish, the cursor stays safe, resume is free).
 
-### Dashboard — every lane, limit, and order, live
+### Dashboard — both engines, every lane and limit, live (v1.9 consolidated)
 
-![Dashboard](docs/screenshots/dashboard.png)
+![Consolidated dashboard](docs/img/dashboard-consolidated.png)
 
+- **Both engines at once** — the dashboard streams `backfill.log` **and**
+  `live.log` together (no toggle). Each engine has its own live status pill:
+  *backfill* creating/scanning, *live sync* working/watching.
 - **All-time strip** — lifetime metrics across *every* backfill run ever:
   orders created, held, run count and engine hours, best rate.
 - **Current period** — how much of the configured window is swept, cursor
   position, session counts, live rate.
 - **Current slot** — the exact time-slot and page being processed right now.
-- **Worker lanes** — one card per lane: the order it carries, its live
-  phase, and how long it has been at it.
+  A skip-heavy slot reads as **"scanning"**, not idle — a working engine never
+  looks dead.
+- **Color-coded activity** — one card per unit of work: **backfill** worker
+  lanes in light green, **live-order** cards in deep blue-green (sorted first),
+  each showing the order it carries, its live phase, and its age:
+
+  ![Color-coded worker lanes and live orders](docs/img/activity-lanes.png)
 - **Adaptive pacing** — request rate vs the 90–95% ceiling per provider.
   The bars deepen toward sage green as utilization rises: **a full bar is
   the goal** (full utility), not a warning. Throttle events appear in the
@@ -163,7 +180,7 @@ graceful (in-flight orders finish, the cursor stays safe, resume is free).
 **Privacy note:** `archive/`, `mirror/`, and logs contain customer data. They
 are gitignored; keep them local.
 
-## Live sync mode (v1.6) — 24/7 order syncing without the big scenario
+## Live sync mode (v1.8) — 24/7 order syncing without the big scenario
 
 The same engine that backfills history can replace your live "order
 created" automation. Instead of a 25-40-op Make scenario per order, a
@@ -177,10 +194,18 @@ python live.py --once            # dry run: one poll cycle, plan only
 python run.py --mode live --live # the 24/7 service (restarts forever)
 ```
 
-Poll → claim queued rows → fetch full orders through the relay → the exact
-same worker-lane pipeline as the backfill (dedup, catalog gate, contact
-guardrails, bundles, audit trail, adaptive pacing) → write
+Poll (every **5 s** by default) → claim queued rows → fetch full orders through
+the relay → the exact same worker-lane pipeline as the backfill (dedup, catalog
+gate, contact guardrails, bundles, audit trail, adaptive pacing) → write
 `done/held/error/gone` back to the row.
+
+**Live status + bursts (v1.8):** when several orders land in one poll window,
+the whole batch is stamped **`processing`** at once — the Live Queue sheet shows
+exactly which orders are in flight vs done — then drained through the lanes, each
+row flipping to its terminal state as its lane finishes. The loop is synchronous,
+so the next poll can never re-claim an in-flight row. To keep the 5 s poll honest,
+the full single-consumer heartbeat cycle is decoupled to run only every ~25 s, so
+most polls do a single queue read.
 
 Durability (nothing lost, nothing duplicated — by construction):
 
@@ -195,15 +220,16 @@ Durability (nothing lost, nothing duplicated — by construction):
   (single consumer path — the sweep never writes to HubSpot itself).
 - **Two instances by mistake** → an OS file lock plus a heartbeat cell in
   the queue sheet make the second consumer refuse to claim.
-- **Crash mid-order** → the row stays `queued`; the pre-existing check
-  (ledger + line-item verification) finishes or repairs it on reprocess.
+- **Crash mid-order** → a row left `processing` by a dead predecessor is
+  reclaimed on restart (v1.8); the pre-existing check (ledger + line-item
+  verification) finishes or repairs it — idempotently, so never a duplicate.
 
 Ops per order: ~2 (intake) + ~1-2 amortized (relay fetch) vs 25-40 in a
 full Make scenario — the same ~92-94% credit cut as the backfill.
-`docs/cutover-live.md` has the zero-loss migration runbook;
-`docs/deploy-gcp.md` covers running it as a systemd service. The
-dashboards gain a live-queue view (`dashboard.py --live`, or the web UI's
-Engine toggle).
+[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) covers the full live-sync design,
+running it as a **systemd service on GCP**, and the coordination that lets the
+backfill and live engines run together on one HubSpot rate budget. The web
+dashboard shows the live queue and both engines in one consolidated view.
 
 ## Concurrent worker lanes (v1.5)
 
