@@ -252,6 +252,7 @@ pre{background:var(--bg);border:1px solid var(--line);border-radius:12px;padding
         <div class="seg" id="modeSeg">
           <button class="active" data-mode="dry">Dry run</button>
           <button class="live" data-mode="live">LIVE</button>
+          <button class="live" data-mode="live-sync">LIVE SYNC 24/7</button>
         </div>
         <div class="row">
           <div><label>Max orders <span class="muted">(blank = all)</span></label><input id="maxOrders" type="number" min="1" placeholder="e.g. 2"></div>
@@ -262,7 +263,8 @@ pre{background:var(--bg);border:1px solid var(--line);border-radius:12px;padding
           <input id="confirmRun" placeholder="RUN" autocomplete="off">
         </div>
         <button class="btn primary" style="width:100%" onclick="startRun()">Start</button>
-        <button class="btn danger" style="width:100%" onclick="stopRun()">Graceful stop</button>
+        <button class="btn danger" style="width:100%" onclick="stopRun()">Stop backfill</button>
+        <button class="btn danger" style="width:100%" onclick="stopLive()">Stop live sync</button>
         <div class="status" id="runStatus"></div>
       </div>
       <div class="card">
@@ -275,6 +277,22 @@ pre{background:var(--bg);border:1px solid var(--line);border-radius:12px;padding
 
 <!-- ============================ DASHBOARD ============================ -->
 <section id="tab-dash" style="display:none">
+  <div class="card" style="display:flex;gap:10px;align-items:center;margin-bottom:18px;padding:12px 18px">
+    <p class="eyebrow" style="margin:0">Engine</p>
+    <div class="seg" style="margin:0">
+      <button class="active" id="srcBackfill" onclick="setSource('')">Backfill</button>
+      <button id="srcLive" onclick="setSource('live')">Live sync</button>
+    </div>
+    <span class="hint" id="srcHint" style="margin:0">tailing backfill.log</span>
+  </div>
+  <div class="card" id="queueCard" style="display:none;margin-bottom:18px">
+    <p class="eyebrow">Live queue</p>
+    <div class="grid5">
+      <div class="metric"><b id="qDepth">–</b><span>queued orders</span></div>
+      <div class="metric"><b id="qAge">–</b><span>oldest event age</span></div>
+      <div class="metric"><b id="qToday">–</b><span>processed today</span></div>
+    </div>
+  </div>
   <p class="eyebrow">All-time · every backfill run</p>
   <div class="grid5" style="margin-bottom:18px">
     <div class="metric"><b id="hCreated">–</b><span>orders created</span></div>
@@ -406,7 +424,7 @@ let runMode="dry";
 document.querySelectorAll("#modeSeg button").forEach(b=>b.onclick=()=>{
   document.querySelectorAll("#modeSeg button").forEach(x=>x.classList.remove("active"));
   b.classList.add("active");runMode=b.dataset.mode;
-  $("confirmWrap").style.display=runMode==="live"?"":"none";});
+  $("confirmWrap").style.display=(runMode==="live"||runMode==="live-sync")?"":"none";});
 
 /* ---- readiness checklist ---- */
 function chip(ok,labelOk,labelBad,warn){return `<span class="chip ${ok?'ok':(warn?'warn':'bad')}">${ok?'✓':(warn?'○':'✗')} ${ok?labelOk:labelBad}</span>`;}
@@ -529,6 +547,10 @@ async function startRun(){
 }
 async function stopRun(){
   const r=await api("/api/stop",{});
+  $("runStatus").innerHTML=`<span class="warn">${esc(r.note)}</span>`;
+}
+async function stopLive(){
+  const r=await api("/api/stop",{scope:"live"});
   $("runStatus").innerHTML=`<span class="warn">${esc(r.note)}</span>`;
 }
 
@@ -704,9 +726,18 @@ function windowStart(cursor){
 }
 
 /* ---- SSE ---- */
-let lastD={},cursorCache=null;
-const es=new EventSource("/api/stream");
-es.onmessage=ev=>{
+let lastD={},cursorCache=null,es=null,src="";
+function setSource(which){
+  src=which;
+  $("srcBackfill").classList.toggle("active",which==="");
+  $("srcLive").classList.toggle("active",which==="live");
+  $("queueCard").style.display=which==="live"?"":"none";
+  $("srcHint").textContent=which==="live"?"tailing live.log":"tailing backfill.log";
+  if(es)es.close();
+  es=new EventSource("/api/stream"+(which?"?source=live":""));
+  es.onmessage=onStream;
+}
+function onStream(ev){
   const d=JSON.parse(ev.data);lastD=d;
   $("engineChip").textContent=d.engine_running?(d.stale_s>90?"engine silent "+d.stale_s+"s":"engine running"):"engine idle";
   $("engineChip").className="chip "+(d.engine_running?(d.stale_s>90?"warn":"ok"):"warn");
@@ -719,6 +750,11 @@ es.onmessage=ev=>{
   $("pageBar").style.width=pct+"%";
   renderLanes(d);renderPace(d);renderSpark(d);
   if(cursorCache)renderWindow(d,cursorCache);
+  if(src==="live"){
+    $("qDepth").textContent=d.queue_depth==null?"–":d.queue_depth;
+    $("qAge").textContent=d.queue_depth?((d.queue_age||0)+"s"):"—";
+    $("qToday").textContent=d.processed_today||0;
+  }
   $("curOrder").textContent=d.last_result?("last: "+d.last_result):"";
   $("feed").innerHTML=(d.recent||[]).map(r=>`<li><span class="t">${esc(r[0].slice(11))}</span><span class="evt-icon evt-${r[1]==="✓"?"created":r[1]==="◼"?"held":"error"}">${esc(r[1])}</span><div>${esc(r[2])}</div></li>`).join("");
 };

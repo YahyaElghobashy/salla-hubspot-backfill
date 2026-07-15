@@ -163,6 +163,48 @@ graceful (in-flight orders finish, the cursor stays safe, resume is free).
 **Privacy note:** `archive/`, `mirror/`, and logs contain customer data. They
 are gitignored; keep them local.
 
+## Live sync mode (v1.6) — 24/7 order syncing without the big scenario
+
+The same engine that backfills history can replace your live "order
+created" automation. Instead of a 25-40-op Make scenario per order, a
+**2-op intake scenario** (`relay/live_intake_blueprint.template.json`:
+Salla trigger → append one row) writes every new order's id to a dedicated
+**Live Queue spreadsheet**, and the engine's live mode consumes it:
+
+```bash
+python live.py --init-queue      # one-time: creates the queue spreadsheet
+python live.py --once            # dry run: one poll cycle, plan only
+python run.py --mode live --live # the 24/7 service (restarts forever)
+```
+
+Poll → claim queued rows → fetch full orders through the relay → the exact
+same worker-lane pipeline as the backfill (dedup, catalog gate, contact
+guardrails, bundles, audit trail, adaptive pacing) → write
+`done/held/error/gone` back to the row.
+
+Durability (nothing lost, nothing duplicated — by construction):
+
+- **Engine down** → rows accumulate in the sheet; restart consumes them.
+- **Make credits exhausted / intake off** → Make's webhook queue buffers
+  and replays on recovery (the relay stalls too: lossless wait).
+- **HubSpot's search index lags fresh objects** → a persistent local
+  created-ledger plus a duplicate-rejection guardrail on order create make
+  reprocessing idempotent even when search can't see the order yet.
+- **Webhook missed an event** → an hourly reconciliation sweep lists the
+  recent window via the relay and *appends* missing ids to the queue
+  (single consumer path — the sweep never writes to HubSpot itself).
+- **Two instances by mistake** → an OS file lock plus a heartbeat cell in
+  the queue sheet make the second consumer refuse to claim.
+- **Crash mid-order** → the row stays `queued`; the pre-existing check
+  (ledger + line-item verification) finishes or repairs it on reprocess.
+
+Ops per order: ~2 (intake) + ~1-2 amortized (relay fetch) vs 25-40 in a
+full Make scenario — the same ~92-94% credit cut as the backfill.
+`docs/cutover-live.md` has the zero-loss migration runbook;
+`docs/deploy-gcp.md` covers running it as a systemd service. The
+dashboards gain a live-queue view (`dashboard.py --live`, or the web UI's
+Engine toggle).
+
 ## Concurrent worker lanes (v1.5)
 
 One order is ~13 sequential API round-trips, so a single-lane engine is

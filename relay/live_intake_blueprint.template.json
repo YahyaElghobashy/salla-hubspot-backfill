@@ -1,0 +1,197 @@
+{
+    "name": "Salla | Live Order Intake",
+    "flow": [
+        {
+            "id": 1,
+            "module": "salla:WhenOrderCreated",
+            "version": 1,
+            "parameters": {
+                "__IMTHOOK__": 0
+            },
+            "mapper": {},
+            "metadata": {
+                "designer": {
+                    "x": 0,
+                    "y": 0,
+                    "name": "Order Created (Salla)"
+                },
+                "restore": {
+                    "parameters": {
+                        "__IMTHOOK__": {
+                            "data": {
+                                "editable": "true"
+                            },
+                            "label": "salla-live-intake (create new on import)"
+                        }
+                    }
+                },
+                "parameters": [
+                    {
+                        "name": "__IMTHOOK__",
+                        "type": "hook",
+                        "label": "Webhook",
+                        "required": true
+                    }
+                ]
+            }
+        },
+        {
+            "id": 2,
+            "module": "google-sheets:addRow",
+            "version": 2,
+            "parameters": {
+                "__IMTCONN__": 0
+            },
+            "mapper": {
+                "from": "drive",
+                "mode": "select",
+                "values": {
+                    "0": "{{formatDate(now; \"YYYY-MM-DD HH:mm:ss\")}}",
+                    "1": "{{1.data.id}}",
+                    "2": "{{1.data.reference_id}}",
+                    "3": "order.created",
+                    "4": "queued",
+                    "5": "0",
+                    "6": "webhook",
+                    "7": ""
+                },
+                "sheetId": "Live Queue",
+                "spreadsheetId": "/REPLACE_WITH_LIVE_QUEUE_SPREADSHEET",
+                "includesHeaders": true,
+                "insertDataOption": "INSERT_ROWS",
+                "useColumnHeaders": false,
+                "valueInputOption": "RAW",
+                "insertUnformatted": false
+            },
+            "metadata": {
+                "designer": {
+                    "x": 300,
+                    "y": 0,
+                    "name": "Enqueue (Live Queue sheet, RAW)"
+                },
+                "restore": {
+                    "expect": {
+                        "from": {
+                            "label": "My Drive"
+                        },
+                        "mode": {
+                            "label": "Search by path"
+                        },
+                        "sheetId": {
+                            "label": "Live Queue"
+                        },
+                        "spreadsheetId": {
+                            "path": [
+                                "Salla Live Queue"
+                            ]
+                        },
+                        "includesHeaders": {
+                            "label": "Yes"
+                        },
+                        "insertDataOption": {
+                            "mode": "chose",
+                            "label": "Insert rows"
+                        },
+                        "useColumnHeaders": {
+                            "label": "No",
+                            "nested": [
+                                {
+                                    "name": "values",
+                                    "spec": [
+                                        {
+                                            "name": "0",
+                                            "type": "text",
+                                            "label": "received_at (A)"
+                                        },
+                                        {
+                                            "name": "1",
+                                            "type": "text",
+                                            "label": "order_id (B)"
+                                        },
+                                        {
+                                            "name": "2",
+                                            "type": "text",
+                                            "label": "reference_id (C)"
+                                        },
+                                        {
+                                            "name": "3",
+                                            "type": "text",
+                                            "label": "event (D)"
+                                        },
+                                        {
+                                            "name": "4",
+                                            "type": "text",
+                                            "label": "status (E)"
+                                        },
+                                        {
+                                            "name": "5",
+                                            "type": "text",
+                                            "label": "attempts (F)"
+                                        },
+                                        {
+                                            "name": "6",
+                                            "type": "text",
+                                            "label": "source (G)"
+                                        },
+                                        {
+                                            "name": "7",
+                                            "type": "text",
+                                            "label": "note (H)"
+                                        }
+                                    ]
+                                }
+                            ]
+                        },
+                        "valueInputOption": {
+                            "mode": "chose",
+                            "label": "Raw"
+                        }
+                    }
+                }
+            },
+            "onerror": [
+                {
+                    "id": 3,
+                    "module": "builtin:Break",
+                    "version": 1,
+                    "parameters": {},
+                    "mapper": {
+                        "count": "10",
+                        "interval": "15",
+                        "retry": true
+                    },
+                    "metadata": {
+                        "designer": {
+                            "x": 300,
+                            "y": 300,
+                            "name": "Retry later (never drop an event)"
+                        }
+                    }
+                }
+            ]
+        }
+    ],
+    "metadata": {
+        "instant": true,
+        "version": 1,
+        "scenario": {
+            "roundtrips": 1,
+            "maxErrors": 10,
+            "autoCommit": true,
+            "autoCommitTriggerLast": true,
+            "sequential": true,
+            "slots": null,
+            "confidential": false,
+            "dataloss": false,
+            "dlq": true,
+            "freshVariables": false
+        },
+        "designer": {
+            "orphans": []
+        },
+        "zone": "eu1.make.com",
+        "notes": [
+            "2-op replacement intake for 'Salla | Order Created': the local live-sync engine consumes the Live Queue sheet and does everything else. Enable 'Allow storing of incomplete executions' in scenario settings so the Break retry works. On import: create a NEW webhook on the Salla connection, select the 'Salla Live Queue' spreadsheet (created by python live.py --init-queue) and its 'Live Queue' tab."
+        ]
+    }
+}
