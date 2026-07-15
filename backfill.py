@@ -206,6 +206,22 @@ class AdaptiveLimiter:
         log.info("ADAPT %s %.3f->%.3f/s (%s)", self.name, self.rate, new_rate, reason)
         self.rate = new_rate
 
+    def set_ceiling(self, new_ceil, reason=""):
+        """v1.7: move the adaptive ceiling at runtime (used to yield the shared
+        HubSpot account budget to the live engine). Keeps floor <= rate <= ceil
+        and lets AIMD re-converge from wherever it lands. No-op when the change
+        is negligible."""
+        new_ceil = max(new_ceil, 0.001)
+        if abs(new_ceil - self.ceil) < 1e-6:
+            return
+        with self._lock:
+            self.ceil = new_ceil
+            self.floor = min(self.floor, self.ceil)
+            if self.rate > self.ceil:
+                log.info("CEIL %s %.2f->%.2f/s (%s); rate %.2f->%.2f",
+                         self.name, self.rate, new_ceil, reason, self.rate, new_ceil)
+                self.rate = self.ceil
+
     def on_throttle(self, retry_after=None):
         """Provider throttled us (429 / RESOURCE_EXHAUSTED)."""
         if not self.adaptive:
@@ -364,6 +380,14 @@ class Config:
     live_max_attempts: int = 8
     live_trim_days: int = 7
     live_trim_hour: int = 4
+    # v1.7 live-priority pacing. When the live engine is active (it writes
+    # mirror/live_active.json each poll) the backfill drops its HubSpot ceilings
+    # to these yield floors so live keeps the shared account budget; when live
+    # is idle the backfill reclaims its full *_limit_* ceilings. Sized so
+    # live_ceiling + backfill_yield stays under the account cap.
+    live_yield_enabled: bool = True
+    hs_search_yield_per_s: float = 0.6
+    hs_general_yield_per_10s: float = 20.0
 
     @staticmethod
     def load(path):
@@ -1374,6 +1398,39 @@ class Engine:
                 lock = self._phone_locks[key] = threading.Lock()
         return lock
 
+    def _yield_to_live(self):
+        """v1.7: read the live engine's activity signal (mirror/live_active.json,
+        written each poll by live.py) and hand the shared HubSpot account budget
+        to live when it has orders. When live is busy the backfill search/general
+        ceilings drop to their yield floors; when live is idle (or its signal is
+        stale) they return to full. Cursor logic is untouched -- this only paces,
+        never skips a page."""
+        if not getattr(self.cfg, "live_yield_enabled", True):
+            return
+        active = False
+        try:
+            sig = json.loads((Path(self.mirror.dir) / "live_active.json").read_text())
+            active = bool(sig.get("active")) and (time.time() - float(sig.get("ts", 0))) < 60
+        except Exception:
+            active = False  # no live engine / unreadable -> take the full budget
+        if active == getattr(self, "_yielding", None):
+            return  # no change since last page
+        self._yielding = active
+        util = self.cfg.adaptive_target_util
+        if active:
+            self.hs.search_rl.set_ceiling(self.cfg.hs_search_yield_per_s, "yield to live")
+            self.hs.general_rl.set_ceiling(
+                self.cfg.hs_general_yield_per_10s / 10.0, "yield to live")
+            log.info("YIELD backfill -> live active: search ceiling %.2f/s",
+                     self.cfg.hs_search_yield_per_s)
+        else:
+            self.hs.search_rl.set_ceiling(self.cfg.hs_search_limit_per_s * util,
+                                          "live idle, reclaim")
+            self.hs.general_rl.set_ceiling(
+                self.cfg.hs_general_limit_per_10s / 10.0 * util, "live idle, reclaim")
+            log.info("RECLAIM backfill -> live idle: search ceiling %.2f/s",
+                     self.cfg.hs_search_limit_per_s * util)
+
     def _rates_report(self):
         """v1.4: periodic snapshot; v1.5: current/ceiling pairs + lanes.
         Called from the main loop only."""
@@ -1926,6 +1983,7 @@ class Engine:
                     f"&to_date={end.strftime('%Y-%m-%dT%H:%M:%S')}"
                     f"&per_page={self.cfg.per_page}&format=light&page={page}")
             log.info("PAGE slot %s -> %s page %s", start, end, page)
+            self._yield_to_live()  # v1.7: give the live engine priority
             self._rates_report()  # v1.4
             body = self.relay.get_path(path)                    # [M302]
             total_pages = int(dig(body, "pagination.totalPages", 0) or 0)

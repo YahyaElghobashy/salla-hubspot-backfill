@@ -95,6 +95,7 @@ class LiveEngine(Engine):
         self.instance_id = f"{socket.gethostname()}-{os.getpid()}"
         self.processed_today = 0
         self._today = datetime.now().date()
+        self._active_until = 0.0  # v1.7: live-priority signal cooldown
         # sweep: 0 or >=1440 minutes disables it; otherwise the first sweep
         # runs shortly after start (catches any downtime gap immediately)
         self._sweep_enabled = 0 < cfg.live_sweep_minutes < 1440
@@ -143,10 +144,19 @@ class LiveEngine(Engine):
             return True
         info = self._hb_age(prev)
         if info and info[0] != self.instance_id and info[1] < HEARTBEAT_STALE_S:
-            log.error("FOREIGN LIVE INSTANCE %s heartbeat %ds ago -- refusing "
-                      "to claim (two consumers = duplicate risk). Stop the "
-                      "other instance first.", info[0], int(info[1]))
-            return False  # do NOT write: let the incumbent keep ownership
+            # v1.7: a stale heartbeat from THIS machine is a dead predecessor --
+            # the flock we hold proves no other live.py runs here -- so take
+            # over immediately instead of waiting out HEARTBEAT_STALE_S. Only a
+            # foreign HOSTNAME (a truly separate machine) triggers the refusal.
+            my_host = self.instance_id.rsplit("-", 1)[0]
+            their_host = info[0].rsplit("-", 1)[0]
+            if their_host != my_host:
+                log.error("FOREIGN LIVE INSTANCE %s heartbeat %ds ago -- refusing "
+                          "to claim (two consumers = duplicate risk). Stop the "
+                          "other instance first.", info[0], int(info[1]))
+                return False  # do NOT write: let the incumbent keep ownership
+            log.info("stale same-machine heartbeat from %s (%ds, dead predecessor) "
+                     "-- taking over", info[0], int(info[1]))
         try:
             self.gio.queue_write_heartbeat(self.qsid, self.instance_id)
             back = self._hb_age(self.gio.queue_read_heartbeat(self.qsid))
@@ -388,6 +398,18 @@ class LiveEngine(Engine):
                 log.info("QUEUE depth=%d oldest_age=%ss processed_today=%d "
                          "lanes=%d/%d", len(claimable), age,
                          self.processed_today, self._in_flight, self.workers)
+                # v1.7: publish an activity signal so the backfill engine yields
+                # the shared HubSpot budget to live. Active while there is work
+                # plus a 30s cooldown so a bursty queue doesn't flap the backfill.
+                nowep = time.time()
+                if claimable or self._in_flight:
+                    self._active_until = nowep + 30
+                try:
+                    (Path(self.mirror.dir) / "live_active.json").write_text(json.dumps(
+                        {"active": nowep < self._active_until,
+                         "depth": len(claimable), "ts": int(nowep)}))
+                except Exception as e:
+                    log.debug("live_active publish failed: %s", e)
                 if claimable:
                     if not self.live:
                         for r in claimable[:20]:

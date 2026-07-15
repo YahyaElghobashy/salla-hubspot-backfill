@@ -239,6 +239,19 @@ Audit-trail note: sheet rows interleave across lanes; row integrity is
 preserved because each lane updates only the row number its own append
 returned.
 
+## Live-priority pacing (v1.7)
+
+When the live-sync service and a backfill run share one HubSpot account,
+they coordinate so **fresh orders always win**. The live engine writes a
+tiny `mirror/live_active.json` signal each poll; the backfill reads it at
+every page and **yields its HubSpot search/general budget** (down to
+`hs_search_yield_per_s`, e.g. 0.6/s) whenever live has orders, then
+**reclaims the full 90-95% ceiling** the moment live is idle (or its signal
+goes stale, i.e. the live engine stopped). The cursor is untouched, so the
+backfill is only *paced* slower during live bursts, never skipped — and no
+live order waits. AIMD 429-backoff remains the ultimate guardrail if the
+combined estimate is ever off.
+
 ## Adaptive rate pacing (v1.4)
 
 The engine paces itself per destination with an AIMD controller (additive
