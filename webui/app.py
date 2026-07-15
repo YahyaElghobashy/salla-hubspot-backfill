@@ -15,6 +15,7 @@ import re
 import ssl
 import subprocess
 import sys
+import threading
 import time
 import urllib.request
 from pathlib import Path
@@ -96,6 +97,11 @@ class LogHistory:
     def __init__(self, path, source="backfill"):
         self.path = path
         self.source = source
+        # Flask's dev server is multi-threaded and several endpoints poll this
+        # concurrently. Without a lock two threads read the same byte range and
+        # append the same run summaries twice -> the run list / lifetime totals
+        # double. This serializes the read+append so each line is parsed once.
+        self._lock = threading.Lock()
         self._offset = 0
         self._runs = []
         self._events = []
@@ -216,21 +222,22 @@ class LogHistory:
     _last_workers = 0
 
     def _refresh(self):
-        if not self.path.exists():
-            return
-        size = self.path.stat().st_size
-        if size < self._offset:  # rotated/truncated: rescan
-            self._offset, self._runs, self._events, self._pending = 0, [], [], None
-            self.total_created = self.total_held = 0
-            self.first_ts = self.last_ts = ""
-        if size == self._offset:
-            return
-        with open(self.path, "r", encoding="utf-8", errors="replace") as f:
-            f.seek(self._offset)
-            for line in f:
-                if line.endswith("\n"):
-                    self._feed(line.rstrip("\n"))
-            self._offset = f.tell()
+        with self._lock:  # one thread reads+appends at a time (no double-count)
+            if not self.path.exists():
+                return
+            size = self.path.stat().st_size
+            if size < self._offset:  # rotated/truncated: rescan
+                self._offset, self._runs, self._events, self._pending = 0, [], [], None
+                self.total_created = self.total_held = 0
+                self.first_ts = self.last_ts = ""
+            if size == self._offset:
+                return
+            with open(self.path, "r", encoding="utf-8", errors="replace") as f:
+                f.seek(self._offset)
+                for line in f:
+                    if line.endswith("\n"):
+                        self._feed(line.rstrip("\n"))
+                self._offset = f.tell()
 
     def get(self):
         self._refresh()
