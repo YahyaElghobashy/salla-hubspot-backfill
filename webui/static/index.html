@@ -12,6 +12,7 @@
   --bg:#fafafa; --panel:#ffffff; --text:#141414; --muted:#757272;
   --line:#ebebeb; --line-soft:#f3f3f3;
   --sage:#84bd9b; --sage-strong:#5ea380; --sage-soft:#e4f3e9;
+  --ocean:#2f9aa0; --ocean-strong:#1f7d86; --ocean-soft:#dcf0f1;
   --blush:#ffe5f2; --rose:#d789ad; --gold:#e2b13c; --gold-soft:#fdf6e3;
   --bad:#f55157; --bad-soft:#fdecec;
   --chip:#f5f2f4; --shadow:0 1px 2px rgba(0,0,0,.04), 0 8px 24px rgba(0,0,0,.05);
@@ -21,6 +22,7 @@
     --bg:#0f0f10; --panel:#1a1a1c; --text:#f2f2f2; --muted:#9a9aa0;
     --line:#28282c; --line-soft:#222226;
     --sage:#9ccfaf; --sage-strong:#84bd9b; --sage-soft:rgba(132,189,155,.14);
+    --ocean:#5cc4ca; --ocean-strong:#3aa7ae; --ocean-soft:rgba(58,167,174,.15);
     --blush:rgba(255,229,242,.10); --rose:#e8a8c8; --gold:#f5c142;
     --gold-soft:rgba(245,193,66,.12);
     --bad:#f55157; --bad-soft:rgba(245,81,87,.12);
@@ -92,16 +94,43 @@ pre{background:var(--bg);border:1px solid var(--line);border-radius:12px;padding
 .grid5{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px}
 .grid2{display:grid;grid-template-columns:1fr 1fr;gap:16px}
 @media(max-width:900px){.grid2{grid-template-columns:1fr}}
-.lanes{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:10px;margin-top:10px}
+.lanes{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:10px;margin-top:10px}
 .lane{background:var(--bg);border:1px solid var(--line);border-radius:12px;padding:11px 13px;position:relative}
-.lane.busy{border-color:color-mix(in srgb, var(--sage) 55%, var(--line))}
-.lane.busy::before{content:"";position:absolute;top:12px;right:12px;width:7px;height:7px;border-radius:99px;
-                   background:var(--sage);animation:pulse 1.5s ease-in-out infinite}
+/* backfill worker lanes — light green undertone */
+.lane.backfill{background:color-mix(in srgb, var(--sage-soft) 55%, var(--bg));
+               border-color:color-mix(in srgb, var(--sage) 55%, var(--line))}
+.lane.backfill .ph{color:var(--sage-strong)}
+.lane.backfill::before{background:var(--sage)}
+/* live-order lanes — deep blue/green fusion, distinct from backfill */
+.lane.live{background:color-mix(in srgb, var(--ocean-soft) 80%, var(--bg));
+           border-color:color-mix(in srgb, var(--ocean) 60%, var(--line))}
+.lane.live .ph{color:var(--ocean-strong)}
+.lane.live::before{background:var(--ocean)}
+.lane.busy::before,.lane.backfill::before,.lane.live::before,.lane.scanning::before{
+  content:"";position:absolute;top:12px;right:12px;width:7px;height:7px;border-radius:99px;
+  animation:pulse 1.5s ease-in-out infinite}
+/* backfill actively scanning/skipping already-synced orders (no create lane, but working) */
+.lane.scanning{background:color-mix(in srgb, var(--sage-soft) 32%, var(--bg));
+               border-color:color-mix(in srgb, var(--sage) 35%, var(--line));border-style:dashed}
+.lane.scanning .ph{color:var(--sage-strong)} .lane.scanning::before{background:var(--sage)}
+.lane .tag{font-size:9.5px;font-weight:800;letter-spacing:.06em;text-transform:uppercase;
+           padding:1px 6px;border-radius:5px;position:absolute;top:10px;right:26px}
+.lane.backfill .tag,.lane.scanning .tag{background:var(--sage-soft);color:var(--sage-strong)}
+.lane.live .tag{background:var(--ocean-soft);color:var(--ocean-strong)}
 @keyframes pulse{0%,100%{opacity:.25}50%{opacity:1}}
 .lane b{font-size:13px;display:block;font-variant-numeric:tabular-nums}
 .lane .ph{color:var(--sage-strong);font-size:12px;font-weight:600;margin-top:2px;display:block}
 .lane .meta{color:var(--muted);font-size:11.5px;display:block;margin-top:2px}
 .lane.idle{opacity:.5}
+/* dual engine status header */
+.engines{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+.estat{display:flex;align-items:center;gap:8px;padding:7px 14px;border-radius:12px;border:1px solid var(--line);background:var(--bg)}
+.estat .dot{width:8px;height:8px;border-radius:99px;background:var(--line)}
+.estat.on-back .dot{background:var(--sage);animation:pulse 1.6s ease-in-out infinite}
+.estat.on-live .dot{background:var(--ocean);animation:pulse 1.6s ease-in-out infinite}
+.estat .lbl{font-weight:700;font-size:12px}
+.estat .st{font-size:12px;color:var(--muted)}
+.estat.back .lbl{color:var(--sage-strong)} .estat.live .lbl{color:var(--ocean-strong)}
 .pace .prow{display:grid;grid-template-columns:92px 1fr 130px;gap:12px;align-items:center;margin:7px 0;font-size:12.5px}
 .pace .nm{font-weight:600;color:var(--muted)}
 .pace .pbar{height:8px;background:var(--line-soft);border-radius:99px;overflow:hidden}
@@ -142,7 +171,7 @@ pre{background:var(--bg);border:1px solid var(--line);border-radius:12px;padding
 .spill{font-size:9.5px;font-weight:800;letter-spacing:.06em;padding:1px 6px;border-radius:5px;
        text-transform:uppercase;flex-shrink:0;transform:translateY(3px)}
 .spill-backfill{background:var(--chip);color:var(--muted)}
-.spill-live{background:var(--sage-soft);color:var(--sage-strong)}
+.spill-live{background:var(--ocean-soft);color:var(--ocean-strong)}
 /* per-order detail drawer */
 .odetail{margin-top:8px;border-left:2px solid var(--line);padding:2px 0 2px 14px}
 .ocheck{display:flex;gap:8px;align-items:baseline;padding:3px 0;font-size:12.5px}
@@ -309,15 +338,17 @@ pre{background:var(--bg);border:1px solid var(--line);border-radius:12px;padding
 
 <!-- ============================ DASHBOARD ============================ -->
 <section id="tab-dash" style="display:none">
-  <div class="card" style="display:flex;gap:10px;align-items:center;margin-bottom:18px;padding:12px 18px">
-    <p class="eyebrow" style="margin:0">Engine</p>
-    <div class="seg" style="margin:0">
-      <button class="active" id="srcBackfill" onclick="setSource('')">Backfill</button>
-      <button id="srcLive" onclick="setSource('live')">Live sync</button>
+  <div class="card" style="margin-bottom:18px;padding:14px 18px">
+    <p class="eyebrow" style="margin:0 0 10px">Engines · both live together</p>
+    <div class="engines">
+      <div class="estat back" id="eBack"><span class="dot"></span>
+        <span class="lbl">Backfill</span><span class="st" id="eBackSt">connecting…</span></div>
+      <div class="estat live" id="eLive"><span class="dot"></span>
+        <span class="lbl">Live sync</span><span class="st" id="eLiveSt">connecting…</span></div>
+      <span class="hint" style="margin:0 0 0 auto">backfill.log + live.log</span>
     </div>
-    <span class="hint" id="srcHint" style="margin:0">tailing backfill.log</span>
   </div>
-  <div class="card" id="queueCard" style="display:none;margin-bottom:18px">
+  <div class="card" id="queueCard" style="margin-bottom:18px">
     <p class="eyebrow">Live queue</p>
     <div class="grid5">
       <div class="metric"><b id="qDepth">–</b><span>queued orders</span></div>
@@ -356,9 +387,9 @@ pre{background:var(--bg);border:1px solid var(--line);border-radius:12px;padding
   </div>
 
   <div class="card">
-    <p class="eyebrow">Worker lanes</p>
+    <p class="eyebrow">Activity · <span style="color:var(--sage-strong)">backfill lanes</span> + <span style="color:var(--ocean-strong)">live orders</span></p>
     <h2 id="laneTitle">– <span class="muted" id="laneCount" style="font-size:12px;font-weight:500"></span></h2>
-    <div class="lanes" id="laneGrid"><div class="lane idle"><b>waiting for engine…</b></div></div>
+    <div class="lanes" id="laneGrid"><div class="lane idle"><b>waiting for engines…</b></div></div>
     <div class="status" id="curOrder"></div>
   </div>
 
@@ -703,19 +734,42 @@ async function loadRaw(){
 }
 
 /* ---- dashboard live rendering ---- */
-function renderLanes(d){
-  const max=d.lanes_max||((d.lanes||[]).length)||0;
-  $("laneTitle").firstChild.textContent=(d.lanes||[]).length?`${(d.lanes||[]).length} order(s) in flight `:"idle ";
-  $("laneCount").textContent=max?`${(d.lanes||[]).length} busy / ${max} configured`:"";
-  const busy=(d.lanes||[]).map(l=>`
-    <div class="lane busy">
-      <b>${esc(l.id)}</b>
-      <span class="ph">${esc(l.phase)}</span>
-      <span class="meta">${esc(l.lane).replace("lane_","lane ")} · ref ${esc(l.ref)} · ${esc(l.items)} item(s) · ${l.age_s}s</span>
-    </div>`);
-  const idle=Math.max(0,max-(d.lanes||[]).length);
-  const idles=Array.from({length:idle},()=>'<div class="lane idle"><b>—</b><span class="ph">waiting for next order</span></div>');
-  $("laneGrid").innerHTML=busy.concat(idles).join("")||'<div class="lane idle"><b>engine idle</b></div>';
+function laneCard(l,cls,tag){
+  return `<div class="lane ${cls}"><span class="tag">${tag}</span>
+    <b>${esc(l.id)}</b>
+    <span class="ph">${esc(l.phase)}</span>
+    <span class="meta">${esc((l.lane||"").replace("lane_","lane "))||tag.toLowerCase()} · ref ${esc(l.ref)} · ${esc(l.items)} item(s) · ${l.age_s}s</span>
+  </div>`;
+}
+function renderLanes(){
+  const bl=(dBack.lanes||[]), ll=(dLive.lanes||[]);
+  const cards=[];
+  /* live orders first — deep blue/green, most time-sensitive */
+  ll.forEach(l=>cards.push(laneCard(l,"live","LIVE")));
+  /* backfill worker lanes — light green */
+  bl.forEach(l=>cards.push(laneCard(l,"backfill","BACKFILL")));
+  /* backfill working but skipping (no create lane) — show it as active, not idle */
+  const bStale=dBack.stale_s==null?999:dBack.stale_s;
+  const bScanning=!!dBack.engine_running && !bl.length && bStale<15;
+  if(bScanning){
+    const sk=(dBack.counts&&dBack.counts.skipped)||0;
+    const pg=dBack.page?`page ${dBack.page}/${dBack.page_total||"?"}`:"scanning";
+    cards.push(`<div class="lane scanning"><span class="tag">backfill</span>
+      <b>scanning window</b>
+      <span class="ph">skipping already-synced orders</span>
+      <span class="meta">${esc(pg)} · ${sk.toLocaleString()} skipped this session</span></div>`);
+  }
+  /* idle backfill lanes for context, only while creating */
+  if(bl.length){const max=dBack.lanes_max||bl.length;
+    for(let i=0;i<Math.max(0,max-bl.length);i++)
+      cards.push('<div class="lane idle"><b>—</b><span class="ph">waiting for next order</span></div>');}
+  const title = (ll.length||bl.length)
+      ? `${ll.length} live · ${bl.length} backfill in flight `
+      : (bScanning?"backfill scanning ":"idle ");
+  $("laneTitle").firstChild.textContent=title;
+  const max=dBack.lanes_max||0;
+  $("laneCount").textContent=max?`${bl.length} of ${max} backfill lanes busy`:"";
+  $("laneGrid").innerHTML=cards.join("")||'<div class="lane idle"><b>both engines idle</b></div>';
 }
 function renderPace(d){
   const p=d.pacing||{};
@@ -790,8 +844,8 @@ function renderWindow(d,cursor){
   $("winBar").style.width=pct.toFixed(1)+"%";
   const daysLeft=Math.max(0,(to-from)/864e5);
   $("winTitle").textContent=`${pct.toFixed(0)}% of the window swept · ${daysLeft.toFixed(1)} day(s) of orders remaining`;
-  $("winCounts").textContent=`${(lastD.counts?.created||0).toLocaleString()} / ${(lastD.counts?.held||0)}`;
-  $("winRate").textContent=`${lastD.rate_h||0} orders/h`;
+  $("winCounts").textContent=`${(d.counts?.created||0).toLocaleString()} / ${(d.counts?.held||0)}`;
+  $("winRate").textContent=`${d.rate_h||0} orders/h`;
 }
 let winStartCache=null;
 function windowStart(cursor){
@@ -805,43 +859,64 @@ function windowStart(cursor){
   return d;
 }
 
-/* ---- SSE ---- */
-let lastD={},cursorCache=null,es=null,src="";
-function setSource(which){
-  src=which;
-  $("srcBackfill").classList.toggle("active",which==="");
-  $("srcLive").classList.toggle("active",which==="live");
-  $("queueCard").style.display=which==="live"?"":"none";
-  $("srcHint").textContent=which==="live"?"tailing live.log":"tailing backfill.log";
-  if(es)es.close();
-  es=new EventSource("/api/stream"+(which?"?source=live":""));
-  es.onmessage=onStream;
+/* ---- SSE · both engines streamed at once (consolidated view) ---- */
+let dBack={},dLive={},cursorCache=null,esBack=null,esLive=null;
+function initStreams(){
+  if(esBack)esBack.close(); if(esLive)esLive.close();
+  esBack=new EventSource("/api/stream");
+  esBack.onmessage=e=>{dBack=JSON.parse(e.data);renderAll();};
+  esLive=new EventSource("/api/stream?source=live");
+  esLive.onmessage=e=>{dLive=JSON.parse(e.data);renderAll();};
 }
-function onStream(ev){
-  const d=JSON.parse(ev.data);lastD=d;
-  $("engineChip").textContent=d.engine_running?(d.stale_s>90?"engine silent "+d.stale_s+"s":"engine running"):"engine idle";
-  $("engineChip").className="chip "+(d.engine_running?(d.stale_s>90?"warn":"ok"):"warn");
-  $("slotTitle").textContent=d.slot&&d.slot!=="-"?`slot ${d.slot}`:"between slots";
-  $("slotPage").textContent=`${d.page} of ${d.page_total||"?"}`;
-  $("slotOrders").textContent=`${d.page_done} done / ${d.page_orders}`;
-  $("slotSkipped").textContent=d.counts.skipped||0;
-  $("slotErrors").textContent=d.counts.errors||0;
-  const pct=d.page_orders?Math.round(100*d.page_done/d.page_orders):0;
+function engineStatus(d,kind){
+  if(!d||d.engine_running===undefined)return "connecting…";
+  if(!d.engine_running)return "stopped";
+  const stale=d.stale_s||0;
+  if(stale>90)return "silent "+stale+"s";
+  if(kind==="live")return (d.queue_depth>0)?`working · ${d.queue_depth} queued`:"watching · queue empty";
+  if((d.lanes||[]).length)return `creating · ${(d.lanes||[]).length} lane(s)`;
+  if(stale<15)return "scanning · skipping synced orders";
+  return "running";
+}
+function renderAll(){
+  const bRun=!!(dBack.engine_running&&(dBack.stale_s||0)<90);
+  const lRun=!!(dLive.engine_running&&(dLive.stale_s||0)<90);
+  $("eBackSt").textContent=engineStatus(dBack,"back");
+  $("eBack").classList.toggle("on-back",bRun);
+  $("eLiveSt").textContent=engineStatus(dLive,"live");
+  $("eLive").classList.toggle("on-live",lRun);
+  const anyRun=dBack.engine_running||dLive.engine_running;
+  $("engineChip").textContent=anyRun?"engine running":"engine idle";
+  $("engineChip").className="chip "+(anyRun?"ok":"warn");
+  /* current period + slot come from the backfill engine */
+  $("slotTitle").textContent=dBack.slot&&dBack.slot!=="-"?`slot ${dBack.slot}`
+      :(dBack.engine_running?"scanning…":"between slots");
+  $("slotPage").textContent=`${dBack.page||0} of ${dBack.page_total||"?"}`;
+  $("slotOrders").textContent=`${dBack.page_done||0} done / ${dBack.page_orders||0}`;
+  $("slotSkipped").textContent=((dBack.counts&&dBack.counts.skipped)||0).toLocaleString();
+  $("slotErrors").textContent=(dBack.counts&&dBack.counts.errors)||0;
+  const pct=dBack.page_orders?Math.round(100*dBack.page_done/dBack.page_orders):0;
   $("pageBar").style.width=pct+"%";
-  renderLanes(d);renderPace(d);renderSpark(d);
-  if(cursorCache)renderWindow(d,cursorCache);
-  if(src==="live"){
-    $("qDepth").textContent=d.queue_depth==null?"–":d.queue_depth;
-    $("qAge").textContent=d.queue_depth?((d.queue_age||0)+"s"):"—";
-    $("qToday").textContent=d.processed_today||0;
-  }
-  $("curOrder").textContent=d.last_result?("last: "+d.last_result):"";
-  $("feed").innerHTML=(d.recent||[]).map(r=>`<li><span class="t">${esc(r[0].slice(11))}</span><span class="evt-icon evt-${r[1]==="✓"?"created":r[1]==="◼"?"held":"error"}">${esc(r[1])}</span><div>${esc(r[2])}</div></li>`).join("");
+  /* live queue always visible */
+  $("qDepth").textContent=dLive.queue_depth==null?"–":dLive.queue_depth;
+  $("qAge").textContent=dLive.queue_depth?((dLive.queue_age||0)+"s"):"—";
+  $("qToday").textContent=dLive.processed_today||0;
+  renderLanes();renderPace(dBack);renderSpark(dBack);
+  if(cursorCache)renderWindow(dBack,cursorCache);
+  const lastr=dLive.last_result||dBack.last_result;
+  $("curOrder").textContent=lastr?("last: "+lastr):"";
+  /* merged completions feed, newest first, source-tagged */
+  const merged=[].concat((dLive.recent||[]).map(r=>[r[0],r[1],r[2],"live"]),
+                         (dBack.recent||[]).map(r=>[r[0],r[1],r[2],"backfill"]))
+    .sort((a,b)=>a[0]<b[0]?1:-1).slice(0,12);
+  $("feed").innerHTML=merged.map(r=>`<li><span class="t">${esc(r[0].slice(11))}</span>`
+    +`<span class="evt-icon evt-${r[1]==="✓"?"created":r[1]==="◼"?"held":"error"}">${esc(r[1])}</span>`
+    +`<div>${esc(r[2])} <span class="spill spill-${r[3]}">${r[3]}</span></div></li>`).join("");
 }
-setSource("");
+initStreams();
 async function pollCursor(){
   const s=await api("/api/state");cursorCache=s.cursor||null;
-  if(cursorCache&&lastD)renderWindow(lastD,cursorCache);
+  if(cursorCache)renderWindow(dBack,cursorCache);
   const c=cursorCache;
   if(c&&c.from_date){
     $("winCurrent").innerHTML=`current: <b>${esc(c.from_date.replace("T"," "))} → ${esc(c.to_date||"")}</b> · page ${c.next_page}/${c.total_pages} · ${esc(c.status)}`;
