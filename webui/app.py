@@ -93,8 +93,9 @@ class LogHistory:
 
     EVENT_CAP = 4000
 
-    def __init__(self, path):
+    def __init__(self, path, source="backfill"):
         self.path = path
+        self.source = source
         self._offset = 0
         self._runs = []
         self._events = []
@@ -107,7 +108,12 @@ class LogHistory:
         self.last_ts = ""
 
     def _push(self, ts, kind, text, raw=""):
-        self._events.append({"ts": ts, "kind": kind, "text": text, "raw": raw})
+        oid = ""
+        m = re.search(r"[Oo]rder (\S+)", text)
+        if m and m.group(1).isdigit():
+            oid = m.group(1)
+        self._events.append({"ts": ts, "kind": kind, "text": text, "raw": raw,
+                             "source": self.source, "oid": oid})
         if len(self._events) > self.EVENT_CAP:
             del self._events[: len(self._events) - self.EVENT_CAP]
 
@@ -235,9 +241,111 @@ class LogHistory:
         return list(self._events)
 
 
+def order_trace(oid, logs, tail_bytes=8_000_000):
+    """v1.6: reconstruct the checks a single order went through, from the
+    tail of the given log files. Uses the [lane] token to gather the window
+    of lines between an order's 'ORDER begin' and its resolution, then
+    classifies each into a human-readable check + result. Read-only."""
+    import re as _re
+    LINE = _re.compile(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}),\d+ (\w+)\s+"
+                       r"(?:\[([\w-]+)\] )?(.*)$")
+    # phase classifiers: (regex on msg) -> (label, how to read the result)
+    CHECKS = [
+        (_re.compile(r"orders/search -> 200 (.*)"), "Deduplication check",
+         lambda m: ("already in HubSpot — skipped"
+                    if '"total":0' not in m.group(1) else "not found — will create")),
+        (_re.compile(r"contacts/search -> 200 (.*)"), "Contact lookup by phone",
+         lambda m: ("matched an existing contact"
+                    if '"total":0' not in m.group(1) else "no match — will create")),
+        (_re.compile(r"POST /crm/v3/objects/contacts -> 20\d"), "Contact created", None),
+        (_re.compile(r"products/search -> 200 (.*)"), "Catalog / product check",
+         lambda m: ("product found" if '"total":0' not in m.group(1) else "not in catalog")),
+        (_re.compile(r"objects/2-\d+/search -> 200 (.*)"), "Bundle / component check",
+         lambda m: ("match" if '"total":0' not in m.group(1) else "none")),
+        (_re.compile(r"POST /crm/v3/objects/orders -> 20\d"), "Order created in HubSpot", None),
+        (_re.compile(r"PATCH /crm/v3/objects/orders/"), "Order patched (stage / sync)", None),
+        (_re.compile(r"POST /crm/v3/objects/line_items -> 20\d"), "Line item created", None),
+        (_re.compile(r"PATCH /crm/v3/objects/line_items/"), "Line item stamped with product", None),
+        (_re.compile(r"associations/.*batch/create -> 20\d"), "Records linked (association)", None),
+        (_re.compile(r"PHASE drive upload"), "Order JSON archived to Drive", None),
+        (_re.compile(r"PHASE sheet append"), "Audit row written", None),
+        (_re.compile(r"PHASE sheet update"), "Audit row updated", None),
+    ]
+    header = {}
+    checks = []
+    for src_name, path in logs:
+        if not path.exists():
+            continue
+        size = path.stat().st_size
+        with open(path, "rb") as f:
+            if size > tail_bytes:
+                f.seek(size - tail_bytes)
+                f.readline()  # drop the partial first line
+            data = f.read().decode("utf-8", "replace")
+        lane_oid = {}          # lane -> the order id it is currently processing
+        capturing_lane = None
+        for line in data.splitlines():
+            m = LINE.match(line)
+            if not m:
+                continue
+            ts, level, lane, msg = m.groups()
+            lane = lane or "main"
+            b = _re.search(r"ORDER begin (\S+) ref (\S+) items=(\d+)", msg)
+            if b:
+                lane_oid[lane] = b.group(1)
+                if b.group(1) == oid:
+                    header = {"source": src_name, "ts": ts, "ref": b.group(2),
+                              "items": b.group(3)}
+                    capturing_lane = lane
+                    checks = []
+                continue
+            cr = _re.search(r"CREATED order (\S+) -> HubSpot (\S+) \((\w+) contact (\S+)\)", msg)
+            if cr and cr.group(1) == oid:
+                header["result"] = "created"
+                header["hs_order_id"] = cr.group(2)
+                header["contact_kind"] = cr.group(3)
+                header["hs_contact_id"] = cr.group(4)
+                checks.append({"ts": ts, "label": "Order fully synced", "ok": "ok",
+                               "detail": f"HubSpot order {cr.group(2)}, "
+                                         f"{cr.group(3)} contact {cr.group(4)}"})
+                capturing_lane = None
+                continue
+            hd = _re.search(r"HELD order (\S+) \((\d+) unverified", msg)
+            if hd and hd.group(1) == oid:
+                header["result"] = "held"
+                checks.append({"ts": ts, "label": "Held for catalog approval", "ok": "warn",
+                               "detail": f"{hd.group(2)} item(s) not yet approved"})
+                capturing_lane = None
+                continue
+            sk = _re.search(r"skip existing (\S+)", msg)
+            if sk and sk.group(1) == oid:
+                header.setdefault("source", src_name)
+                header.setdefault("ts", ts)
+                header["result"] = "deduplicated"
+                checks.append({"ts": ts, "label": "Deduplication", "ok": "ok",
+                               "detail": "already in HubSpot — skipped (no duplicate)"})
+                continue
+            if level == "ERROR" and oid in msg:
+                header.setdefault("result", "error")
+                checks.append({"ts": ts, "label": "Error", "ok": "err",
+                               "detail": msg[:200]})
+                continue
+            # trace lines: only while capturing this order's lane window
+            if capturing_lane and lane == capturing_lane:
+                for rx, label, reader in CHECKS:
+                    mm = rx.search(msg)
+                    if mm:
+                        detail = reader(mm) if reader else ""
+                        checks.append({"ts": ts, "label": label,
+                                       "ok": "ok", "detail": detail})
+                        break
+    return {"order_id": oid, "header": header, "checks": checks}
+
+
 def create_app():
     app = Flask(__name__, static_folder=str(ROOT / "webui" / "static"))
-    history = LogHistory(LOG)
+    history = LogHistory(LOG, source="backfill")
+    live_history = LogHistory(LIVELOG, source="live")
 
     @app.get("/")
     def index():
@@ -386,7 +494,7 @@ def create_app():
         try:
             import backfill
             c = backfill.Config.load(str(CONFIG))
-            backfill.apply_portal_config(c)
+            getattr(backfill, "apply_portal_config", lambda _c: None)(c)
             valid = True
             err = ""
         except SystemExit as e:
@@ -531,13 +639,25 @@ def create_app():
 
     @app.get("/api/events")
     def events():
-        """Human-readable event feed from the recent log, filterable."""
-        kind = request.args.get("kind", "")     # created|held|skip|error|pacing|system
+        """Human-readable event feed merged across the backfill and live logs,
+        filterable by kind (created|held|skip|error|pacing|system) and source
+        (backfill|live). Each event carries source + oid for the UI blobs and
+        per-order drill-down."""
+        kind = request.args.get("kind", "")
+        source = request.args.get("source", "")   # ''|backfill|live
         q = request.args.get("q", "").strip().lower()
         limit = min(int(request.args.get("limit", 300)), 1000)
+        merged = list(history.events())
+        if source != "backfill":
+            merged += list(live_history.events())
+        if source == "backfill":
+            merged = list(history.events())
+        merged.sort(key=lambda e: e["ts"])
         out = []
-        for ev in reversed(history.events()):
+        for ev in reversed(merged):
             if kind and ev["kind"] != kind:
+                continue
+            if source and ev.get("source") != source:
                 continue
             if q and q not in ev["text"].lower() and q not in ev.get("raw", "").lower():
                 continue
@@ -545,6 +665,39 @@ def create_app():
             if len(out) >= limit:
                 break
         return jsonify({"events": out})
+
+    @app.get("/api/order/<oid>")
+    def order_detail(oid):
+        """v1.6: the full check trace a single order went through, read from
+        both logs. Powers the click-to-expand order detail."""
+        if not oid.isdigit():
+            return jsonify({"error": "bad order id"}), 400
+        return jsonify(order_trace(oid, [("backfill", LOG), ("live", LIVELOG)]))
+
+    @app.post("/api/window")
+    def set_window():
+        """v1.6: set the backfill window (cursor) from a date range without the
+        full wizard. Refused while the engine is running so a live sweep is
+        never disturbed mid-slot."""
+        if engine_running():
+            return jsonify({"ok": False, "error": "stop the backfill before "
+                            "changing its window"})
+        body = request.get_json(force=True)
+        frm, to = body.get("from", "").strip(), body.get("to", "").strip()
+        if not frm or not to:
+            return jsonify({"ok": False, "error": "pick both a from and to date"})
+        if len(frm) == 16:
+            frm += ":00"
+        try:
+            cfg = json.loads(CONFIG.read_text())
+        except Exception:
+            return jsonify({"ok": False, "error": "config.json not saved yet"})
+        state_file = cfg.get("state_file", "cursor.json")
+        (ROOT / state_file).write_text(json.dumps(
+            {"from_date": frm, "to_date": to, "next_page": 1,
+             "total_pages": 1, "status": "running"}, indent=2))
+        return jsonify({"ok": True, "note": f"window set {frm} → {to}; "
+                        "press Start when ready"})
 
     @app.get("/api/errors")
     def errors():

@@ -21,14 +21,14 @@
                             "data": {
                                 "editable": "true"
                             },
-                            "label": "salla-live-intake (create new on import)"
+                            "label": "Create a NEW webhook on import"
                         }
                     }
                 },
                 "parameters": [
                     {
                         "name": "__IMTHOOK__",
-                        "type": "hook",
+                        "type": "hook:salla15",
                         "label": "Webhook",
                         "required": true
                     }
@@ -67,7 +67,7 @@
                 "designer": {
                     "x": 300,
                     "y": 0,
-                    "name": "Enqueue (Live Queue sheet, RAW)"
+                    "name": "Enqueue (Live Queue, RAW)"
                 },
                 "restore": {
                     "expect": {
@@ -93,79 +93,63 @@
                             "label": "Insert rows"
                         },
                         "useColumnHeaders": {
-                            "label": "No",
-                            "nested": [
-                                {
-                                    "name": "values",
-                                    "spec": [
-                                        {
-                                            "name": "0",
-                                            "type": "text",
-                                            "label": "received_at (A)"
-                                        },
-                                        {
-                                            "name": "1",
-                                            "type": "text",
-                                            "label": "order_id (B)"
-                                        },
-                                        {
-                                            "name": "2",
-                                            "type": "text",
-                                            "label": "reference_id (C)"
-                                        },
-                                        {
-                                            "name": "3",
-                                            "type": "text",
-                                            "label": "event (D)"
-                                        },
-                                        {
-                                            "name": "4",
-                                            "type": "text",
-                                            "label": "status (E)"
-                                        },
-                                        {
-                                            "name": "5",
-                                            "type": "text",
-                                            "label": "attempts (F)"
-                                        },
-                                        {
-                                            "name": "6",
-                                            "type": "text",
-                                            "label": "source (G)"
-                                        },
-                                        {
-                                            "name": "7",
-                                            "type": "text",
-                                            "label": "note (H)"
-                                        }
-                                    ]
-                                }
-                            ]
+                            "label": "No"
                         },
                         "valueInputOption": {
                             "mode": "chose",
                             "label": "Raw"
                         }
+                    },
+                    "parameters": {
+                        "__IMTCONN__": {
+                            "label": "Your Google Sheets connection"
+                        }
                     }
-                }
+                },
+                "parameters": [
+                    {
+                        "name": "__IMTCONN__",
+                        "type": "account:google",
+                        "label": "Connection",
+                        "required": true
+                    }
+                ]
             },
             "onerror": [
                 {
                     "id": 3,
                     "module": "builtin:Break",
                     "version": 1,
-                    "parameters": {},
                     "mapper": {
+                        "retry": true,
                         "count": "10",
-                        "interval": "15",
-                        "retry": true
+                        "interval": "15"
                     },
                     "metadata": {
                         "designer": {
                             "x": 300,
                             "y": 300,
                             "name": "Retry later (never drop an event)"
-                        }
+                        },
+                        "parameters": [
+                            {
+                                "name": "count",
+                                "type": "uinteger",
+                                "label": "Number of consecutive errors",
+                                "required": true
+                            },
+                            {
+                                "name": "interval",
+                                "type": "uinteger",
+                                "label": "Interval between attempts (minutes)",
+                                "required": true
+                            },
+                            {
+                                "name": "retry",
+                                "type": "boolean",
+                                "label": "Retry"
+                            }
+                        ]
                     }
                 }
             ]
@@ -176,7 +160,7 @@
         "version": 1,
         "scenario": {
             "roundtrips": 1,
-            "maxErrors": 10,
+            "maxErrors": 3,
             "autoCommit": true,
             "autoCommitTriggerLast": true,
             "sequential": true,
@@ -189,9 +173,6 @@
         "designer": {
             "orphans": []
         },
-        "zone": "eu1.make.com",
-        "notes": [
-            "2-op replacement intake for 'Salla | Order Created': the local live-sync engine consumes the Live Queue sheet and does everything else. Enable 'Allow storing of incomplete executions' in scenario settings so the Break retry works. On import: create a NEW webhook on the Salla connection, select the 'Salla Live Queue' spreadsheet (created by python live.py --init-queue) and its 'Live Queue' tab."
-        ]
+        "zone": "eu1.make.com"
     }
 }
