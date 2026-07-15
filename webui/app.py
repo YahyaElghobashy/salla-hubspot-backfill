@@ -32,7 +32,9 @@ CTX = ssl.create_default_context()
 ENV_FILE = ROOT / ".env"
 CONFIG = ROOT / "config.json"
 LOG = ROOT / "backfill.log"
+LIVELOG = ROOT / "live.log"          # v1.6 live-sync service log
 PIDFILE = ROOT / "engine.pid"
+LIVEPID = ROOT / "live.pid"
 
 
 def _env():
@@ -40,15 +42,23 @@ def _env():
     return os.environ
 
 
-def engine_running():
-    if not PIDFILE.exists():
+def _pid_alive(pidfile):
+    if not pidfile.exists():
         return False
     try:
-        pid = int(PIDFILE.read_text().strip())
+        pid = int(pidfile.read_text().strip())
         os.kill(pid, 0)
         return True
     except (ValueError, ProcessLookupError, PermissionError, OSError):
         return False
+
+
+def engine_running():
+    return _pid_alive(PIDFILE)
+
+
+def live_running():
+    return _pid_alive(LIVEPID)
 
 
 def hs_get(path, token):
@@ -262,8 +272,11 @@ def create_app():
             "google_token_cached": (ROOT / "token.json").exists(),
             "cursor": cursor,
             "engine_running": engine_running(),
+            "live_running": live_running(),
             "stop_file": (ROOT / "STOP").exists(),
+            "stop_live_file": (ROOT / "STOP.live").exists(),
             "log_present": LOG.exists(),
+            "live_log_present": LIVELOG.exists(),
         })
 
     # ---- wizard ------------------------------------------------------------
@@ -384,10 +397,23 @@ def create_app():
 
     @app.post("/api/run")
     def run():
-        if engine_running():
-            return jsonify({"ok": False, "error": "engine already running"})
         body = request.get_json(force=True)
         mode = body.get("mode", "dry")
+        if mode == "live-sync":
+            # v1.6: the 24/7 queue consumer (live.py under the supervisor)
+            if live_running():
+                return jsonify({"ok": False, "error": "live sync already running"})
+            if body.get("confirm") != "RUN":
+                return jsonify({"ok": False, "error": 'type RUN in the confirmation box'})
+            (ROOT / "STOP.live").unlink(missing_ok=True)
+            cmd = [sys.executable, "-u", "run.py", "--mode", "live", "--live", "--yes"]
+            if body.get("workers"):
+                cmd += ["--workers", str(int(body["workers"]))]
+            logf = open(ROOT / "supervisor.live.out", "a")
+            subprocess.Popen(cmd, stdout=logf, stderr=logf, start_new_session=True)
+            return jsonify({"ok": True})
+        if engine_running():
+            return jsonify({"ok": False, "error": "engine already running"})
         if mode == "live" and body.get("confirm") != "RUN":
             return jsonify({"ok": False, "error": 'type RUN in the confirmation box'})
         (ROOT / "STOP").unlink(missing_ok=True)
@@ -406,6 +432,11 @@ def create_app():
 
     @app.post("/api/stop")
     def stop():
+        body = request.get_json(silent=True) or {}
+        if body.get("scope") == "live":
+            (ROOT / "STOP.live").touch()
+            return jsonify({"ok": True, "note": "live sync finishes in-flight "
+                            "orders, then halts; queued rows stay in the sheet"})
         (ROOT / "STOP").touch()
         return jsonify({"ok": True, "note": "engine finishes the current order, "
                         "then halts; cursor stays safe and resume is free"})
@@ -414,13 +445,16 @@ def create_app():
 
     @app.get("/api/stream")
     def stream():
+        src = LIVELOG if request.args.get("source") == "live" else LOG
+        running_fn = live_running if request.args.get("source") == "live" else engine_running
+
         def gen():
             st = dash.State(target=0)
             f = None
             last_emit = 0.0
             while True:
-                if f is None and LOG.exists():
-                    f = open(LOG, encoding="utf-8", errors="replace")
+                if f is None and src.exists():
+                    f = open(src, encoding="utf-8", errors="replace")
                     f.seek(0, 2)
                 if f:
                     while True:
@@ -435,7 +469,10 @@ def create_app():
                     last_emit = now
                     lanes = st.lanes_list()
                     payload = {
-                        "engine_running": engine_running(),
+                        "engine_running": running_fn(),
+                        "queue_depth": st.queue_depth,
+                        "queue_age": st.queue_age,
+                        "processed_today": st.processed_today,
                         # legacy fields (phase/current) mirror the busiest lane
                         "phase": lanes[0]["phase"] if lanes else "idle",
                         "slot": st.slot,
@@ -464,9 +501,10 @@ def create_app():
     @app.get("/api/log")
     def logtail():
         n = min(int(request.args.get("lines", 200)), 2000)
-        if not LOG.exists():
+        src = LIVELOG if request.args.get("source") == "live" else LOG
+        if not src.exists():
             return jsonify({"lines": []})
-        lines = LOG.read_text(encoding="utf-8", errors="replace").splitlines()[-n:]
+        lines = src.read_text(encoding="utf-8", errors="replace").splitlines()[-n:]
         return jsonify({"lines": lines})
 
     # ---- run history + readable events (v1.6) -------------------------------

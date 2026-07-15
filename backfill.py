@@ -354,6 +354,17 @@ class Config:
     # account-wide HubSpot search ceiling; higher values add only 429 risk.
     workers: int = 1
 
+    # v1.6 live sync (see live.py). The queue lives in its OWN spreadsheet so
+    # the audit workbook's cell budget is untouched.
+    queue_spreadsheet_id: str = ""
+    live_queue_tab: str = "Live Queue"
+    live_poll_s: float = 20.0
+    live_sweep_minutes: int = 60
+    live_sweep_window_h: int = 6
+    live_max_attempts: int = 8
+    live_trim_days: int = 7
+    live_trim_hour: int = 4
+
     @staticmethod
     def load(path):
         with open(path) as f:
@@ -500,6 +511,41 @@ class RelayClient:
 
 
 # ----------------------------------------------------------------------------
+# Created ledger (v1.6)
+# ----------------------------------------------------------------------------
+
+class CreatedLedger:
+    """Persistent salla_order_id -> HubSpot order id map. The HubSpot search
+    index is eventually consistent (fresh objects take seconds-to-minutes to
+    become searchable), so live mode must not rely on the dedup search alone:
+    this ledger records every create the moment it succeeds and is consulted
+    FIRST. Append-only CSV, loaded at start, thread safe."""
+
+    def __init__(self, outdir="mirror"):
+        self.path = Path(outdir) / "created.csv"
+        self._lock = threading.Lock()
+        self._map = {}
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        if self.path.exists():
+            with open(self.path, newline="") as f:
+                for row in csv.reader(f):
+                    if len(row) >= 3 and row[1] != "salla_order_id":
+                        self._map[str(row[1])] = str(row[2])
+        else:
+            with open(self.path, "w", newline="") as f:
+                csv.writer(f).writerow(["ts", "salla_order_id", "hubspot_order_id"])
+
+    def get(self, salla_order_id):
+        return self._map.get(str(salla_order_id))
+
+    def add(self, salla_order_id, hubspot_order_id):
+        with self._lock:
+            self._map[str(salla_order_id)] = str(hubspot_order_id)
+            with open(self.path, "a", newline="") as f:
+                csv.writer(f).writerow([now_str(), salla_order_id, hubspot_order_id])
+
+
+# ----------------------------------------------------------------------------
 # HubSpot client
 # ----------------------------------------------------------------------------
 
@@ -582,6 +628,26 @@ class HubSpot:
         if status != 200:
             raise RuntimeError(f"{what}: HubSpot search {status}: {json.dumps(data)[:300]}")
         return data
+
+    def find_order_by_salla_id(self, salla_order_id):
+        """v1.6: like the dedup search but returns the HubSpot order id."""
+        data = self.search("/crm/v3/objects/orders/search", {
+            "filterGroups": [{"filters": [{"propertyName": "salla_order_id",
+                                           "operator": "EQ",
+                                           "value": str(salla_order_id)}]}],
+            "properties": ["hs_object_id"], "limit": 1}, f"find {salla_order_id}")
+        results = data.get("results", [])
+        return results[0]["id"] if results else None
+
+    def order_line_item_count(self, order_id):
+        """v1.6: partial-order detector -- a crash between order create and
+        line items leaves an order with zero LI associations."""
+        status, data = self._req(
+            "GET", f"/crm/v4/objects/orders/{order_id}/associations/line_items?limit=100",
+            what="li count")
+        if status != 200:
+            return -1  # unknown; caller must not treat as healthy
+        return len(data.get("results", []))
 
     def dedup_order_exists(self, salla_order_id):
         """[M310] POST /crm/v3/objects/orders/search on salla_order_id."""
@@ -773,10 +839,31 @@ class HubSpot:
                                      "types": [{"associationCategory": "HUBSPOT_DEFINED",
                                                 "associationTypeId": ASSOC_ORDER_CONTACT}]}]
         status, data = self._write("POST", "/crm/v3/objects/orders", body, "create order")
-        if status not in (200, 201):
-            log.error("Order create failed (%s): %s", status, json.dumps(data)[:400])
-            return None
-        return data.get("id")
+        if status in (200, 201):
+            return data.get("id"), True   # (id, was_fresh)
+        # v1.6 duplicate guardrail: HubSpot rejects a second order carrying the
+        # same external id at WRITE time even while the search index still
+        # can't see the first one. Resolve to the existing order instead of
+        # erroring (mirrors the v1.1 contact race guardrail).
+        text = json.dumps(data)
+        if status == 400 and ("already has that value" in text
+                              or "hs_external_order_id" in text
+                              or "DUPLICATE" in text.upper()):
+            log.warning("Order create rejected as duplicate for salla %s: "
+                        "re-searching in %ss (duplicate guardrail)",
+                        order.get("id"), RACE_RETRY_WAIT_S)
+            time.sleep(RACE_RETRY_WAIT_S)
+            try:
+                existing = self.find_order_by_salla_id(order.get("id"))
+            except Exception as e:
+                log.error("Duplicate guardrail re-search failed: %s", e)
+                existing = None
+            if existing:
+                log.info("Duplicate guardrail resolved salla %s -> existing HS %s",
+                         order.get("id"), existing)
+                return existing, False    # pre-existing: caller must NOT add items
+        log.error("Order create failed (%s): %s", status, text[:400])
+        return None, False
 
     def patch_order(self, order_id, props, what):
         return self._write("PATCH", f"/crm/v3/objects/orders/{order_id}",
@@ -1015,6 +1102,160 @@ class GoogleIO:
         except Exception as e:  # [oe240 Resume / oe244 Ignore]
             log.error("Audit update (%s) failed on row %s: %s", what, row_number, e)
 
+    # ---- v1.6 live-sync queue (its own spreadsheet, tab cfg.queue_tab) ------
+    # Columns: A received_at | B order_id | C reference_id | D event
+    #          E status (queued/done/held/error/gone) | F attempts
+    #          G source (webhook/sweep) | H note        Heartbeat cell: J1
+
+    QUEUE_HEADERS = ["received_at", "order_id", "reference_id", "event",
+                     "status", "attempts", "source", "note"]
+
+    def ensure_queue_spreadsheet(self, title="Salla Live Queue"):
+        """Create the dedicated queue spreadsheet + header row; returns id."""
+        body = {"properties": {"title": title},
+                "sheets": [{"properties": {"title": self.cfg.live_queue_tab}}]}
+        resp = self._gexec(
+            self.sheets.create(body=body, fields="spreadsheetId,spreadsheetUrl"),
+            "queue spreadsheet create", self.sheets_rl)
+        qsid = resp["spreadsheetId"]
+        self._gexec(self.sheets.values().update(
+            spreadsheetId=qsid, range=f"'{self.cfg.live_queue_tab}'!A1:H1",
+            valueInputOption="RAW", body={"values": [self.QUEUE_HEADERS]}),
+            "queue headers", self.sheets_rl)
+        return qsid, resp.get("spreadsheetUrl", "")
+
+    @staticmethod
+    def _norm_id(v):
+        """Sheets may hand ids back as floats (1.02e+12) -- normalize hard."""
+        if v is None or v == "":
+            return ""
+        if isinstance(v, float):
+            return str(int(v))
+        return str(v).strip()
+
+    def queue_read(self, qsid, start_row=2):
+        """All queue rows from start_row down. Returns list of dicts with
+        1-based sheet row numbers. UNFORMATTED_VALUE dodges display mangling."""
+        resp = self._gexec(self.sheets.values().get(
+            spreadsheetId=qsid,
+            range=f"'{self.cfg.live_queue_tab}'!A{start_row}:H",
+            valueRenderOption="UNFORMATTED_VALUE"),
+            "queue read", self.sheets_rl)
+        out = []
+        for i, raw in enumerate(resp.get("values", []) or []):
+            raw = list(raw) + [""] * (8 - len(raw))
+            out.append({
+                "row": start_row + i,
+                "received_at": str(raw[0]),
+                "order_id": self._norm_id(raw[1]),
+                "reference_id": self._norm_id(raw[2]),
+                "event": str(raw[3]),
+                "status": str(raw[4]).strip().lower(),
+                "attempts": int(raw[5] or 0),
+                "source": str(raw[6]),
+                "note": str(raw[7]),
+            })
+        return out
+
+    def queue_mark(self, qsid, row, expect_order_id, status, attempts, note):
+        """Verify-then-write: re-read the row's order_id immediately before
+        writing so a human sort/insert can never retarget a status update.
+        Returns True when the write landed on the intended row."""
+        resp = self._gexec(self.sheets.values().get(
+            spreadsheetId=qsid, range=f"'{self.cfg.live_queue_tab}'!B{row}",
+            valueRenderOption="UNFORMATTED_VALUE"),
+            "queue verify", self.sheets_rl)
+        got = self._norm_id(((resp.get("values") or [[""]])[0] or [""])[0])
+        if got != str(expect_order_id):
+            log.error("QUEUE row %s moved (expected order %s, found %s) -- "
+                      "write refused; row will be reprocessed by rescan",
+                      row, expect_order_id, got)
+            return False
+        self._gexec(self.sheets.values().update(
+            spreadsheetId=qsid, range=f"'{self.cfg.live_queue_tab}'!E{row}:H{row}",
+            valueInputOption="RAW",
+            body={"values": [[status, attempts, None, note]]}),
+            f"queue mark {status}", self.sheets_rl)
+        return True
+
+    def queue_mark_batch(self, qsid, marks):
+        """Bulk verify-then-write for pre-existing resolutions: `marks` is a
+        list of (row, expect_order_id, status, attempts, note). One batchGet
+        + one batchUpdate instead of 2 calls per row. Returns rows written."""
+        if not marks:
+            return 0
+        ranges = [f"'{self.cfg.live_queue_tab}'!B{m[0]}" for m in marks]
+        resp = self._gexec(self.sheets.values().batchGet(
+            spreadsheetId=qsid, ranges=ranges,
+            valueRenderOption="UNFORMATTED_VALUE"),
+            "queue verify batch", self.sheets_rl)
+        got = [self._norm_id((((vr.get("values") or [[""]])[0]) or [""])[0])
+               for vr in resp.get("valueRanges", [])]
+        data, ok = [], 0
+        for (row, expect, status, attempts, note), have in zip(marks, got):
+            if have != str(expect):
+                log.error("QUEUE row %s moved (expected order %s, found %s) -- "
+                          "batch write skips it", row, expect, have)
+                continue
+            data.append({"range": f"'{self.cfg.live_queue_tab}'!E{row}:H{row}",
+                         "values": [[status, attempts, None, note]]})
+            ok += 1
+        if data:
+            self._gexec(self.sheets.values().batchUpdate(
+                spreadsheetId=qsid,
+                body={"valueInputOption": "RAW", "data": data}),
+                "queue mark batch", self.sheets_rl)
+        return ok
+
+    def queue_append_rows(self, qsid, rows):
+        """Sweep producer: append [received_at, order_id, ref, event, status,
+        attempts, source, note] rows. RAW so ids stay verbatim."""
+        self._gexec(self.sheets.values().append(
+            spreadsheetId=qsid, range=f"'{self.cfg.live_queue_tab}'!A:H",
+            valueInputOption="RAW", insertDataOption="INSERT_ROWS",
+            body={"values": rows}), "queue sweep append", self.sheets_rl)
+
+    def queue_read_heartbeat(self, qsid):
+        """Return the current heartbeat cell content (owner|epoch) or ''."""
+        resp = self._gexec(self.sheets.values().get(
+            spreadsheetId=qsid, range=f"'{self.cfg.live_queue_tab}'!J1",
+            valueRenderOption="UNFORMATTED_VALUE"),
+            "queue heartbeat read", self.sheets_rl)
+        return str((((resp.get("values") or [[""]])[0]) or [""])[0])
+
+    def queue_write_heartbeat(self, qsid, instance_id):
+        self._gexec(self.sheets.values().update(
+            spreadsheetId=qsid, range=f"'{self.cfg.live_queue_tab}'!J1",
+            valueInputOption="RAW",
+            body={"values": [[f"{instance_id}|{int(time.time())}"]]}),
+            "queue heartbeat write", self.sheets_rl)
+
+    def queue_trim(self, qsid, keep_predicate):
+        """Delete terminal rows failing keep_predicate(row_dict). Caller must
+        hold the claim pause (engine is the ONLY deleter). Deletes bottom-up
+        so indices stay valid."""
+        rows = self.queue_read(qsid)
+        # held rows are deliberately NEVER trimmed: they are the sweep's
+        # memory that an order was seen and intentionally not created (catalog
+        # gate). Deleting them would make every sweep re-hold the same order.
+        doomed = [r["row"] for r in rows
+                  if r["status"] in ("done", "gone") and not keep_predicate(r)]
+        if not doomed:
+            return 0
+        meta = self._gexec(self.sheets.get(
+            spreadsheetId=qsid, fields="sheets(properties(sheetId,title))"),
+            "queue meta", self.sheets_rl)
+        gid = next(p["properties"]["sheetId"] for p in meta["sheets"]
+                   if p["properties"]["title"] == self.cfg.live_queue_tab)
+        requests = [{"deleteDimension": {"range": {
+            "sheetId": gid, "dimension": "ROWS",
+            "startIndex": r - 1, "endIndex": r}}}
+            for r in sorted(doomed, reverse=True)]
+        self._gexec(self.sheets.batchUpdate(
+            spreadsheetId=qsid, body={"requests": requests}),
+            "queue trim", self.sheets_rl)
+        return len(doomed)
+
     def queue_append(self, values_by_idx):
         """[M224] Queue Log row."""
         if not self.enabled:
@@ -1108,6 +1349,8 @@ class Engine:
         self._phone_guard = threading.Lock()
         self._phone_locks = {}
         self._contact_cache = {}  # customer key -> resolved HubSpot contact id
+        self.created_ledger = CreatedLedger(getattr(mirror, "dir", Path("mirror")))
+        self._outcome = {}        # v1.6: salla id -> created/held/error (live mode)
         self._in_flight = 0  # maintained by the main loop only
         signal.signal(signal.SIGINT, self._sigint)
 
@@ -1207,6 +1450,7 @@ class Engine:
                     headers={"Content-Type": "application/json"}, body=body)
                 if status != 200:
                     log.warning("Held notify webhook returned %s: %s", status, text[:200])
+        self._outcome[str(order.get("id"))] = ("held", "")
         log.info("HELD order %s (%d unverified item(s): %s)",
                  order.get("id"), len(unverified), names)
 
@@ -1274,12 +1518,29 @@ class Engine:
     def _finish_create(self, order, audit_row, customer_id, total):
         oid = str(order.get("id"))
         # [M2] order create
-        order_id = self.hs.create_order(order, customer_id, self.cfg.salla_timezone_default)
+        order_id, was_fresh = self.hs.create_order(
+            order, customer_id, self.cfg.salla_timezone_default)
         if not order_id:  # [oe2 Ignore]
             self.mirror.error(oid, "order_create", "createAnOrder failed after retries")
             self._bump("errors")
             return
+        if not was_fresh:
+            # v1.6: a concurrent or earlier writer created this order between
+            # our search and our create. Adding line items now would duplicate
+            # whatever that writer added. Do NOT touch items; leave it to the
+            # authoritative verify path (live: the queue row retries and
+            # _resolve_preexisting compares LI count vs source item count).
+            self.mirror.error(oid, "duplicate_create",
+                              f"order create resolved to pre-existing HS {order_id}; "
+                              "line items NOT added -- verify via retry / "
+                              "tools/recover_missing.py")
+            self._bump("errors")
+            self._outcome[oid] = ("error", "")
+            log.warning("Order %s resolved to pre-existing HS %s during create; "
+                        "deferring item sync to the verify path", oid, order_id)
+            return
         self._bump("created")
+        self._outcome[oid] = ("created", order_id)
         log.info("CREATED order %s -> HubSpot %s (%s contact %s)", oid, order_id,
                  "existing" if total > 0 else "new", customer_id)
 
@@ -1299,13 +1560,22 @@ class Engine:
             self.gio.audit_update(audit_row, upd, "processed")
 
         # [M100] items loop
+        item_error = False
         for item in order.get("items", []) or []:
             try:
                 self.process_item(order, order_id, item)
             except Exception as e:
+                item_error = True
                 self.mirror.error(oid, f"item {item.get('id')}", e)
                 self._bump("errors")
                 log.error("Item %s on order %s raised: %s", item.get("id"), oid, e)
+        # v1.6: record in the created-ledger ONLY after the full item loop
+        # completed cleanly. The ledger is the "fully synced" marker: a crash
+        # (or item error) mid-loop leaves the order absent from it, so the
+        # verify path (LI count vs source item count) repairs it on reprocess
+        # instead of silently accepting a partial.
+        if not item_error:
+            self.created_ledger.add(oid, order_id)
 
     def process_item(self, order, order_id, item):
         oid = str(order.get("id"))

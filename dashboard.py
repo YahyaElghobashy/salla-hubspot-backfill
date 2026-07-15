@@ -62,7 +62,8 @@ R_BEGIN = re.compile(r"ORDER begin (\S+) ref (\S+) items=(\d+)")
 R_CREATED = re.compile(r"CREATED order (\S+) -> HubSpot (\S+) \((\w+) contact (\S+)\)")
 R_HELD = re.compile(r"HELD order (\S+)")
 R_SKIP = re.compile(r"skip existing (\S+)")
-R_SUMMARY = re.compile(r"RUN SUMMARY")
+R_SUMMARY = re.compile(r"RUN SUMMARY|LIVE SESSION SUMMARY")
+R_QUEUE = re.compile(r"QUEUE depth=(\d+) oldest_age=(\S+?)s? processed_today=(\d+)")  # v1.6
 # v1.5 format: cur/ceil pairs + lanes; the old single-value format still matches
 # via R_RATES_OLD.
 R_RATES = re.compile(
@@ -92,6 +93,9 @@ class State:
         self.done_ts = deque(maxlen=4000)
         self.last_result = ""
         self.rates = ""            # raw pacing tail (web UI compatibility)
+        self.queue_depth = None    # v1.6 live mode
+        self.queue_age = 0
+        self.processed_today = 0
         self.pacing = {}           # bucket -> (current, ceiling, unit)
         self.lanes_used = 0
         self.lanes_max = 0
@@ -142,6 +146,16 @@ class State:
         m = R_SKIP.search(msg)
         if m:
             self.counts["skipped"] += 1
+            return
+        m = R_QUEUE.search(msg)
+        if m:
+            self.engine = "RUNNING"
+            self.queue_depth = int(m.group(1))
+            try:
+                self.queue_age = int(float(m.group(2)))
+            except ValueError:
+                self.queue_age = 0
+            self.processed_today = int(m.group(3))
             return
         m = R_RATES.search(msg)
         if m:
@@ -288,6 +302,22 @@ class State:
             Text(""),
             Text(cursor_line, style="dim"),
         )
+        progress_title = "progress"
+        if self.queue_depth is not None:  # v1.6 live mode panel
+            qcolor = ("green" if self.queue_depth == 0
+                      else ("yellow" if self.queue_depth < 20 else "red"))
+            prog = Group(
+                Text("live queue", style="bold"),
+                Text(f"depth {self.queue_depth}", style=f"bold {qcolor}"),
+                Text(f"oldest event {self.queue_age}s ago" if self.queue_depth
+                     else "queue drained — waiting for orders", style="dim"),
+                Text(""),
+                Text(f"processed today  {self.processed_today:,}", style="bold"),
+                Text(f"session created {self.counts['created']:,}  held "
+                     f"{self.counts['held']:,}  skipped {self.counts['skipped']:,}",
+                     style="dim"),
+            )
+            progress_title = "live sync"
 
         # lanes panel
         lanes_tbl = Table.grid(padding=(0, 1))
@@ -365,7 +395,7 @@ class State:
             Layout(Panel(recent, title="recent", border_style="dim"), size=10),
         )
         root["mid"].split_row(
-            Layout(Panel(prog, title="progress", border_style="blue")),
+            Layout(Panel(prog, title=progress_title, border_style="blue")),
             Layout(Panel(Group(*lane_lines), title=lanes_title,
                          border_style="magenta")),
         )
@@ -386,7 +416,13 @@ def main():
                     help="orders already resolved in the window by earlier sessions")
     ap.add_argument("--from-start", action="store_true",
                     help="replay the whole existing log instead of tailing from EOF")
+    ap.add_argument("--live", action="store_true",
+                    help="v1.6: tail live.log (the 24/7 live-sync service) "
+                         "and show the queue panel")
     args = ap.parse_args()
+    global LOG
+    if args.live:
+        LOG = Path("live.log")
 
     st = State(args.target, args.baseline)
     console = Console()

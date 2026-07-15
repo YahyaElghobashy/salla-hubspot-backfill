@@ -97,6 +97,9 @@ def main():
     ap.add_argument("--workers", type=int, default=None,
                     help="concurrent order lanes (default: config workers)")
     ap.add_argument("--max-restarts", type=int, default=50)
+    ap.add_argument("--mode", choices=["backfill", "live"], default="backfill",
+                    help="live = the 24/7 queue consumer (live.py): restart "
+                         "forever with backoff, own pid/STOP/log namespace")
     ap.add_argument("--yes", action="store_true",
                     help="skip the interactive RUN confirmation (use from the web UI)")
     args = ap.parse_args()
@@ -106,52 +109,77 @@ def main():
         sys.exit("HUBSPOT_ACCESS_TOKEN / RELAY_SECRET missing: set them in .env "
                  "or the environment (the setup wizard writes .env for you).")
     state_file = "cursor.json"
-    try:
-        state_file = json.loads(Path("config.json").read_text()).get("state_file", state_file)
-    except Exception:
-        sys.exit("config.json missing or invalid: run the setup wizard (python serve.py)")
+    if args.mode == "backfill":
+        try:
+            state_file = json.loads(Path("config.json").read_text()).get("state_file", state_file)
+        except Exception:
+            sys.exit("config.json missing or invalid: run the setup wizard (python serve.py)")
 
     if args.live and not args.yes:
-        confirm = input("LIVE RUN will write to your HubSpot portal. Type RUN to proceed: ")
+        what = "LIVE SYNC (24/7)" if args.mode == "live" else "LIVE RUN"
+        confirm = input(f"{what} will write to your HubSpot portal. Type RUN to proceed: ")
         if confirm.strip() != "RUN":
             sys.exit("aborted")
 
-    cmd = [sys.executable, "-u", "backfill.py"]
+    script = "live.py" if args.mode == "live" else "backfill.py"
+    cmd = [sys.executable, "-u", script]
     if args.live:
-        cmd.append("--live")
+        cmd += ["--live", "--yes"] if args.mode == "live" else ["--live"]
     if args.max_orders is not None:
         cmd += ["--max-orders", str(args.max_orders)]
-    if args.max_pages is not None:
+    if args.max_pages is not None and args.mode == "backfill":
         cmd += ["--max-pages", str(args.max_pages)]
-    if args.no_google:
+    if args.no_google and args.mode == "backfill":
         cmd.append("--no-google")
     if args.workers is not None:
         cmd += ["--workers", str(args.workers)]
 
+    stop_file = Path("STOP.live") if args.mode == "live" else Path("STOP")
+    pidfile = Path("live.pid") if args.mode == "live" else PIDFILE
+    # live mode is a service: restart forever with capped backoff; backfill
+    # keeps its bounded restart budget.
+    forever = args.mode == "live" and args.live
+    backoff = 20
     with KeepAwake():
-        for attempt in range(1, args.max_restarts + 1):
-            if Path("STOP").exists():
-                print("run.py: STOP file present, not (re)starting")
+        attempt = 0
+        while True:
+            attempt += 1
+            if not forever and attempt > args.max_restarts:
+                print("run.py: max restarts reached")
                 break
-            if cursor_status(state_file) in ("done", "done_overflow"):
+            if stop_file.exists():
+                print(f"run.py: {stop_file} present, not (re)starting")
+                break
+            if args.mode == "backfill" and cursor_status(state_file) in ("done", "done_overflow"):
                 print("run.py: cursor is done, nothing to do")
                 break
             print(f"run.py: launch attempt {attempt} at {time.strftime('%F %T')}")
             proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, text=True)
-            PIDFILE.write_text(str(proc.pid))
+            pidfile.write_text(str(proc.pid))
             try:
-                if args.live:
+                if args.live and args.mode == "backfill":
                     proc.stdin.write("RUN\n")
                     proc.stdin.flush()
             except Exception:
                 pass
+            start = time.time()
             code = proc.wait()
-            PIDFILE.unlink(missing_ok=True)
+            pidfile.unlink(missing_ok=True)
             print(f"run.py: engine exited with code {code} at {time.strftime('%F %T')}")
-            if code == 0 or args.dry:
+            if code == 0 and not forever:
                 break
-            print("run.py: abnormal exit, relaunching in 20s (dedup makes the rescan free)")
-            time.sleep(20)
+            if code == 0 and forever:
+                if stop_file.exists():
+                    break
+                backoff = 20  # clean exit without STOP: restart promptly
+            elif time.time() - start > 600:
+                backoff = 20  # ran fine for a while before dying
+            else:
+                backoff = min(300, backoff * 2)  # crash loop: back off
+            if args.dry:
+                break
+            print(f"run.py: relaunching in {backoff}s (dedup makes rescans free)")
+            time.sleep(backoff)
 
 
 if __name__ == "__main__":
