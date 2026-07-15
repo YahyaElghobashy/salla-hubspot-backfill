@@ -134,6 +134,26 @@ pre{background:var(--bg);border:1px solid var(--line);border-radius:12px;padding
             padding:6px 10px;background:var(--bg);border-radius:8px;margin-top:5px;word-break:break-all}
 .evrow.open .raw{display:block}
 .searchbar{display:flex;gap:8px;align-items:center}
+/* leading blob + source pill on each activity line */
+.blob{width:9px;height:9px;border-radius:99px;flex-shrink:0;transform:translateY(6px);margin-right:2px}
+.blob-created{background:var(--sage)} .blob-held{background:var(--gold)}
+.blob-skip{background:var(--rose)} .blob-error{background:var(--bad)}
+.blob-pacing{background:#8bb4e8} .blob-system{background:var(--line)}
+.spill{font-size:9.5px;font-weight:800;letter-spacing:.06em;padding:1px 6px;border-radius:5px;
+       text-transform:uppercase;flex-shrink:0;transform:translateY(3px)}
+.spill-backfill{background:var(--chip);color:var(--muted)}
+.spill-live{background:var(--sage-soft);color:var(--sage-strong)}
+/* per-order detail drawer */
+.odetail{margin-top:8px;border-left:2px solid var(--line);padding:2px 0 2px 14px}
+.ocheck{display:flex;gap:8px;align-items:baseline;padding:3px 0;font-size:12.5px}
+.ocheck .ci{width:15px;flex-shrink:0;font-weight:700}
+.ci-ok{color:var(--sage-strong)} .ci-warn{color:var(--gold)} .ci-err{color:var(--bad)}
+.ocheck .cl{font-weight:600} .ocheck .cd{color:var(--muted)}
+.ocheck .ct{color:var(--muted);font-variant-numeric:tabular-nums;font-size:11px;margin-left:auto;flex-shrink:0}
+.ohead{display:flex;gap:8px;flex-wrap:wrap;font-size:12px;color:var(--muted);margin-bottom:6px}
+.ohead b{color:var(--text)}
+.btnrow{display:flex;gap:8px;margin-top:12px}
+.btnrow .btn{flex:1;margin-top:0}
 .searchbar input{max-width:260px}
 .pagebar{height:7px;background:var(--line-soft);border-radius:99px;overflow:hidden;margin:8px 0 4px}
 .pagebar>i{display:block;height:100%;background:var(--sage);border-radius:99px;transition:width .5s}
@@ -254,7 +274,16 @@ pre{background:var(--bg);border:1px solid var(--line);border-radius:12px;padding
           <button class="live" data-mode="live">LIVE</button>
           <button class="live" data-mode="live-sync">LIVE SYNC 24/7</button>
         </div>
-        <div class="row">
+        <div id="windowWrap">
+          <label style="margin-top:12px">Backfill window <span class="muted">(oldest → newest, newest exclusive)</span></label>
+          <div class="row">
+            <div><input id="winFrom" type="datetime-local"></div>
+            <div><input id="winTo" type="date"></div>
+            <div style="flex:0 0 auto"><button class="btn secondary" style="margin-top:0;white-space:nowrap" onclick="setWindow()">Set window</button></div>
+          </div>
+          <p class="hint" id="winCurrent" style="margin:4px 0 0"></p>
+        </div>
+        <div class="row" style="margin-top:10px">
           <div><label>Max orders <span class="muted">(blank = all)</span></label><input id="maxOrders" type="number" min="1" placeholder="e.g. 2"></div>
           <div><label>Worker lanes</label><input id="runWorkers" type="number" min="1" max="8" placeholder="config"></div>
         </div>
@@ -262,9 +291,12 @@ pre{background:var(--bg);border:1px solid var(--line);border-radius:12px;padding
           <label>Type <b>RUN</b> to arm live mode</label>
           <input id="confirmRun" placeholder="RUN" autocomplete="off">
         </div>
-        <button class="btn primary" style="width:100%" onclick="startRun()">Start</button>
-        <button class="btn danger" style="width:100%" onclick="stopRun()">Stop backfill</button>
-        <button class="btn danger" style="width:100%" onclick="stopLive()">Stop live sync</button>
+        <div class="btnrow">
+          <button class="btn primary" onclick="startRun()" id="btnStart">▶ Start</button>
+          <button class="btn secondary" onclick="stopRun()" id="btnPause">⏸ Pause backfill</button>
+        </div>
+        <button class="btn danger" style="width:100%" onclick="stopLive()" id="btnStopLive">■ Stop live sync</button>
+        <p class="hint" style="margin:8px 0 0">Pause is graceful — the lanes finish their current orders, then it halts with the cursor safe. Press Start to resume; deduplication makes the re-scan free.</p>
         <div class="status" id="runStatus"></div>
       </div>
       <div class="card">
@@ -391,10 +423,16 @@ pre{background:var(--bg);border:1px solid var(--line);border-radius:12px;padding
       <button class="active" data-kind="">All</button>
       <button data-kind="created">Created</button>
       <button data-kind="held">Held</button>
-      <button data-kind="skip">Skipped</button>
+      <button data-kind="skip">Deduplicated</button>
       <button data-kind="error">Errors</button>
       <button data-kind="pacing">Pacing</button>
       <button data-kind="system">System</button>
+    </div>
+    <div class="filters" id="srcFilters" style="margin-top:0">
+      <span class="muted" style="font-size:11.5px;align-self:center;margin-right:2px">source</span>
+      <button class="active" data-src="">Both</button>
+      <button data-src="backfill">Backfill</button>
+      <button data-src="live">Live sync</button>
     </div>
     <ul class="feed" id="evList"><li class="muted">loading…</li></ul>
   </div>
@@ -549,6 +587,13 @@ async function stopRun(){
   const r=await api("/api/stop",{});
   $("runStatus").innerHTML=`<span class="warn">${esc(r.note)}</span>`;
 }
+async function setWindow(){
+  const from=$("winFrom").value,to=$("winTo").value;
+  if(!from||!to){$("runStatus").innerHTML='<span class="bad">pick both a from and to date</span>';return;}
+  const r=await api("/api/window",{from:from,to:to});
+  $("runStatus").innerHTML=r.ok?`<span class="ok">✓ ${esc(r.note)}</span>`:`<span class="bad">✗ ${esc(r.error)}</span>`;
+  if(r.ok)pollCursor();
+}
 async function stopLive(){
   const r=await api("/api/stop",{scope:"live"});
   $("runStatus").innerHTML=`<span class="warn">${esc(r.note)}</span>`;
@@ -591,25 +636,60 @@ document.querySelectorAll("#runsTable th").forEach(th=>th.onclick=()=>{
   renderRuns();});
 
 /* ---- events feed ---- */
-let evKind="",evOrder="desc",evTimer=null,evCache=[];
+let evKind="",evSrc="",evOrder="desc",evTimer=null,evCache=[];
 document.querySelectorAll("#evFilters button").forEach(b=>b.onclick=()=>{
   document.querySelectorAll("#evFilters button").forEach(x=>x.classList.remove("active"));
   b.classList.add("active");evKind=b.dataset.kind;loadEvents();});
+document.querySelectorAll("#srcFilters button").forEach(b=>b.onclick=()=>{
+  document.querySelectorAll("#srcFilters button").forEach(x=>x.classList.remove("active"));
+  b.classList.add("active");evSrc=b.dataset.src;loadEvents();});
 function evDebounce(){clearTimeout(evTimer);evTimer=setTimeout(loadEvents,300);}
 async function loadEvents(){
   const q=encodeURIComponent($("evSearch").value.trim());
-  const r=await api(`/api/events?kind=${evKind}&q=${q}&limit=300`);
+  const r=await api(`/api/events?kind=${evKind}&source=${evSrc}&q=${q}&limit=300`);
   evCache=r.events||[];renderEvents();
 }
-const EV_ICON={created:"✓",held:"◼",skip:"↷",error:"✗",pacing:"≈",system:"·"};
+const BLOB={created:"blob-created",held:"blob-held",skip:"blob-skip",error:"blob-error",pacing:"blob-pacing",system:"blob-system"};
 function renderEvents(){
   $("evOrderLbl").textContent=evOrder==="desc"?"newest first":"oldest first";
   const evs=evOrder==="desc"?evCache:[...evCache].reverse();
-  $("evList").innerHTML=evs.map((e,i)=>`<li class="evrow" onclick="this.classList.toggle('open')">
+  $("evList").innerHTML=evs.map((e,i)=>{
+    const pill=e.source==="live"?'<span class="spill spill-live">live</span>':'<span class="spill spill-backfill">backfill</span>';
+    const drill=e.oid?`<div class="odetail" id="od-${i}"></div>`:"";
+    return `<li class="evrow" data-oid="${esc(e.oid||"")}" data-i="${i}" onclick="evClick(this)">
      <span class="t">${esc(e.ts.slice(5))}</span>
-     <span class="evt-icon evt-${esc(e.kind)}">${EV_ICON[e.kind]||"·"}</span>
-     <div style="flex:1">${esc(e.text)}${e.raw?`<div class="raw">${esc(e.raw)}</div>`:""}</div></li>`).join("")
-   ||'<li class="muted">nothing matches</li>';
+     <span class="blob ${BLOB[e.kind]||"blob-system"}"></span>
+     ${pill}
+     <div style="flex:1">${esc(e.text)}${e.raw?`<div class="raw">${esc(e.raw)}</div>`:""}${drill}</div></li>`;
+  }).join("")||'<li class="muted">nothing matches</li>';
+}
+async function evClick(row){
+  const oid=row.dataset.oid;
+  row.classList.toggle("open");
+  if(!oid) return;
+  const box=$("od-"+row.dataset.i);
+  if(!box || box.dataset.loaded) return;
+  box.dataset.loaded="1"; box.innerHTML='<span class="muted" style="font-size:12px">loading checks…</span>';
+  try{
+    const d=await api("/api/order/"+oid);
+    const h=d.header||{}, checks=d.checks||[];
+    const RES={created:["ci-ok","✓","created"],held:["ci-warn","◼","held for catalog"],
+               deduplicated:["ci-ok","↷","deduplicated (no duplicate made)"],error:["ci-err","✗","error"]};
+    const r=RES[h.result]||["ci-ok","·",h.result||"in progress"];
+    const head=`<div class="ohead"><span class="${r[0]}" style="font-weight:700">${r[1]} ${esc(r[2])}</span>`+
+      (h.ref?`<span>ref <b>${esc(h.ref)}</b></span>`:"")+
+      (h.items?`<span><b>${esc(h.items)}</b> item(s)</span>`:"")+
+      (h.hs_order_id?`<span>HS order <b>${esc(h.hs_order_id)}</b></span>`:"")+
+      (h.hs_contact_id?`<span>${esc(h.contact_kind||"")} contact <b>${esc(h.hs_contact_id)}</b></span>`:"")+
+      `<span>via <b>${esc(h.source||"—")}</b></span></div>`;
+    const rows=checks.length?checks.map(c=>`<div class="ocheck">
+        <span class="ci ci-${esc(c.ok)}">${c.ok==="err"?"✗":c.ok==="warn"?"!":"✓"}</span>
+        <span class="cl">${esc(c.label)}</span>
+        <span class="cd">${c.detail?"— "+esc(c.detail):""}</span>
+        <span class="ct">${esc((c.ts||"").slice(11))}</span></div>`).join(""):
+      '<span class="muted" style="font-size:12px">No detailed trace in the recent log window.</span>';
+    box.innerHTML=head+rows;
+  }catch(e){ box.innerHTML='<span class="bad" style="font-size:12px">could not load trace</span>'; }
 }
 async function loadLedger(){
   const e=await api("/api/errors");
@@ -757,10 +837,17 @@ function onStream(ev){
   }
   $("curOrder").textContent=d.last_result?("last: "+d.last_result):"";
   $("feed").innerHTML=(d.recent||[]).map(r=>`<li><span class="t">${esc(r[0].slice(11))}</span><span class="evt-icon evt-${r[1]==="✓"?"created":r[1]==="◼"?"held":"error"}">${esc(r[1])}</span><div>${esc(r[2])}</div></li>`).join("");
-};
+}
+setSource("");
 async function pollCursor(){
   const s=await api("/api/state");cursorCache=s.cursor||null;
   if(cursorCache&&lastD)renderWindow(lastD,cursorCache);
+  const c=cursorCache;
+  if(c&&c.from_date){
+    $("winCurrent").innerHTML=`current: <b>${esc(c.from_date.replace("T"," "))} → ${esc(c.to_date||"")}</b> · page ${c.next_page}/${c.total_pages} · ${esc(c.status)}`;
+    if(!$("winFrom").value)$("winFrom").value=c.from_date.slice(0,16);
+    if(!$("winTo").value)$("winTo").value=c.to_date||"";
+  }
 }
 setInterval(pollCursor,5000);
 setInterval(()=>{if($("tab-activity").style.display!=="none")loadEvents();},7000);
