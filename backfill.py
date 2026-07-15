@@ -280,6 +280,46 @@ def RateLimiter(per_second):
     return AdaptiveLimiter("fixed", per_second, adaptive=False)
 
 
+# ---------------------------------------------------------------------------
+# DNS cache (v1.9)
+# ---------------------------------------------------------------------------
+# http_request opens a fresh connection per API call, each doing a getaddrinfo.
+# Running the backfill (N lanes) and the live-sync engine together can flood the
+# OS resolver, which then intermittently returns EAI_NONAME ("nodename nor
+# servname provided"). The app only ever talks to a handful of API hosts, so
+# caching successful lookups for a few minutes removes the churn without
+# touching throughput. Only successful, non-empty results are cached; failures
+# fall through to the resolver so a genuine outage still surfaces.
+_DNS_CACHE = {}
+_DNS_LOCK = threading.Lock()
+_DNS_TTL = 300.0
+_dns_orig_getaddrinfo = socket.getaddrinfo
+
+
+def _cached_getaddrinfo(host, port, *args, **kwargs):
+    key = (host, port, args, tuple(sorted(kwargs.items())))
+    now = time.monotonic()
+    with _DNS_LOCK:
+        hit = _DNS_CACHE.get(key)
+        if hit and now - hit[1] < _DNS_TTL:
+            return hit[0]
+    res = _dns_orig_getaddrinfo(host, port, *args, **kwargs)  # may raise; propagate
+    if res:
+        with _DNS_LOCK:
+            _DNS_CACHE[key] = (res, now)
+    return res
+
+
+def install_dns_cache(ttl=300.0):
+    """Idempotently monkeypatch socket.getaddrinfo with the TTL cache above."""
+    global _DNS_TTL
+    _DNS_TTL = ttl
+    if socket.getaddrinfo is not _cached_getaddrinfo:
+        socket.getaddrinfo = _cached_getaddrinfo
+        log.info("DNS cache installed (ttl=%ss)", int(ttl))
+    return True
+
+
 def http_request(method, url, headers=None, body=None, timeout=90):
     """Raw HTTP with structured result. Never logs Authorization headers."""
     data = body.encode("utf-8") if isinstance(body, str) else body
@@ -1359,6 +1399,11 @@ class Engine:
         self.cfg, self.cursor, self.relay = cfg, cursor, relay
         self.hs, self.gio, self.mirror = hs, gio, mirror
         self.live = live
+        # Mode flag: the base engine is the historical backfill, so the audit /
+        # queue-log "Older Backfill?" column reads "Yes". LiveEngine flips this
+        # to False so real-time orders are stamped "No". (self.live is the
+        # dry-run flag -- true for both modes -- so it can't drive this.)
+        self.is_live_sync = False
         self.stats = Stats()
         self.stop = False
         self._next_rate_report = 0.0  # v1.4
@@ -1493,7 +1538,8 @@ class Engine:
             self.gio.audit_update(audit_row, upd, "queued")
         names = ", ".join(u["name"] for u in unverified)
         qrow = {0: now_str(), 1: str(order.get("id")), 2: str(order.get("reference_id", "")),
-                3: now_str(), 4: names, 5: names, 6: "Queued", 12: "Yes",
+                3: now_str(), 4: names, 5: names, 6: "Queued",
+                12: "No" if self.is_live_sync else "Yes",
                 13: dig(order, "customer.created_at.date")}
         self.mirror.queue_event(qrow)
         if self.live:
@@ -1930,7 +1976,7 @@ class Engine:
                10: ",".join(str(i.get("name", "")) for i in items),
                11: "Order Arrived",
                27: link if link else "Drive upload failed",
-               29: now_str(), 30: "Yes"}
+               29: now_str(), 30: "No" if self.is_live_sync else "Yes"}
         audit_row = self.gio.audit_append(add) if self.live else -1
         self.mirror.audit_event("arrived_append", audit_row, add)
 
@@ -2121,6 +2167,7 @@ def main():
     # v1.2.1: googleapiclient/httplib2 defaults to no socket timeout; a stalled
     # Drive/Sheets socket would hang the engine forever. Global floor:
     socket.setdefaulttimeout(180)
+    install_dns_cache()  # v1.9: cache getaddrinfo so dual-engine load can't flood the resolver
     cfg = Config.load(args.config)
     apply_portal_config(cfg)
     cursor = Cursor(cfg.state_file)

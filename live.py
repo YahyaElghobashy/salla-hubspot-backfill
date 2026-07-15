@@ -44,7 +44,7 @@ from pathlib import Path
 
 import backfill
 from backfill import (Config, Cursor, Engine, GoogleIO, HubSpot, LocalMirror,
-                      RelayClient, dig, now_str)
+                      RelayClient, dig, now_str, install_dns_cache)
 
 log = logging.getLogger("backfill")  # share the engine's logger/format
 
@@ -91,11 +91,13 @@ class LiveEngine(Engine):
             status = "live"
         super().__init__(cfg, _NoCursor(), relay, hs, gio, mirror,
                          live=live, workers=workers)
+        self.is_live_sync = True  # stamp "Older Backfill? = No" on live orders
         self.qsid = cfg.queue_spreadsheet_id
         self.instance_id = f"{socket.gethostname()}-{os.getpid()}"
         self.processed_today = 0
         self._today = datetime.now().date()
         self._active_until = 0.0  # v1.7: live-priority signal cooldown
+        self._last_hb_check = 0.0  # v1.8: full heartbeat cycle decoupled from poll
         # sweep: 0 or >=1440 minutes disables it; otherwise the first sweep
         # runs shortly after start (catches any downtime gap immediately)
         self._sweep_enabled = 0 < cfg.live_sweep_minutes < 1440
@@ -135,7 +137,15 @@ class LiveEngine(Engine):
         wins: read J1 first; if a DIFFERENT instance's heartbeat is fresh,
         refuse WITHOUT stamping (no mutual starvation). Otherwise claim
         ownership, write, and re-read to catch a simultaneous-start race
-        (TOCTOU) -- if the cell is no longer ours, yield this cycle."""
+        (TOCTOU) -- if the cell is no longer ours, yield this cycle.
+
+        v1.8: the full read+check+write cycle runs at most every ~25s so most
+        polls do a single queue read -- keeps the 5s poll cadence honest instead
+        of paying two extra Sheets round-trips every cycle."""
+        now = time.monotonic()
+        if now - getattr(self, "_last_hb_check", 0.0) < 25.0:
+            return True  # skip heartbeat maintenance this poll
+        self._last_hb_check = now
         try:
             prev = self.gio.queue_read_heartbeat(self.qsid)
         except Exception as e:
@@ -177,6 +187,11 @@ class LiveEngine(Engine):
             if not r["order_id"]:
                 continue
             if r["status"] == "queued":
+                out.append(r)
+            elif r["status"] == "processing":
+                # v1.8: a 'processing' row left by a crashed predecessor -- reclaim
+                # it. Idempotent: the created-ledger + dedup verify make a re-run
+                # of an already-created order a skip, never a duplicate.
                 out.append(r)
             elif (retry_errors and r["status"] == "error"
                   and r["attempts"] < self.cfg.live_max_attempts):
@@ -239,7 +254,19 @@ class LiveEngine(Engine):
 
     def _process_batch(self, claimed, orders, max_orders, done_counter):
         """Run claimed rows through worker lanes (bounded window, same shape
-        as the backfill page loop) and mark each row from its outcome."""
+        as the backfill page loop) and mark each row from its outcome. A poll
+        can hand this MANY orders at once (a burst, or the sweep backlog); they
+        drain concurrently up to `workers` lanes, each paced by the adaptive
+        limiters -- nothing is dropped, the poll interval only controls how
+        often we re-check for new rows."""
+        # v1.8: stamp the whole in-flight batch 'processing' so the Live Queue
+        # sheet shows exactly which orders are being worked on right now. Each
+        # row flips to done/held/error/gone as its lane finishes.
+        if claimed:
+            ts = now_str()
+            self.gio.queue_mark_batch(self.qsid, [
+                (r["row"], r["order_id"], "processing", r["attempts"],
+                 f"processing since {ts}") for r in claimed])
         feed = iter(claimed)
         pending = {}
         with ThreadPoolExecutor(max_workers=self.workers,
@@ -514,6 +541,7 @@ def main():
     logging.getLogger().addHandler(console)
     logging.getLogger("googleapiclient").setLevel(logging.WARNING)
     socket.setdefaulttimeout(180)
+    install_dns_cache()  # v1.9: cache getaddrinfo so dual-engine load can't flood the resolver
 
     cfg = Config.load(args.config)
     if hasattr(backfill, "apply_portal_config"):

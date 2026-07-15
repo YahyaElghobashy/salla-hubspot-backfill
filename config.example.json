@@ -54,7 +54,7 @@
   "workers": 3,
   "queue_spreadsheet_id": "",
   "live_queue_tab": "Live Queue",
-  "live_poll_s": 20.0,
+  "live_poll_s": 5.0,
   "live_sweep_minutes": 60,
   "live_sweep_window_h": 6,
   "live_max_attempts": 8,
