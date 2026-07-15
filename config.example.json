@@ -59,5 +59,8 @@
   "live_sweep_window_h": 6,
   "live_max_attempts": 8,
   "live_trim_days": 7,
-  "live_trim_hour": 4
+  "live_trim_hour": 4,
+  "live_yield_enabled": true,
+  "hs_search_yield_per_s": 0.6,
+  "hs_general_yield_per_10s": 20
 }

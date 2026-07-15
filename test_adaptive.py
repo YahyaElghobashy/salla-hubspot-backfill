@@ -99,6 +99,25 @@ class TestAdaptiveLimiter(unittest.TestCase):
         rl = AdaptiveLimiter("x", 5.0, floor_per_s=1.0, ceil_per_s=2.0)
         self.assertAlmostEqual(rl.rate, 2.0, places=6)
 
+    def test_set_ceiling_lowers_rate_and_clamps(self):
+        rl = self.mk(start_per_s=4.0, floor_per_s=1.0, ceil_per_s=4.6)
+        rl.set_ceiling(0.6, "yield")          # yield to live
+        self.assertAlmostEqual(rl.ceil, 0.6, places=6)
+        self.assertLessEqual(rl.rate, 0.6 + 1e-9)   # rate clamped down
+        self.assertLessEqual(rl.floor, rl.ceil)     # floor never exceeds ceil
+        rl.set_ceiling(4.6, "reclaim")        # live idle
+        self.assertAlmostEqual(rl.ceil, 4.6, places=6)
+        # AIMD may now grow back up to the new ceiling
+        for _ in range(500):
+            rl.on_success()
+        self.assertLessEqual(rl.rate, 4.6 + 1e-9)
+
+    def test_set_ceiling_noop_when_unchanged(self):
+        rl = self.mk(start_per_s=3.0, ceil_per_s=4.6)
+        r0 = rl.rate
+        rl.set_ceiling(4.6)                    # same ceiling
+        self.assertEqual(rl.rate, r0)
+
     def test_fixed_alias(self):
         rl = RateLimiter(10.0)
         self.assertEqual(rl.rate, 10.0)
