@@ -3,214 +3,568 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Salla → HubSpot Backfill</title>
+<title>Salla → HubSpot Sync</title>
 <style>
-/* ============ Clara design language: quiet-luxury minimal ============
-   black/white editorial surfaces · sage green as the single positive
-   accent · blush tint for highlights · coral reserved for real errors */
+/* ================= Quiet Fleet — design tokens =================
+   Stream-object shell in the quiet-luxury language.
+   Constitutional rules: red never animates; red appears only in the
+   Ledger badge, the beacon, the banner and a faulted tile edge. Gold
+   means PARKED (never warning); amber means DEGRADED (never parked). */
 :root{
-  --bg:#fafafa; --panel:#ffffff; --text:#141414; --muted:#757272;
+  --bg:#fafafa; --panel:#ffffff; --ink:#141414; --muted:#757272;
   --line:#ebebeb; --line-soft:#f3f3f3;
-  --sage:#84bd9b; --sage-strong:#5ea380; --sage-soft:#e4f3e9;
-  --ocean:#2f9aa0; --ocean-strong:#1f7d86; --ocean-soft:#dcf0f1;
-  --blush:#ffe5f2; --rose:#d789ad; --gold:#e2b13c; --gold-soft:#fdf6e3;
-  --bad:#f55157; --bad-soft:#fdecec;
-  --chip:#f5f2f4; --shadow:0 1px 2px rgba(0,0,0,.04), 0 8px 24px rgba(0,0,0,.05);
+  --sage:#5ea380; --sage-hi:#84bd9b; --sage-tint:#e4f3e9;
+  --ocean:#1f7d86; --ocean-hi:#2f9aa0; --ocean-tint:#dcf0f1;
+  --gold:#e2b13c; --gold-tint:#faf3df;
+  --amber:#d97706; --amber-tint:#fdf0e0;
+  --red:#f55157; --red-tint:#fdeaea;
+  --rose:#d789ad;
+  --chip:#f5f2f4;
+  --shadow:0 1px 2px rgba(0,0,0,.04), 0 8px 24px rgba(0,0,0,.05);
 }
 @media (prefers-color-scheme: dark){
-  :root{
-    --bg:#0f0f10; --panel:#1a1a1c; --text:#f2f2f2; --muted:#9a9aa0;
-    --line:#28282c; --line-soft:#222226;
-    --sage:#9ccfaf; --sage-strong:#84bd9b; --sage-soft:rgba(132,189,155,.14);
-    --ocean:#5cc4ca; --ocean-strong:#3aa7ae; --ocean-soft:rgba(58,167,174,.15);
-    --blush:rgba(255,229,242,.10); --rose:#e8a8c8; --gold:#f5c142;
-    --gold-soft:rgba(245,193,66,.12);
-    --bad:#f55157; --bad-soft:rgba(245,81,87,.12);
-    --chip:#242427; --shadow:0 1px 2px rgba(0,0,0,.4), 0 8px 24px rgba(0,0,0,.25);
+  :root:not([data-theme="light"]){
+    --bg:#101113; --panel:#191b1e; --ink:#ececec; --muted:#8f9296;
+    --line:#2a2d31; --line-soft:#222428;
+    --sage:#6fbf93; --sage-hi:#84cda2; --sage-tint:#1d2b23;
+    --ocean:#3fb3bc; --ocean-hi:#5cc4ca; --ocean-tint:#14282b;
+    --gold:#e8bd58; --gold-tint:#2e2716;
+    --amber:#f59e0b; --amber-tint:#2e2210;
+    --red:#ff6b70; --red-tint:#2e1618;
+    --rose:#e39fc0;
+    --chip:#232529;
+    --shadow:0 1px 2px rgba(0,0,0,.4), 0 8px 24px rgba(0,0,0,.25);
   }
+}
+:root[data-theme="dark"]{
+  --bg:#101113; --panel:#191b1e; --ink:#ececec; --muted:#8f9296;
+  --line:#2a2d31; --line-soft:#222428;
+  --sage:#6fbf93; --sage-hi:#84cda2; --sage-tint:#1d2b23;
+  --ocean:#3fb3bc; --ocean-hi:#5cc4ca; --ocean-tint:#14282b;
+  --gold:#e8bd58; --gold-tint:#2e2716;
+  --amber:#f59e0b; --amber-tint:#2e2210;
+  --red:#ff6b70; --red-tint:#2e1618;
+  --rose:#e39fc0;
+  --chip:#232529;
+  --shadow:0 1px 2px rgba(0,0,0,.4), 0 8px 24px rgba(0,0,0,.25);
 }
 *{box-sizing:border-box}
 body{margin:0;font:14px/1.55 -apple-system,"SF Pro Text","Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif;
-     background:var(--bg);color:var(--text);-webkit-font-smoothing:antialiased}
-header{display:flex;align-items:center;gap:14px;padding:14px 24px;border-bottom:1px solid var(--line);
-       background:color-mix(in srgb, var(--panel) 88%, transparent);backdrop-filter:blur(10px);
-       position:sticky;top:0;z-index:9}
-header h1{font-size:15px;margin:0;font-weight:650;letter-spacing:.01em}
-.chip{padding:3px 12px;border-radius:999px;font-size:12px;font-weight:600;background:var(--chip)}
-.chip.ok{background:var(--sage-soft);color:var(--sage-strong)}
-.chip.bad{background:var(--bad-soft);color:var(--bad)}
-.chip.warn{background:var(--gold-soft);color:var(--gold)}
-nav{display:flex;gap:2px;margin-left:auto;background:var(--chip);border-radius:10px;padding:3px}
-nav button{border:0;background:transparent;color:var(--muted);padding:7px 16px;border-radius:8px;
-           cursor:pointer;font-weight:600;font-size:13px;transition:all .15s}
-nav button.active{background:var(--panel);color:var(--text);box-shadow:var(--shadow)}
-main{max-width:1180px;margin:0 auto;padding:24px 20px 60px}
-.eyebrow{font-size:11px;font-weight:700;letter-spacing:.09em;text-transform:uppercase;color:var(--muted);margin:0 0 6px}
+     background:var(--bg);color:var(--ink);-webkit-font-smoothing:antialiased}
+code{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:.92em}
+.mono{font-family:ui-monospace,Menlo,Consolas,monospace}
+.tnum{font-variant-numeric:tabular-nums}
+
+/* ---------- top strip ---------- */
+#topstrip{display:flex;align-items:center;gap:14px;padding:12px 22px;border-bottom:1px solid var(--line);
+  background:color-mix(in srgb, var(--panel) 90%, transparent);backdrop-filter:blur(10px);
+  position:sticky;top:0;z-index:40}
+#beacon{display:flex;align-items:center;gap:8px;flex-shrink:0}
+#beaconDot{width:10px;height:10px;border-radius:99px;background:var(--sage)}
+#beaconDot.nominal{animation:glow 4s ease-in-out infinite}
+#beaconDot.attention{background:var(--amber);animation:none}
+#beaconDot.fault{background:var(--red);animation:none}
+@keyframes glow{0%,100%{opacity:.45}50%{opacity:1}}
+#beaconWord{font-size:15px;font-weight:700;letter-spacing:.04em}
+#beaconWord.fault{color:var(--red)} #beaconWord.attention{color:var(--amber)}
+#sentence{font-size:15.5px;font-weight:300;color:var(--ink);flex:1;min-width:0;
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+#sentence b{font-weight:600}
+#sentence.fault{color:var(--red);font-weight:400}
+#sentenceAction{display:none;flex-shrink:0;background:var(--ink);color:var(--panel);border:0;border-radius:9px;
+  padding:6px 14px;font-weight:650;font-size:12.5px;cursor:pointer}
+#fresh{display:flex;align-items:center;gap:6px;font-size:11.5px;color:var(--muted);flex-shrink:0}
+#freshDot{width:7px;height:7px;border-radius:99px;background:var(--sage)}
+#freshDot.stale{background:var(--amber)}
+#themeBtn,#paletteBtn{border:1px solid var(--line);background:var(--panel);color:var(--muted);border-radius:9px;
+  padding:5px 11px;font-size:12px;font-weight:600;cursor:pointer;flex-shrink:0}
+#paletteBtn kbd{font-family:inherit;font-size:10.5px;border:1px solid var(--line);border-radius:4px;padding:0 4px;margin-left:4px}
+
+/* ---------- shell ---------- */
+#shell{display:grid;grid-template-columns:216px 1fr;min-height:calc(100vh - 55px)}
+#rail{border-right:1px solid var(--line);padding:18px 12px;position:sticky;top:55px;height:calc(100vh - 55px);overflow-y:auto}
+.rail-item{display:flex;align-items:center;gap:9px;width:100%;border:0;background:transparent;color:var(--ink);
+  padding:8px 12px;border-radius:10px;font-size:13.5px;font-weight:600;cursor:pointer;text-align:left;margin-bottom:2px}
+.rail-item:hover{background:var(--chip)}
+.rail-item.active{background:var(--chip)}
+.rail-item .rdot{width:8px;height:8px;border-radius:99px;background:var(--line);flex-shrink:0}
+.rail-item .rdot.live{background:var(--ocean)} .rail-item .rdot.back{background:var(--sage)}
+.rail-item .rmeta{margin-left:auto;font-size:11px;color:var(--muted);font-weight:500}
+.rail-label{font-size:10.5px;font-weight:700;letter-spacing:.09em;text-transform:uppercase;color:var(--muted);
+  margin:16px 0 6px;padding:0 12px}
+.rail-badge{margin-left:auto;background:var(--red);color:#fff;border-radius:99px;font-size:10.5px;font-weight:700;
+  padding:1px 7px;display:none}
+#main{padding:26px 30px 80px;max-width:1280px;width:100%;margin:0 auto;min-width:0}
+.surface{display:none}.surface.active{display:block}
+
+/* ---------- shared components ---------- */
+.eyebrow{font-size:11px;font-weight:700;letter-spacing:.09em;text-transform:uppercase;color:var(--muted);margin:0 0 8px}
 .card{background:var(--panel);border:1px solid var(--line);border-radius:16px;padding:20px 22px;
-      margin-bottom:16px;box-shadow:var(--shadow)}
+  margin-bottom:18px;box-shadow:var(--shadow)}
 .card h2{margin:0 0 4px;font-size:15px;font-weight:650}
-.card p.hint{margin:2px 0 12px;color:var(--muted);font-size:13px}
+.hint{color:var(--muted);font-size:13px;margin:2px 0 12px}
 label{display:block;font-size:12px;font-weight:600;color:var(--muted);margin:10px 0 4px}
 input,select{width:100%;padding:9px 12px;border:1px solid var(--line);border-radius:10px;
-             background:var(--bg);color:var(--text);font-size:14px;transition:border-color .15s}
+  background:var(--bg);color:var(--ink);font-size:14px}
 input:focus,select:focus{outline:none;border-color:var(--sage)}
-.row{display:flex;gap:12px;flex-wrap:wrap}.row>div{flex:1;min-width:170px}
-button.btn{background:var(--text);color:var(--panel);border:0;border-radius:10px;padding:10px 18px;
-           font-weight:650;cursor:pointer;margin-top:12px;font-size:13.5px;transition:opacity .15s}
+.row{display:flex;gap:12px;flex-wrap:wrap}.row>div{flex:1;min-width:160px}
+button.btn{background:var(--ink);color:var(--panel);border:0;border-radius:10px;padding:10px 18px;
+  font-weight:650;cursor:pointer;margin-top:12px;font-size:13.5px}
 button.btn:hover{opacity:.85}
-button.btn.primary{background:var(--sage-strong);color:#fff}
-button.btn.secondary{background:var(--chip);color:var(--text)}
-button.btn.danger{background:var(--bad);color:#fff}
+button.btn.primary{background:var(--sage);color:#fff}
+button.btn.secondary{background:var(--chip);color:var(--ink)}
+button.btn.danger{background:var(--red);color:#fff}
 button.btn:disabled{opacity:.4;cursor:default}
 .status{font-size:13px;margin-top:8px;white-space:pre-wrap}
-.ok{color:var(--sage-strong)}.bad{color:var(--bad)}.warn{color:var(--gold)}.muted{color:var(--muted)}
+.ok{color:var(--sage)}.bad{color:var(--red)}.warn{color:var(--amber)}.muted{color:var(--muted)}
+.kv{display:flex;justify-content:space-between;font-size:13px;padding:4px 0}
+.kv span:first-child{color:var(--muted)}
+.kv span:last-child{font-variant-numeric:tabular-nums;font-weight:600}
+.seg{display:inline-flex;background:var(--chip);border-radius:10px;padding:3px;gap:2px}
+.seg button{border:0;background:transparent;padding:7px 14px;border-radius:8px;font-weight:650;
+  color:var(--muted);cursor:pointer;font-size:12.5px}
+.seg button.active{background:var(--panel);color:var(--ink);box-shadow:var(--shadow)}
 table{width:100%;border-collapse:collapse;font-size:13px}
 td,th{padding:8px 10px;border-bottom:1px solid var(--line-soft);text-align:left;font-variant-numeric:tabular-nums}
-th{font-size:11.5px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);cursor:pointer;user-select:none;white-space:nowrap}
-th.sorted::after{content:" ↓";color:var(--sage-strong)} th.sorted.asc::after{content:" ↑"}
+th{font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);cursor:pointer;user-select:none;white-space:nowrap}
+th.sorted::after{content:" ↓";color:var(--sage)} th.sorted.asc::after{content:" ↑"}
 pre{background:var(--bg);border:1px solid var(--line);border-radius:12px;padding:12px;overflow:auto;
-    font-size:12px;max-height:420px;font-family:ui-monospace,Menlo,Consolas,monospace}
+  font-size:12px;max-height:420px;font-family:ui-monospace,Menlo,Consolas,monospace}
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+@media(max-width:960px){.grid2{grid-template-columns:1fr}}
+
+/* ---------- fleet: stream tiles ---------- */
+#tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:14px;margin-bottom:20px}
+.tile{background:var(--panel);border:1px solid var(--line);border-radius:16px;padding:16px 18px;
+  box-shadow:var(--shadow);cursor:pointer;position:relative}
+.tile.fault-edge{border-color:var(--red);box-shadow:0 0 0 1px var(--red), var(--shadow)}
+.tile.focused{border-color:color-mix(in srgb, var(--ink) 30%, var(--line))}
+.tile .t-name{font-size:11px;font-weight:700;letter-spacing:.09em;text-transform:uppercase;color:var(--muted)}
+.tile .t-pill{display:inline-flex;align-items:center;gap:6px;border-radius:99px;padding:2px 10px;
+  font-size:12px;font-weight:650;margin:8px 0 6px}
+.tile .t-pill .pdot{width:7px;height:7px;border-radius:99px}
+.tile.live .t-pill{background:var(--ocean-tint);color:var(--ocean)} .tile.live .pdot{background:var(--ocean)}
+.tile.back .t-pill{background:var(--sage-tint);color:var(--sage)} .tile.back .pdot{background:var(--sage)}
+.tile .t-hero{font-size:21px;font-weight:650;font-variant-numeric:tabular-nums;letter-spacing:-.01em}
+.tile .t-sub{font-size:12px;color:var(--muted);font-variant-numeric:tabular-nums}
+.tile .t-chips{position:absolute;top:14px;right:14px;display:flex;gap:6px}
+.heldchip{background:var(--gold-tint);color:var(--gold);border-radius:99px;padding:1px 9px;font-size:11px;font-weight:700}
+.stalechip{background:var(--amber-tint);color:var(--amber);border-radius:99px;padding:1px 9px;font-size:11px;font-weight:700}
+.tile svg{display:block;width:100%;height:30px;margin-top:8px}
+
+/* ---------- budget commons ---------- */
+#commonsCard{position:relative}
+#commonsBar{display:flex;height:22px;border-radius:9px;overflow:hidden;background:var(--line-soft);
+  position:relative;margin:10px 0 6px}
+#segLive{background:var(--ocean);transition:width .9s cubic-bezier(.4,0,.2,1)}
+#segBack{background:var(--sage);transition:width .9s cubic-bezier(.4,0,.2,1)}
+#commonsGoal{position:absolute;top:-4px;bottom:-4px;width:2px;background:var(--ink);opacity:.5;transition:left .9s}
+#commonsLabels{display:flex;justify-content:space-between;font-size:12px;color:var(--muted);font-variant-numeric:tabular-nums}
+#commonsNote{font-size:12px;color:var(--rose);font-weight:600;min-height:18px}
+.fullutil{color:var(--sage);font-weight:700;font-size:11.5px}
+.pace-grid{display:grid;grid-template-columns:1fr 1fr;gap:6px 26px;margin-top:10px}
+@media(max-width:860px){.pace-grid{grid-template-columns:1fr}}
+.prow{display:grid;grid-template-columns:86px 1fr 118px;gap:10px;align-items:center;font-size:12px}
+.prow .nm{font-weight:600;color:var(--muted)}
+.prow .pbar{height:7px;background:var(--line-soft);border-radius:99px;overflow:hidden}
+.prow .pbar>i{display:block;height:100%;border-radius:99px;background:var(--sage);transition:width .7s ease-in-out}
+.prow.live .pbar>i{background:var(--ocean)}
+.prow .val{text-align:right;font-family:ui-monospace,Menlo,monospace;color:var(--muted);font-size:11px}
+
+/* ---------- lanes + feed band ---------- */
+#band{display:grid;grid-template-columns:3fr 2fr;gap:16px}
+@media(max-width:960px){#band{grid-template-columns:1fr}}
+.ticket{background:var(--bg);border:1px solid var(--line);border-left:3px solid var(--line);
+  border-radius:12px;padding:10px 13px;margin-bottom:8px;cursor:pointer;position:relative}
+.ticket .ph{font-size:10.5px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;display:block}
+.ticket b{font-size:13.5px;font-family:ui-monospace,Menlo,monospace;font-weight:600}
+.ticket .meta{color:var(--muted);font-size:11.5px;display:block;font-variant-numeric:tabular-nums}
+.ticket.live{border-left-color:var(--ocean);background:color-mix(in srgb, var(--ocean-tint) 45%, var(--bg))}
+.ticket.live .ph{color:var(--ocean)}
+.ticket.back{border-left-color:var(--sage);background:color-mix(in srgb, var(--sage-tint) 40%, var(--bg))}
+.ticket.back .ph{color:var(--sage)}
+.ticket.ghost{border-style:dashed;border-left-style:dashed;cursor:default;background:var(--bg)}
+.ticket.ghost .ph{color:var(--sage)}
+.ticket.idle{opacity:.45;cursor:default}
+.ticket.enter{animation:tin .2s ease-out}
+@keyframes tin{from{opacity:0;transform:translateX(-10px)}to{opacity:1;transform:none}}
+.feedrow{display:flex;gap:8px;padding:6px 2px;border-bottom:1px solid var(--line-soft);font-size:12.5px;
+  align-items:baseline;cursor:pointer}
+.feedrow .t{color:var(--muted);font-size:11px;font-variant-numeric:tabular-nums;flex-shrink:0}
+.fico{width:19px;height:19px;border-radius:99px;display:inline-flex;align-items:center;justify-content:center;
+  font-size:10.5px;flex-shrink:0;transform:translateY(2px)}
+.fico.ok{background:var(--sage-tint);color:var(--sage)}
+.fico.held{background:var(--gold-tint);color:var(--gold)}
+.fico.err{background:var(--red-tint);color:var(--red)}
+.spill{font-size:9.5px;font-weight:800;letter-spacing:.06em;padding:1px 6px;border-radius:5px;
+  text-transform:uppercase;flex-shrink:0;transform:translateY(1px)}
+.spill-backfill{background:var(--sage-tint);color:var(--sage)}
+.spill-live{background:var(--ocean-tint);color:var(--ocean)}
+#feedToggle{border:0;background:transparent;color:var(--muted);font-size:11.5px;cursor:pointer;font-weight:600;padding:4px 0}
+#seal{font-size:13px;font-weight:600;color:var(--sage);margin-top:14px}
+#seal.has{color:var(--red)}
+
+/* ---------- ledger ---------- */
+.serene{font-size:19px;font-weight:300;color:var(--sage);padding:26px 0;text-align:center}
+
+/* ---------- checklist chips (wizard) ---------- */
+.checklist{display:flex;gap:8px;flex-wrap:wrap;margin:2px 0 14px}
+.chip{padding:3px 12px;border-radius:999px;font-size:12px;font-weight:600;background:var(--chip)}
+.chip.ok{background:var(--sage-tint);color:var(--sage)}
+.chip.bad{background:var(--red-tint);color:var(--red)}
+.chip.warn{background:var(--amber-tint);color:var(--amber)}
 .step{border:1px solid var(--line);border-radius:14px;margin-bottom:10px;background:var(--panel);overflow:hidden}
 .step>summary{display:flex;align-items:center;gap:10px;padding:14px 18px;cursor:pointer;font-weight:650;
-              font-size:14px;list-style:none}
+  font-size:14px;list-style:none}
 .step>summary::-webkit-details-marker{display:none}
 .step .dot{width:9px;height:9px;border-radius:99px;background:var(--line);flex-shrink:0}
 .step .dot.on{background:var(--sage)}
 .step .body{padding:2px 18px 16px}
 .maprow{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:6px;align-items:center}
 .controlgrid{display:grid;grid-template-columns:1fr 360px;gap:18px;align-items:start}
-@media(max-width:900px){.controlgrid{grid-template-columns:1fr}}
+@media(max-width:960px){.controlgrid{grid-template-columns:1fr}}
 .runcard{position:sticky;top:74px}
-.seg{display:flex;background:var(--chip);border-radius:10px;padding:3px;margin-top:4px}
-.seg button{flex:1;border:0;background:transparent;padding:8px;border-radius:8px;font-weight:650;
-            color:var(--muted);cursor:pointer;font-size:13px}
-.seg button.active{background:var(--panel);color:var(--text);box-shadow:var(--shadow)}
-.seg button.live.active{background:var(--sage-strong);color:#fff}
-.checklist{display:flex;gap:8px;flex-wrap:wrap;margin:2px 0 14px}
-.metric{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:14px 16px;box-shadow:var(--shadow)}
-.metric b{display:block;font-size:24px;font-weight:700;font-variant-numeric:tabular-nums;letter-spacing:-.01em}
-.metric span{font-size:12px;color:var(--muted)}
-.metric .sub{font-size:11.5px;color:var(--sage-strong);font-weight:600}
-.grid5{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px}
-.grid2{display:grid;grid-template-columns:1fr 1fr;gap:16px}
-@media(max-width:900px){.grid2{grid-template-columns:1fr}}
-.lanes{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:10px;margin-top:10px}
-.lane{background:var(--bg);border:1px solid var(--line);border-radius:12px;padding:11px 13px;position:relative}
-/* backfill worker lanes — light green undertone */
-.lane.backfill{background:color-mix(in srgb, var(--sage-soft) 55%, var(--bg));
-               border-color:color-mix(in srgb, var(--sage) 55%, var(--line))}
-.lane.backfill .ph{color:var(--sage-strong)}
-.lane.backfill::before{background:var(--sage)}
-/* live-order lanes — deep blue/green fusion, distinct from backfill */
-.lane.live{background:color-mix(in srgb, var(--ocean-soft) 80%, var(--bg));
-           border-color:color-mix(in srgb, var(--ocean) 60%, var(--line))}
-.lane.live .ph{color:var(--ocean-strong)}
-.lane.live::before{background:var(--ocean)}
-.lane.busy::before,.lane.backfill::before,.lane.live::before,.lane.scanning::before{
-  content:"";position:absolute;top:12px;right:12px;width:7px;height:7px;border-radius:99px;
-  animation:pulse 1.5s ease-in-out infinite}
-/* backfill actively scanning/skipping already-synced orders (no create lane, but working) */
-.lane.scanning{background:color-mix(in srgb, var(--sage-soft) 32%, var(--bg));
-               border-color:color-mix(in srgb, var(--sage) 35%, var(--line));border-style:dashed}
-.lane.scanning .ph{color:var(--sage-strong)} .lane.scanning::before{background:var(--sage)}
-.lane .tag{font-size:9.5px;font-weight:800;letter-spacing:.06em;text-transform:uppercase;
-           padding:1px 6px;border-radius:5px;position:absolute;top:10px;right:26px}
-.lane.backfill .tag,.lane.scanning .tag{background:var(--sage-soft);color:var(--sage-strong)}
-.lane.live .tag{background:var(--ocean-soft);color:var(--ocean-strong)}
-@keyframes pulse{0%,100%{opacity:.25}50%{opacity:1}}
-.lane b{font-size:13px;display:block;font-variant-numeric:tabular-nums}
-.lane .ph{color:var(--sage-strong);font-size:12px;font-weight:600;margin-top:2px;display:block}
-.lane .meta{color:var(--muted);font-size:11.5px;display:block;margin-top:2px}
-.lane.idle{opacity:.5}
-/* dual engine status header */
-.engines{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
-.estat{display:flex;align-items:center;gap:8px;padding:7px 14px;border-radius:12px;border:1px solid var(--line);background:var(--bg)}
-.estat .dot{width:8px;height:8px;border-radius:99px;background:var(--line)}
-.estat.on-back .dot{background:var(--sage);animation:pulse 1.6s ease-in-out infinite}
-.estat.on-live .dot{background:var(--ocean);animation:pulse 1.6s ease-in-out infinite}
-.estat .lbl{font-weight:700;font-size:12px}
-.estat .st{font-size:12px;color:var(--muted)}
-.estat.back .lbl{color:var(--sage-strong)} .estat.live .lbl{color:var(--ocean-strong)}
-.pace .prow{display:grid;grid-template-columns:92px 1fr 130px;gap:12px;align-items:center;margin:7px 0;font-size:12.5px}
-.pace .nm{font-weight:600;color:var(--muted)}
-.pace .pbar{height:8px;background:var(--line-soft);border-radius:99px;overflow:hidden}
-.pace .pbar>i{display:block;height:100%;border-radius:99px;background:var(--sage);
-              transition:width .8s cubic-bezier(.4,0,.2,1), background .8s}
-.pace .val{text-align:right;font-family:ui-monospace,Menlo,monospace;color:var(--muted);font-size:11.5px}
-.fullutil{font-size:11px;font-weight:700;color:var(--sage-strong)}
-.chartwrap{position:relative;margin-top:8px}
-.chartwrap svg{width:100%;height:150px;display:block}
-.tooltip{position:absolute;pointer-events:none;background:var(--text);color:var(--panel);font-size:11.5px;
-         padding:5px 9px;border-radius:8px;transform:translate(-50%,-130%);white-space:nowrap;display:none;
-         font-variant-numeric:tabular-nums;z-index:3}
-.feed{list-style:none;margin:8px 0 0;padding:0;font-size:13px}
-.feed li{display:flex;gap:10px;padding:7px 4px;border-bottom:1px solid var(--line-soft);align-items:baseline}
-.feed .t{color:var(--muted);font-size:11.5px;font-variant-numeric:tabular-nums;flex-shrink:0}
-.evt-icon{width:22px;height:22px;border-radius:99px;display:inline-flex;align-items:center;justify-content:center;
-          font-size:11px;flex-shrink:0;transform:translateY(3px)}
-.evt-created{background:var(--sage-soft);color:var(--sage-strong)}
-.evt-held{background:var(--gold-soft);color:var(--gold)}
-.evt-skip{background:var(--chip);color:var(--muted)}
-.evt-error{background:var(--bad-soft);color:var(--bad)}
-.evt-pacing{background:var(--blush);color:var(--rose)}
-.evt-system{background:var(--chip);color:var(--muted)}
-.filters{display:flex;gap:6px;flex-wrap:wrap;margin:10px 0}
-.filters button{border:1px solid var(--line);background:var(--panel);border-radius:999px;padding:5px 13px;
-                font-size:12px;font-weight:600;color:var(--muted);cursor:pointer}
-.filters button.active{background:var(--text);color:var(--panel);border-color:var(--text)}
-.evrow{cursor:pointer}
-.evrow .raw{display:none;font-family:ui-monospace,Menlo,monospace;font-size:11px;color:var(--muted);
-            padding:6px 10px;background:var(--bg);border-radius:8px;margin-top:5px;word-break:break-all}
-.evrow.open .raw{display:block}
-.searchbar{display:flex;gap:8px;align-items:center}
-/* leading blob + source pill on each activity line */
-.blob{width:9px;height:9px;border-radius:99px;flex-shrink:0;transform:translateY(6px);margin-right:2px}
-.blob-created{background:var(--sage)} .blob-held{background:var(--gold)}
-.blob-skip{background:var(--rose)} .blob-error{background:var(--bad)}
-.blob-pacing{background:#8bb4e8} .blob-system{background:var(--line)}
-.spill{font-size:9.5px;font-weight:800;letter-spacing:.06em;padding:1px 6px;border-radius:5px;
-       text-transform:uppercase;flex-shrink:0;transform:translateY(3px)}
-.spill-backfill{background:var(--chip);color:var(--muted)}
-.spill-live{background:var(--ocean-soft);color:var(--ocean-strong)}
-/* per-order detail drawer */
-.odetail{margin-top:8px;border-left:2px solid var(--line);padding:2px 0 2px 14px}
-.ocheck{display:flex;gap:8px;align-items:baseline;padding:3px 0;font-size:12.5px}
-.ocheck .ci{width:15px;flex-shrink:0;font-weight:700}
-.ci-ok{color:var(--sage-strong)} .ci-warn{color:var(--gold)} .ci-err{color:var(--bad)}
-.ocheck .cl{font-weight:600} .ocheck .cd{color:var(--muted)}
-.ocheck .ct{color:var(--muted);font-variant-numeric:tabular-nums;font-size:11px;margin-left:auto;flex-shrink:0}
-.ohead{display:flex;gap:8px;flex-wrap:wrap;font-size:12px;color:var(--muted);margin-bottom:6px}
-.ohead b{color:var(--text)}
 .btnrow{display:flex;gap:8px;margin-top:12px}
 .btnrow .btn{flex:1;margin-top:0}
+/* first flight ladder */
+.ffrow{display:flex;align-items:center;gap:12px;padding:12px 4px;border-bottom:1px solid var(--line-soft)}
+.ffrow:last-child{border-bottom:0}
+.ffrow .ffn{width:22px;height:22px;border-radius:99px;background:var(--chip);display:flex;align-items:center;
+  justify-content:center;font-size:12px;font-weight:700;flex-shrink:0}
+.ffrow.done .ffn{background:var(--sage-tint);color:var(--sage)}
+.ffrow .fft{flex:1}
+.ffrow .fft b{display:block;font-size:13.5px}
+.ffrow .fft span{font-size:12px;color:var(--muted)}
+.ffrow.locked{opacity:.55}
+.ffrow .btn{margin-top:0;padding:7px 14px;font-size:12.5px}
+
+/* ---------- events / audit ---------- */
+.filters{display:flex;gap:6px;flex-wrap:wrap;margin:10px 0}
+.filters button{border:1px solid var(--line);background:var(--panel);border-radius:999px;padding:5px 13px;
+  font-size:12px;font-weight:600;color:var(--muted);cursor:pointer}
+.filters button.active{background:var(--ink);color:var(--panel);border-color:var(--ink)}
+.searchbar{display:flex;gap:8px;align-items:center}
 .searchbar input{max-width:260px}
-.pagebar{height:7px;background:var(--line-soft);border-radius:99px;overflow:hidden;margin:8px 0 4px}
-.pagebar>i{display:block;height:100%;background:var(--sage);border-radius:99px;transition:width .5s}
-.kv{display:flex;justify-content:space-between;font-size:13px;padding:4px 0}
-.kv span:first-child{color:var(--muted)}
-.kv span:last-child{font-variant-numeric:tabular-nums;font-weight:600}
+.feed{list-style:none;margin:8px 0 0;padding:0;font-size:13px}
+.feed li{border-bottom:1px solid var(--line-soft)}
+.evrow{display:flex;gap:10px;padding:7px 4px;align-items:baseline;cursor:pointer}
+.evrow .t{color:var(--muted);font-size:11.5px;font-variant-numeric:tabular-nums;flex-shrink:0}
+.blob{width:9px;height:9px;border-radius:99px;flex-shrink:0;transform:translateY(1px)}
+.blob-created{background:var(--sage)} .blob-held{background:var(--gold)}
+.blob-skip{background:var(--rose)} .blob-error{background:var(--red)}
+.blob-pacing{background:var(--rose)} .blob-system{background:var(--line)}
+.evrow .raw{display:none;font-family:ui-monospace,Menlo,monospace;font-size:11px;color:var(--muted);
+  padding:6px 10px;background:var(--bg);border-radius:8px;margin-top:5px;word-break:break-all}
+li.open .raw{display:block}
+
+/* ---------- trace drawer ---------- */
+#overlay{position:fixed;inset:0;background:rgba(0,0,0,.32);z-index:60;display:none}
+#drawer{position:fixed;top:0;right:0;bottom:0;width:min(560px,94vw);background:var(--panel);z-index:61;
+  box-shadow:-8px 0 40px rgba(0,0,0,.18);transform:translateX(100%);transition:transform .24s ease-out;
+  display:flex;flex-direction:column}
+#drawer.open{transform:none}
+#drawerHead{display:flex;align-items:center;gap:10px;padding:16px 20px;border-bottom:1px solid var(--line)}
+#drawerHead b{font-family:ui-monospace,Menlo,monospace;font-size:15px}
+#drawerBody{flex:1;overflow-y:auto;padding:18px 20px}
+#drawerHead .x{margin-left:auto;border:0;background:transparent;color:var(--muted);font-size:17px;cursor:pointer}
+.tpill{border-radius:99px;padding:2px 10px;font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.05em}
+.tpill.created{background:var(--sage-tint);color:var(--sage)}
+.tpill.held{background:var(--gold-tint);color:var(--gold)}
+.tpill.deduplicated{background:var(--sage-tint);color:var(--sage)}
+.tpill.error{background:var(--red-tint);color:var(--red)}
+.tpill.progress{background:var(--chip);color:var(--muted)}
+.hero{border-radius:14px;padding:14px 16px;margin-bottom:16px;font-size:13px}
+.hero.held{background:var(--gold-tint)} .hero.held .hseal{color:var(--gold)}
+.hero.created{background:var(--sage-tint)} .hero.created .hseal{color:var(--sage)}
+.hero.error{background:var(--red-tint)} .hero.error .hseal{color:var(--red)}
+.hero .hseal{font-weight:700;font-size:14px;display:block;margin-bottom:4px}
+.hero .hbody{color:var(--ink)} .hero .hmeta{color:var(--muted);font-size:12px;margin-top:6px}
+.tstage{border:1px solid var(--line);border-radius:12px;margin-bottom:10px;overflow:hidden}
+.tstage>summary{display:flex;gap:10px;align-items:center;padding:10px 14px;cursor:pointer;list-style:none;
+  font-size:11px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:var(--muted)}
+.tstage>summary::-webkit-details-marker{display:none}
+.tstage>summary .sum{margin-left:auto;font-weight:500;text-transform:none;letter-spacing:0;font-size:12px}
+.tstage .steps{padding:2px 14px 10px}
+.ocheck{display:flex;gap:8px;align-items:baseline;padding:4px 0;font-size:12.5px}
+.ocheck .ci{width:15px;flex-shrink:0;font-weight:700}
+.ci-ok{color:var(--sage)} .ci-warn{color:var(--gold)} .ci-err{color:var(--red)}
+.ocheck .cl{font-weight:600} .ocheck .cd{color:var(--muted)}
+.ocheck .ct{color:var(--muted);font-variant-numeric:tabular-nums;font-size:11px;margin-left:auto;flex-shrink:0}
+#drawerFoot{border-top:1px solid var(--line);padding:12px 20px;font-size:12.5px}
+#drawerFoot .idem{color:var(--sage);font-weight:600}
+#drawerFoot a,#drawerFoot button.linky{color:var(--muted);background:none;border:0;padding:0;cursor:pointer;
+  font-size:12.5px;text-decoration:underline}
+
+/* ---------- palette ---------- */
+#palWrap{position:fixed;inset:0;background:rgba(0,0,0,.32);z-index:70;display:none;align-items:flex-start;justify-content:center;padding-top:14vh}
+#pal{background:var(--panel);border:1px solid var(--line);border-radius:16px;width:min(560px,92vw);box-shadow:var(--shadow);overflow:hidden}
+#palInput{border:0;border-bottom:1px solid var(--line);border-radius:0;padding:14px 18px;font-size:15px;background:var(--panel)}
+#palList{max-height:300px;overflow-y:auto;padding:6px}
+.palItem{padding:9px 14px;border-radius:9px;cursor:pointer;font-size:13.5px;display:flex;gap:10px;align-items:center}
+.palItem.sel,.palItem:hover{background:var(--chip)}
+.palItem .pk{color:var(--muted);font-size:11px;margin-left:auto}
+
+/* ---------- motion doctrine ---------- */
+@media (prefers-reduced-motion: reduce){
+  *,*::before,*::after{animation:none!important;transition:none!important}
+}
+@media(max-width:820px){
+  #shell{grid-template-columns:1fr}
+  #rail{position:static;height:auto;display:flex;overflow-x:auto;border-right:0;border-bottom:1px solid var(--line);padding:8px 12px}
+  .rail-label{display:none}
+  .rail-item{flex-shrink:0;margin-bottom:0}
+  .rail-item .rmeta{display:none}
+}
 </style>
 </head>
 <body>
-<header>
-  <h1>Salla → HubSpot Backfill</h1>
-  <span id="engineChip" class="chip">…</span>
-  <nav>
-    <button data-tab="control" class="active">Control</button>
-    <button data-tab="dash">Dashboard</button>
-    <button data-tab="activity">Activity</button>
-  </nav>
-</header>
-<main>
 
-<!-- ============================ CONTROL (setup + run) ============================ -->
-<section id="tab-control">
+<div id="topstrip">
+  <div id="beacon"><span id="beaconDot" class="nominal"></span><span id="beaconWord">NOMINAL</span></div>
+  <div id="sentence">connecting to the engines…</div>
+  <button id="sentenceAction" onclick="go('ledger')">Open Ledger</button>
+  <div id="fresh"><span id="freshDot"></span><span id="freshTxt">—</span></div>
+  <button id="themeBtn" onclick="cycleTheme()" title="theme">◐ auto</button>
+  <button id="paletteBtn" onclick="openPal()">Search<kbd>⌘K</kbd></button>
+</div>
+
+<div id="shell">
+<nav id="rail">
+  <button class="rail-item active" data-route="fleet" onclick="go('fleet')">Fleet</button>
+  <div class="rail-label">Streams</div>
+  <button class="rail-item" data-route="stream-live" onclick="go('stream-live')">
+    <span class="rdot live"></span>Orders · Live<span class="rmeta" id="railLiveMeta">—</span></button>
+  <button class="rail-item" data-route="stream-back" onclick="go('stream-back')">
+    <span class="rdot back"></span>Orders · Backfill<span class="rmeta" id="railBackMeta">—</span></button>
+  <div class="rail-label">System</div>
+  <button class="rail-item" data-route="ledger" onclick="go('ledger')">Ledger<span class="rail-badge" id="ledgerBadge">0</span></button>
+  <button class="rail-item" data-route="audit" onclick="go('audit')">Audit</button>
+  <button class="rail-item" data-route="setup" onclick="go('setup')"><span id="setupTick"></span>Setup</button>
+</nav>
+
+<main id="main">
+
+<!-- ================= FLEET ================= -->
+<section class="surface active" id="surface-fleet">
+  <div id="tiles">
+    <div class="tile live" id="tileLive" onclick="tileClick('live')">
+      <div class="t-chips" id="tileLiveChips"></div>
+      <div class="t-name">Orders · Live</div>
+      <div class="t-pill" id="tileLivePill"><span class="pdot"></span><span>connecting…</span></div>
+      <div class="t-hero tnum" id="tileLiveHero">—</div>
+      <div class="t-sub" id="tileLiveSub"></div>
+      <svg id="sparkLive" viewBox="0 0 200 30" preserveAspectRatio="none"></svg>
+    </div>
+    <div class="tile back" id="tileBack" onclick="tileClick('back')">
+      <div class="t-chips" id="tileBackChips"></div>
+      <div class="t-name">Orders · Backfill</div>
+      <div class="t-pill" id="tileBackPill"><span class="pdot"></span><span>connecting…</span></div>
+      <div class="t-hero tnum" id="tileBackHero">—</div>
+      <div class="t-sub" id="tileBackSub"></div>
+      <svg id="sparkBack" viewBox="0 0 200 30" preserveAspectRatio="none"></svg>
+    </div>
+  </div>
+
+  <div class="card" id="commonsCard">
+    <p class="eyebrow">Shared HubSpot budget <span class="fullutil" id="utilBadge"></span></p>
+    <div id="commonsBar">
+      <div id="segLive" style="width:8%"></div>
+      <div id="segBack" style="width:70%"></div>
+      <div id="commonsGoal" style="left:98%"></div>
+    </div>
+    <div id="commonsLabels"><span id="clLive">live —</span><span id="clNote"></span><span id="clBack">backfill —</span></div>
+    <div id="commonsNote"></div>
+    <details><summary class="muted" style="cursor:pointer;font-size:12.5px">All limiters</summary>
+      <div class="pace-grid"><div id="paceBack"></div><div id="paceLive"></div></div>
+    </details>
+  </div>
+
+  <div id="band">
+    <div class="card">
+      <p class="eyebrow">Lanes <span class="muted" id="laneCount" style="text-transform:none;letter-spacing:0"></span>
+        <button id="focusClear" onclick="clearFocus(event)" style="display:none;border:0;background:var(--chip);border-radius:99px;padding:1px 9px;font-size:11px;cursor:pointer;color:var(--muted)">clear filter ✕</button></p>
+      <div id="laneGrid"><div class="ticket idle"><b>waiting for engines…</b></div></div>
+    </div>
+    <div class="card">
+      <p class="eyebrow">Feed</p>
+      <div id="feedBox"></div>
+      <button id="feedToggle" onclick="toggleFeed()">expand feed ▾</button>
+      <div id="seal">0 unrecovered · nothing needs you ●</div>
+    </div>
+  </div>
+
+  <details class="card" id="detailsCard">
+    <summary style="cursor:pointer;font-weight:650;font-size:13.5px">Details — all-time · period · slot</summary>
+    <div class="grid2" style="margin-top:14px">
+      <div>
+        <p class="eyebrow">All-time · every backfill run</p>
+        <div class="kv"><span>orders created</span><span id="hCreated">–</span></div>
+        <div class="kv"><span>held for catalog</span><span id="hHeld">–</span></div>
+        <div class="kv"><span>runs · engine hours</span><span><span id="hRuns">–</span> · <span id="hHours">–</span>h</span></div>
+        <div class="kv"><span>best rate /h</span><span id="hBest">–</span></div>
+        <div class="kv"><span>error events</span><span id="hErrors">–</span></div>
+      </div>
+      <div>
+        <p class="eyebrow">Current period & slot</p>
+        <div class="kv"><span>window</span><span id="winRange">–</span></div>
+        <div class="kv"><span>cursor</span><span id="winCursor">–</span></div>
+        <div class="kv"><span>session created / held</span><span id="winCounts">–</span></div>
+        <div class="kv"><span>rate</span><span id="winRate">–</span></div>
+        <div class="kv"><span>slot</span><span id="slotTitle">–</span></div>
+        <div class="kv"><span>page</span><span id="slotPage">–</span></div>
+        <div class="kv"><span>dedup skipped (session)</span><span id="slotSkipped">–</span></div>
+        <div class="kv"><span>errors (session log lines)</span><span id="slotErrors">–</span></div>
+      </div>
+    </div>
+  </details>
+</section>
+
+<!-- ================= STREAM PAGES ================= -->
+<section class="surface" id="surface-stream-live">
+  <p class="eyebrow">Orders · Live — 24/7 queue consumer</p>
+  <div class="card">
+    <div class="row" style="align-items:center">
+      <div style="flex:2 1 300px"><h2 id="liveHead">—</h2><p class="hint" id="liveHeadSub" style="margin:0"></p></div>
+      <div style="flex:0 0 auto">
+        <button class="btn primary" onclick="armLive()" id="btnStartLiveSync">▶ Start live sync</button>
+        <button class="btn danger" onclick="stopLive()">■ Stop live sync</button>
+      </div>
+    </div>
+    <div id="liveArm" style="display:none">
+      <label>Type <b>RUN</b> to arm the 24/7 live sync — it writes to HubSpot continuously</label>
+      <div class="row"><div><input id="confirmLive" placeholder="RUN" autocomplete="off"></div>
+      <div style="flex:0 0 auto"><button class="btn primary" style="margin-top:0" onclick="startLiveSync()">Confirm</button></div></div>
+    </div>
+    <div class="status" id="liveRunStatus"></div>
+  </div>
+  <div class="grid2">
+    <div class="card"><p class="eyebrow">Queue</p>
+      <div class="kv"><span>queued orders</span><span id="qDepth">–</span></div>
+      <div class="kv"><span>oldest event age</span><span id="qAge">–</span></div>
+      <div class="kv"><span>processed today</span><span id="qToday">–</span></div>
+      <div class="kv"><span>session created / held / skipped</span><span id="liveCounts">–</span></div>
+    </div>
+    <div class="card"><p class="eyebrow">Its lanes</p><div id="liveLanes"></div></div>
+  </div>
+  <div class="card"><p class="eyebrow">Recent completions</p><div id="liveFeed"></div></div>
+</section>
+
+<section class="surface" id="surface-stream-back">
+  <p class="eyebrow">Orders · Backfill — historical window sweep</p>
+  <div class="card">
+    <div class="row" style="align-items:flex-end">
+      <div style="flex:2 1 260px"><h2 id="backHead">—</h2><p class="hint" id="backHeadSub" style="margin:0"></p></div>
+      <div style="flex:0 0 auto">
+        <div class="seg" id="modeSeg">
+          <button class="active" data-mode="dry">Dry run</button>
+          <button data-mode="live">LIVE</button>
+        </div>
+      </div>
+    </div>
+    <div class="row" style="margin-top:8px">
+      <div><label>Max orders <span class="muted">(blank = all)</span></label><input id="maxOrders" type="number" min="1" placeholder="e.g. 2"></div>
+      <div><label>Worker lanes</label><input id="runWorkers" type="number" min="1" max="8" placeholder="config"></div>
+      <div><label>Window from</label><input id="winFrom" type="datetime-local"></div>
+      <div><label>Window to</label><input id="winTo" type="date"></div>
+      <div style="flex:0 0 auto"><label>&nbsp;</label><button class="btn secondary" style="margin-top:0" onclick="setWindow()">Set window</button></div>
+    </div>
+    <p class="hint" id="winCurrent" style="margin:6px 0 0"></p>
+    <div id="confirmWrap" style="display:none">
+      <label>Type <b>RUN</b> to arm live mode</label>
+      <input id="confirmRun" placeholder="RUN" autocomplete="off" style="max-width:220px">
+    </div>
+    <div class="btnrow" style="max-width:420px">
+      <button class="btn primary" onclick="startRun()" id="btnStart">▶ Start</button>
+      <button class="btn secondary" onclick="stopRun()">⏸ Pause</button>
+    </div>
+    <div class="status" id="runStatus"></div>
+  </div>
+  <div class="grid2">
+    <div class="card"><p class="eyebrow">Progress</p>
+      <div class="kv"><span>window</span><span id="bWinRange">–</span></div>
+      <div class="kv"><span>cursor</span><span id="bWinCursor">–</span></div>
+      <div class="kv"><span>slot</span><span id="bSlot">–</span></div>
+      <div class="kv"><span>page</span><span id="bPage">–</span></div>
+      <div class="kv"><span>session created / held / skipped / errors</span><span id="bCounts">–</span></div>
+      <div class="kv"><span>rate</span><span id="bRate">–</span></div>
+    </div>
+    <div class="card"><p class="eyebrow">Its lanes</p><div id="backLanes"></div></div>
+  </div>
+  <div class="card"><p class="eyebrow">Recent completions</p><div id="backFeed"></div></div>
+</section>
+
+<!-- ================= LEDGER ================= -->
+<section class="surface" id="surface-ledger">
+  <p class="eyebrow">Unrecovered failures — the list that must stay empty</p>
+  <div class="card">
+    <h2 id="ledgerTitle">–</h2>
+    <p class="hint">Log "error" events can include incidents the engine already retried and recovered.
+      Anything here genuinely needs attention (<code>mirror/errors.csv</code>).</p>
+    <div id="ledgerBody"></div>
+  </div>
+</section>
+
+<!-- ================= AUDIT ================= -->
+<section class="surface" id="surface-audit">
+  <div class="card">
+    <p class="eyebrow">Run history · every backfill ever</p>
+    <h2>Runs <span class="muted" id="runsMeta" style="font-size:12px;font-weight:500"></span></h2>
+    <div style="overflow-x:auto">
+    <table id="runsTable">
+      <thead><tr>
+        <th data-k="end_ts" class="sorted">Ended</th><th data-k="window_from">Window</th>
+        <th data-k="live">Mode</th><th data-k="duration_min">Duration</th>
+        <th data-k="created">Created</th><th data-k="held">Held</th>
+        <th data-k="skipped">Skipped</th><th data-k="errors">Errors</th>
+        <th data-k="rate_h">Rate /h</th>
+      </tr></thead>
+      <tbody id="runsBody"></tbody>
+    </table>
+    </div>
+  </div>
+  <div class="card">
+    <p class="eyebrow">Events · human-readable</p>
+    <div class="searchbar">
+      <h2 style="margin:0">Everything the engines did</h2>
+      <input id="evSearch" placeholder="search order id, text…" oninput="evDebounce()">
+      <button class="btn secondary" style="margin:0;padding:6px 12px" onclick="evOrder=evOrder==='desc'?'asc':'desc';renderEvents()">
+        <span id="evOrderLbl">newest first</span></button>
+    </div>
+    <div class="filters" id="evFilters">
+      <button class="active" data-kind="">All</button>
+      <button data-kind="created">Created</button>
+      <button data-kind="held">Held</button>
+      <button data-kind="skip">Deduplicated</button>
+      <button data-kind="error">Errors</button>
+      <button data-kind="pacing">Pacing</button>
+      <button data-kind="system">System</button>
+    </div>
+    <div class="filters" id="srcFilters" style="margin-top:0">
+      <span class="muted" style="font-size:11.5px;align-self:center;margin-right:2px">source</span>
+      <button class="active" data-src="">Both</button>
+      <button data-src="backfill">Backfill</button>
+      <button data-src="live">Live sync</button>
+    </div>
+    <ul class="feed" id="evList"><li class="muted">loading…</li></ul>
+  </div>
+  <details class="card" style="padding:14px 22px">
+    <summary style="cursor:pointer;font-weight:650">Raw log tail (for debugging)</summary>
+    <div class="row" style="align-items:center;margin-top:10px">
+      <div class="seg" style="flex:0 0 auto"><button class="active" data-rlsrc="">backfill.log</button><button data-rlsrc="live">live.log</button></div>
+      <div style="flex:0 0 auto"><button class="btn secondary" style="margin:0" onclick="loadRaw()">Refresh</button></div>
+    </div>
+    <pre id="logBox">–</pre>
+  </details>
+</section>
+
+<!-- ================= SETUP ================= -->
+<section class="surface" id="surface-setup">
   <p class="eyebrow">Readiness</p>
   <div class="checklist" id="checklist"></div>
 
   <div class="controlgrid">
     <div>
-      <p class="eyebrow">Setup</p>
+      <p class="eyebrow">Set up · orders sync</p>
 
       <details class="step" open id="step0">
         <summary><span class="dot" id="d0"></span>1 · Connect HubSpot &amp; relay secret</summary>
@@ -293,215 +647,435 @@ pre{background:var(--bg);border:1px solid var(--line);border-radius:12px;padding
     </div>
 
     <div class="runcard">
-      <p class="eyebrow">Run</p>
+      <p class="eyebrow">First flight</p>
       <div class="card">
-        <h2>Run control</h2>
-        <p class="hint">Dry run reads everything, writes nothing. Stop is always graceful — in-flight orders finish, the cursor stays safe, resume is free.</p>
-        <label>Mode</label>
-        <div class="seg" id="modeSeg">
-          <button class="active" data-mode="dry">Dry run</button>
-          <button class="live" data-mode="live">LIVE</button>
-          <button class="live" data-mode="live-sync">LIVE SYNC 24/7</button>
+        <h2>Recommended first flight</h2>
+        <p class="hint">Each stage unlocks the next. The ladder mirrors the tested production rollout.</p>
+        <div class="ffrow" id="ff1">
+          <span class="ffn">①</span>
+          <span class="fft"><b>Dry run · 2 orders</b><span>reads everything, writes nothing</span></span>
+          <button class="btn primary" onclick="ffStart(1)">Start</button>
         </div>
-        <div id="windowWrap">
-          <label style="margin-top:12px">Backfill window <span class="muted">(oldest → newest, newest exclusive)</span></label>
-          <div class="row">
-            <div><input id="winFrom" type="datetime-local"></div>
-            <div><input id="winTo" type="date"></div>
-            <div style="flex:0 0 auto"><button class="btn secondary" style="margin-top:0;white-space:nowrap" onclick="setWindow()">Set window</button></div>
-          </div>
-          <p class="hint" id="winCurrent" style="margin:4px 0 0"></p>
+        <div class="ffrow locked" id="ff2">
+          <span class="ffn">②</span>
+          <span class="fft"><b>Live · 2 orders</b><span id="ff2reason">unlocks after a clean dry run</span></span>
+          <button class="btn" onclick="ffStart(2)">Start</button>
         </div>
-        <div class="row" style="margin-top:10px">
-          <div><label>Max orders <span class="muted">(blank = all)</span></label><input id="maxOrders" type="number" min="1" placeholder="e.g. 2"></div>
-          <div><label>Worker lanes</label><input id="runWorkers" type="number" min="1" max="8" placeholder="config"></div>
+        <div class="ffrow locked" id="ff3">
+          <span class="ffn">③</span>
+          <span class="fft"><b>Open the throttle</b><span id="ff3reason">unlocks after 2 clean live orders</span></span>
+          <button class="btn" onclick="ffStart(3)">Start</button>
         </div>
-        <div id="confirmWrap" style="display:none">
-          <label>Type <b>RUN</b> to arm live mode</label>
-          <input id="confirmRun" placeholder="RUN" autocomplete="off">
+        <div id="ffConfirm" style="display:none">
+          <label>Type <b>RUN</b> — <span id="ffConsequence"></span></label>
+          <div class="row"><div><input id="ffRun" placeholder="RUN" autocomplete="off"></div>
+          <div style="flex:0 0 auto"><button class="btn primary" style="margin-top:0" onclick="ffConfirmed()">Confirm</button></div></div>
         </div>
-        <div class="btnrow">
-          <button class="btn primary" onclick="startRun()" id="btnStart">▶ Start</button>
-          <button class="btn secondary" onclick="stopRun()" id="btnPause">⏸ Pause backfill</button>
-        </div>
-        <button class="btn danger" style="width:100%" onclick="stopLive()" id="btnStopLive">■ Stop live sync</button>
-        <p class="hint" style="margin:8px 0 0">Pause is graceful — the lanes finish their current orders, then it halts with the cursor safe. Press Start to resume; deduplication makes the re-scan free.</p>
-        <div class="status" id="runStatus"></div>
+        <div class="status" id="ffStatus"></div>
       </div>
       <div class="card">
-        <h2 style="font-size:13.5px">Recommended first flight</h2>
-        <p class="hint" style="margin-bottom:0">① Dry run, max 2 — read the plan in Activity. ② LIVE, max 2 — verify both orders in HubSpot. ③ LIVE, no cap. Mirrors the tested production rollout.</p>
+        <h2 style="font-size:13.5px">Run controls live on each stream</h2>
+        <p class="hint" style="margin-bottom:0">Start, pause, window and caps for the backfill are on
+          <a href="#/stream-back" style="color:var(--sage)">Orders · Backfill</a>; the 24/7 service controls are on
+          <a href="#/stream-live" style="color:var(--ocean)">Orders · Live</a>.</p>
       </div>
     </div>
   </div>
 </section>
 
-<!-- ============================ DASHBOARD ============================ -->
-<section id="tab-dash" style="display:none">
-  <div class="card" style="margin-bottom:18px;padding:14px 18px">
-    <p class="eyebrow" style="margin:0 0 10px">Engines · both live together</p>
-    <div class="engines">
-      <div class="estat back" id="eBack"><span class="dot"></span>
-        <span class="lbl">Backfill</span><span class="st" id="eBackSt">connecting…</span></div>
-      <div class="estat live" id="eLive"><span class="dot"></span>
-        <span class="lbl">Live sync</span><span class="st" id="eLiveSt">connecting…</span></div>
-      <span class="hint" style="margin:0 0 0 auto">backfill.log + live.log</span>
-    </div>
-  </div>
-  <div class="card" id="queueCard" style="margin-bottom:18px">
-    <p class="eyebrow">Live queue</p>
-    <div class="grid5">
-      <div class="metric"><b id="qDepth">–</b><span>queued orders</span></div>
-      <div class="metric"><b id="qAge">–</b><span>oldest event age</span></div>
-      <div class="metric"><b id="qToday">–</b><span>processed today</span></div>
-    </div>
-  </div>
-  <p class="eyebrow">All-time · every backfill run</p>
-  <div class="grid5" style="margin-bottom:18px">
-    <div class="metric"><b id="hCreated">–</b><span>orders created</span></div>
-    <div class="metric"><b id="hHeld">–</b><span>held for catalog</span></div>
-    <div class="metric"><b id="hRuns">–</b><span>runs · <span id="hHours">–</span>h engine time</span></div>
-    <div class="metric"><b id="hBest">–</b><span>best rate, orders/h</span></div>
-    <div class="metric"><b id="hErrors">–</b><span>error events (ledger may be 0)</span></div>
-  </div>
-
-  <div class="grid2">
-    <div class="card">
-      <p class="eyebrow">Current period</p>
-      <h2 id="winTitle">–</h2>
-      <div class="pagebar"><i id="winBar" style="width:0%"></i></div>
-      <div class="kv"><span>window</span><span id="winRange">–</span></div>
-      <div class="kv"><span>cursor position</span><span id="winCursor">–</span></div>
-      <div class="kv"><span>session created / held</span><span id="winCounts">–</span></div>
-      <div class="kv"><span>rate</span><span id="winRate">–</span></div>
-    </div>
-    <div class="card">
-      <p class="eyebrow">Current slot</p>
-      <h2 id="slotTitle">–</h2>
-      <div class="pagebar"><i id="pageBar" style="width:0%"></i></div>
-      <div class="kv"><span>page</span><span id="slotPage">–</span></div>
-      <div class="kv"><span>orders on page</span><span id="slotOrders">–</span></div>
-      <div class="kv"><span>dedup skipped (session)</span><span id="slotSkipped">–</span></div>
-      <div class="kv"><span>errors (session log lines)</span><span id="slotErrors">–</span></div>
-    </div>
-  </div>
-
-  <div class="card">
-    <p class="eyebrow">Activity · <span style="color:var(--sage-strong)">backfill lanes</span> + <span style="color:var(--ocean-strong)">live orders</span></p>
-    <h2 id="laneTitle">– <span class="muted" id="laneCount" style="font-size:12px;font-weight:500"></span></h2>
-    <div class="lanes" id="laneGrid"><div class="lane idle"><b>waiting for engines…</b></div></div>
-    <div class="status" id="curOrder"></div>
-  </div>
-
-  <div class="grid2">
-    <div class="card">
-      <p class="eyebrow">Adaptive pacing</p>
-      <h2 style="font-size:13.5px">Request rate vs its 90–95% ceiling <span class="fullutil" id="utilBadge"></span></h2>
-      <div class="pace" id="paceArea"><p class="hint">waiting for the first pacing snapshot…</p></div>
-      <div class="status" id="adaptNote" style="font-family:ui-monospace,Menlo,monospace;font-size:12px;color:var(--rose)"></div>
-    </div>
-    <div class="card">
-      <p class="eyebrow">Throughput</p>
-      <h2 style="font-size:13.5px"><span id="tpNow">–</span> <span class="muted" style="font-weight:500;font-size:12px">orders/min now · peak <span id="tpPeak">–</span> · hover for detail</span></h2>
-      <div class="chartwrap">
-        <svg id="tpChart" viewBox="0 0 600 150" preserveAspectRatio="none"></svg>
-        <div class="tooltip" id="tpTip"></div>
-      </div>
-    </div>
-  </div>
-
-  <div class="card">
-    <p class="eyebrow">Latest completions</p>
-    <ul class="feed" id="feed"></ul>
-  </div>
-</section>
-
-<!-- ============================ ACTIVITY ============================ -->
-<section id="tab-activity" style="display:none">
-  <div class="card" id="ledgerCard">
-    <p class="eyebrow">Unrecovered failures — the ledger that must stay empty</p>
-    <h2 id="ledgerTitle">–</h2>
-    <p class="hint">Log "error" events can include incidents the engine already retried and recovered. Anything here genuinely needs attention (<code>mirror/errors.csv</code>).</p>
-    <pre id="errBox" style="max-height:160px">–</pre>
-  </div>
-
-  <div class="card">
-    <p class="eyebrow">Run history · every backfill ever</p>
-    <h2>Runs <span class="muted" id="runsMeta" style="font-size:12px;font-weight:500"></span></h2>
-    <div style="overflow-x:auto">
-    <table id="runsTable">
-      <thead><tr>
-        <th data-k="end_ts" class="sorted">Ended</th><th data-k="window_from">Window</th>
-        <th data-k="live">Mode</th><th data-k="duration_min">Duration</th>
-        <th data-k="created">Created</th><th data-k="held">Held</th>
-        <th data-k="skipped">Skipped</th><th data-k="errors">Errors</th>
-        <th data-k="rate_h">Rate /h</th>
-      </tr></thead>
-      <tbody id="runsBody"></tbody>
-    </table>
-    </div>
-  </div>
-
-  <div class="card">
-    <p class="eyebrow">Live activity · human-readable</p>
-    <div class="searchbar">
-      <h2 style="margin:0">Events</h2>
-      <input id="evSearch" placeholder="search order id, text…" oninput="evDebounce()">
-      <button class="btn secondary" style="margin:0;padding:6px 12px" onclick="evOrder=evOrder==='desc'?'asc':'desc';renderEvents()">
-        <span id="evOrderLbl">newest first</span></button>
-    </div>
-    <div class="filters" id="evFilters">
-      <button class="active" data-kind="">All</button>
-      <button data-kind="created">Created</button>
-      <button data-kind="held">Held</button>
-      <button data-kind="skip">Deduplicated</button>
-      <button data-kind="error">Errors</button>
-      <button data-kind="pacing">Pacing</button>
-      <button data-kind="system">System</button>
-    </div>
-    <div class="filters" id="srcFilters" style="margin-top:0">
-      <span class="muted" style="font-size:11.5px;align-self:center;margin-right:2px">source</span>
-      <button class="active" data-src="">Both</button>
-      <button data-src="backfill">Backfill</button>
-      <button data-src="live">Live sync</button>
-    </div>
-    <ul class="feed" id="evList"><li class="muted">loading…</li></ul>
-  </div>
-
-  <details class="card" style="padding:14px 22px">
-    <summary style="cursor:pointer;font-weight:650">Raw log tail (for debugging)</summary>
-    <button class="btn secondary" onclick="loadRaw()">Refresh</button>
-    <pre id="logBox">–</pre>
-  </details>
-</section>
 </main>
+</div>
+
+<!-- ================= TRACE DRAWER ================= -->
+<div id="overlay" onclick="closeTrace()"></div>
+<aside id="drawer" aria-label="order trace">
+  <div id="drawerHead">
+    <b id="trOid">—</b>
+    <span class="spill" id="trSrc"></span>
+    <span class="tpill progress" id="trPill">…</span>
+    <button class="x" onclick="closeTrace()" title="close">✕</button>
+  </div>
+  <div id="drawerBody"><p class="muted">loading trace…</p></div>
+  <div id="drawerFoot">
+    <span class="idem" id="trIdem"></span>
+    <div style="display:flex;gap:16px;margin-top:6px">
+      <button class="linky" onclick="traceRaw()">View raw log for this order</button>
+      <button class="linky" onclick="location.hash='#/trace/'+traceOid">Open as page</button>
+    </div>
+    <pre id="trLog" style="display:none;margin-top:10px;max-height:200px"></pre>
+  </div>
+</aside>
+
+<!-- ================= COMMAND PALETTE ================= -->
+<div id="palWrap" onclick="if(event.target===this)closePal()">
+  <div id="pal">
+    <input id="palInput" placeholder="Jump to a surface — or paste an order ID…" oninput="palRender()" autocomplete="off">
+    <div id="palList"></div>
+  </div>
+</div>
 
 <script>
 const $=id=>document.getElementById(id);
-const esc=x=>String(x).replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+const esc=x=>String(x).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 async function api(p,body){const r=await fetch(p,body?{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)}:{});return r.json();}
 
-/* ---- tabs ---- */
-const tabs=document.querySelectorAll("nav button");
-tabs.forEach(b=>b.onclick=()=>{tabs.forEach(x=>x.classList.remove("active"));b.classList.add("active");
-  ["control","dash","activity"].forEach(t=>$("tab-"+t).style.display=(b.dataset.tab===t)?"":"none");
-  if(b.dataset.tab==="activity"){loadRuns();loadEvents();loadLedger();}
-  if(b.dataset.tab==="dash"){loadRuns();}});
+/* ================= theme ================= */
+const THEMES=["","light","dark"],TL={"":"◐ auto",light:"○ light",dark:"● dark"};
+let theme=localStorage.getItem("qf-theme")||"";
+function applyTheme(){if(theme)document.documentElement.dataset.theme=theme;else delete document.documentElement.dataset.theme;$("themeBtn").textContent=TL[theme];}
+function cycleTheme(){theme=THEMES[(THEMES.indexOf(theme)+1)%3];localStorage.setItem("qf-theme",theme);applyTheme();}
+applyTheme();
 
-/* ---- mode segment ---- */
+/* ================= router ================= */
+const ROUTES=["fleet","stream-live","stream-back","ledger","audit","setup"];
+let route="fleet";
+function go(r){route=r;
+  document.querySelectorAll(".surface").forEach(s=>s.classList.toggle("active",s.id==="surface-"+r));
+  document.querySelectorAll(".rail-item").forEach(b=>b.classList.toggle("active",b.dataset.route===r));
+  if(location.hash!=="#/"+r&&!location.hash.startsWith("#/trace/"))history.replaceState(null,"","#/"+r);
+  if(r==="audit"){loadRuns();loadEvents();}
+  if(r==="ledger")loadLedger();
+  if(r==="setup")refreshState();
+  if(r==="fleet")loadRuns();
+}
+window.addEventListener("hashchange",routeFromHash);
+function routeFromHash(){
+  const h=location.hash.replace(/^#\//,"");
+  if(h.startsWith("trace/")){openTrace(h.slice(6));return;}
+  if(ROUTES.includes(h))go(h);
+}
+
+/* ================= SSE — both engines at once ================= */
+let dBack={},dLive={},cursorCache=null,esBack=null,esLive=null;
+function initStreams(){
+  if(esBack)esBack.close(); if(esLive)esLive.close();
+  esBack=new EventSource("/api/stream");
+  esBack.onmessage=e=>{dBack=JSON.parse(e.data);renderAll();};
+  esLive=new EventSource("/api/stream?source=live");
+  esLive.onmessage=e=>{dLive=JSON.parse(e.data);renderAll();};
+}
+
+/* ================= health composer ================= */
+let ledgerCount=0;
+function engineState(d,kind){
+  if(!d||d.engine_running===undefined)return{word:"connecting…",lvl:0};
+  if(!d.engine_running)return{word:"stopped",lvl:0};
+  const st=d.stale_s||0;
+  if(st>90)return{word:"silent "+st+"s",lvl:1};
+  if(kind==="live")return{word:(d.queue_depth>0)?"working":"watching",lvl:0};
+  if((d.lanes||[]).length)return{word:"creating",lvl:0};
+  if(st<20)return{word:"scanning",lvl:0};
+  return{word:"running",lvl:0};
+}
+function composeHealth(){
+  const eb=engineState(dBack,"back"),el=engineState(dLive,"live");
+  let word="NOMINAL",cls="nominal";
+  const attention=[];
+  if(eb.lvl)attention.push("backfill log silent "+(dBack.stale_s||0)+"s");
+  if(el.lvl)attention.push("live log silent "+(dLive.stale_s||0)+"s");
+  if((dLive.queue_depth||0)>0&&(dLive.queue_age||0)>600)attention.push("live queue oldest order is "+Math.round(dLive.queue_age/60)+"m old");
+  if(ledgerCount>0){word="FAULT";cls="fault";}
+  else if(attention.length){word="ATTENTION";cls="attention";}
+  $("beaconWord").textContent=word;$("beaconWord").className=cls==="nominal"?"":cls;
+  $("beaconDot").className=cls;
+  const s=$("sentence"),act=$("sentenceAction");
+  if(word==="FAULT"){
+    s.className="fault";
+    s.innerHTML=`Needs attention: <b>${ledgerCount} order${ledgerCount>1?"s":""} failing</b> in the last 24h — open the Ledger.`;
+    act.style.display="";return;
+  }
+  act.style.display="none";s.className="";
+  const parts=[];
+  const runningN=(dBack.engine_running?1:0)+(dLive.engine_running?1:0);
+  if(!runningN){s.textContent="Both engines are stopped. Start one from its stream page.";return;}
+  if(word==="ATTENTION"){s.innerHTML="Attention: "+esc(attention.join(" · "))+".";return;}
+  if(dLive.engine_running)
+    parts.push((dLive.queue_depth>0)?`live is draining <b>${dLive.queue_depth}</b> order${dLive.queue_depth>1?"s":""}`
+      :`live is watching · <b>${dLive.processed_today||0}</b> today`);
+  if(dBack.engine_running){
+    const pct=windowPct();
+    let b=(eb.word==="creating")?`backfill is creating`:(eb.word==="scanning")?`backfill is scanning`:`backfill ${eb.word}`;
+    if(pct!=null)b+=` · <b>${pct}%</b> of its window`;
+    if(yieldActive())b+=" · yielding to live";
+    parts.push(b);
+  }
+  s.innerHTML=(runningN===2?"All streams healthy — ":"")+parts.join(" · ")+".";
+}
+function windowPct(){
+  if(!cursorCache||!cursorCache.from_date||!cursorCache.to_date)return null;
+  const from=new Date(cursorCache.from_date),to=new Date(cursorCache.to_date+"T00:00:00");
+  const start=windowStart(cursorCache),span=to-start;
+  if(span<=0)return null;
+  return Math.max(0,Math.min(100,Math.round((from-start)/span*100)));
+}
+function yieldActive(){
+  const p=(dBack.pacing||{}).hs_search;
+  return !!(p&&p.ceil&&p.ceil<=1.2&&dLive.engine_running);
+}
+
+/* ================= fleet rendering ================= */
+let focusKey=null,prevBackCeil=null,reclaiming=false;
+function tileClick(k){
+  if(focusKey===k){go(k==="live"?"stream-live":"stream-back");return;}
+  focusKey=k;renderAll();
+}
+function clearFocus(ev){ev.stopPropagation();focusKey=null;renderAll();}
+function pill(elId,word,ok){
+  const el=$(elId);el.querySelector("span:last-child").textContent=word;
+  el.style.opacity=ok?"1":".55";
+}
+function spark(svgId,data,color){
+  const svg=$(svgId);if(!data||!data.length){svg.innerHTML="";return;}
+  const W=200,H=30,P=2,peak=Math.max(1,...data);
+  const x=i=>P+i*(W-2*P)/(data.length-1),y=v=>H-P-(v/peak)*(H-2*P);
+  const pts=data.map((v,i)=>`${x(i).toFixed(1)},${y(v).toFixed(1)}`).join(" L");
+  svg.innerHTML=`<path d="M${pts}" fill="none" stroke="var(${color})" stroke-width="1.6" stroke-linejoin="round"/>`;
+}
+let prevLaneIds=new Set();
+function ticket(l,cls){
+  /* motion doctrine: the enter slide plays once per NEW lane, never on the
+     1s SSE re-render of a lane already on screen */
+  const enter=prevLaneIds.has(String(l.id))?"":" enter";
+  return `<div class="ticket ${cls}${enter}" onclick="openTrace('${esc(l.id)}')">
+    <span class="ph">${esc(l.phase)}</span><b>${esc(l.id)}</b>
+    <span class="meta">${esc((l.lane||"").replace("lane_","lane "))} · ${esc(l.items)} item(s) · ${l.age_s}s</span></div>`;
+}
+function renderFleet(){
+  /* tiles */
+  const el=engineState(dLive,"live"),eb=engineState(dBack,"back");
+  pill("tileLivePill",el.word,!!dLive.engine_running);
+  pill("tileBackPill",eb.word,!!dBack.engine_running);
+  $("tileLiveHero").textContent=dLive.queue_depth!=null?`${dLive.queue_depth} queued`:"—";
+  const peakL=Math.max(0,...(dLive.spark||[0])),peakB=Math.max(0,...(dBack.spark||[0]));
+  $("tileLiveSub").textContent=(dLive.queue_depth>0?`oldest ${dLive.queue_age||0}s · `:"")
+    +`${dLive.processed_today||0} today · ${((dLive.rate_h||0)/60).toFixed(1)}/min now · peak ${peakL}/min`;
+  const pct=windowPct();
+  $("tileBackHero").textContent=pct!=null?pct+"% of window":"—";
+  $("tileBackSub").textContent=(cursorCache&&cursorCache.from_date?("cursor "+cursorCache.from_date.slice(0,10)+" · "):"")
+    +`${((dBack.rate_h||0)/60).toFixed(1)}/min now · peak ${peakB}/min`;
+  const chipsL=[],chipsB=[];
+  const heldL=(dLive.counts||{}).held||0,heldB=(dBack.counts||{}).held||0;
+  if(heldL)chipsL.push(`<span class="heldchip">held ${heldL} ⛉</span>`);
+  if(heldB)chipsB.push(`<span class="heldchip">held ${heldB} ⛉</span>`);
+  if(el.lvl)chipsL.push(`<span class="stalechip">stale</span>`);
+  if(eb.lvl)chipsB.push(`<span class="stalechip">stale</span>`);
+  $("tileLiveChips").innerHTML=chipsL.join("");$("tileBackChips").innerHTML=chipsB.join("");
+  $("tileLive").classList.toggle("focused",focusKey==="live");
+  $("tileBack").classList.toggle("focused",focusKey==="back");
+  spark("sparkLive",dLive.spark,"--ocean");spark("sparkBack",dBack.spark,"--sage");
+  /* rail metas */
+  $("railLiveMeta").textContent=dLive.queue_depth!=null?`${dLive.queue_depth}q`:"";
+  $("railBackMeta").textContent=pct!=null?pct+"%":"";
+  /* commons */
+  const pb=(dBack.pacing||{}).hs_search,pl=(dLive.pacing||{}).hs_search;
+  if(pb||pl){
+    const bc=pb?pb.ceil:0,lc=pl?pl.ceil:0,total=Math.max(bc+lc,0.001),cap=5.0;
+    $("segLive").style.width=(lc/cap*100).toFixed(1)+"%";
+    $("segBack").style.width=(bc/cap*100).toFixed(1)+"%";
+    $("commonsGoal").style.left=(Math.min(total,cap)/cap*100).toFixed(1)+"%";
+    $("clLive").textContent=`live ${pl?pl.cur.toFixed(2):"0"}/${lc.toFixed(2)}/s`;
+    $("clBack").textContent=`backfill ${pb?pb.cur.toFixed(2):"0"}/${bc.toFixed(2)}/s`;
+    let note="";
+    if(yieldActive())note=`yielding to live · backfill ceiling ${bc.toFixed(2)}/s`;
+    else if(prevBackCeil!=null&&bc>prevBackCeil+0.05){reclaiming=true;note=`reclaiming · +${(bc-prevBackCeil).toFixed(2)}/s`;}
+    else if(reclaiming&&bc>=4.4){reclaiming=false;}
+    $("commonsNote").textContent=note;
+    prevBackCeil=bc;
+    const util=pb&&pb.ceil?pb.cur/pb.ceil:0;
+    $("utilBadge").textContent=(util>=0.95&&!yieldActive())?"✦ full utilization":"";
+    $("paceBack").innerHTML=paceRows(dBack.pacing,dBack.relay_gap,"");
+    $("paceLive").innerHTML=paceRows(dLive.pacing,dLive.relay_gap,"live");
+  }
+  /* lanes */
+  const ll=(dLive.lanes||[]),bl=(dBack.lanes||[]);
+  const cards=[];
+  if(focusKey!=="back")ll.forEach(l=>cards.push(ticket(l,"live")));
+  if(focusKey!=="live"){
+    bl.forEach(l=>cards.push(ticket(l,"back")));
+    const bStale=dBack.stale_s==null?999:dBack.stale_s;
+    if(dBack.engine_running&&!bl.length&&bStale<20){
+      const sk=(dBack.counts&&dBack.counts.skipped)||0;
+      cards.push(`<div class="ticket back ghost"><span class="ph">scanning</span><b>skipping already-synced orders</b>
+        <span class="meta">page ${dBack.page||"?"}/${dBack.page_total||"?"} · ${sk.toLocaleString()} skipped this session</span></div>`);
+    }
+  }
+  $("laneCount").textContent=`· ${ll.length} live · ${bl.length} backfill in flight`;
+  $("focusClear").style.display=focusKey?"":"none";
+  $("laneGrid").innerHTML=cards.join("")||`<div class="ticket idle"><b>${(dBack.engine_running||dLive.engine_running)?"between orders":"both engines idle"}</b></div>`;
+  /* feed */
+  renderFeed();
+  /* details */
+  $("slotTitle").textContent=dBack.slot&&dBack.slot!=="-"?dBack.slot:(dBack.engine_running?"scanning…":"between slots");
+  $("slotPage").textContent=`${dBack.page||0} of ${dBack.page_total||"?"} · ${dBack.page_done||0}/${dBack.page_orders||0} done`;
+  $("slotSkipped").textContent=((dBack.counts||{}).skipped||0).toLocaleString();
+  $("slotErrors").textContent=(dBack.counts||{}).errors||0;
+  $("winCounts").textContent=`${((dBack.counts||{}).created||0).toLocaleString()} / ${(dBack.counts||{}).held||0}`;
+  $("winRate").textContent=`${dBack.rate_h||0} orders/h`;
+  if(cursorCache&&cursorCache.from_date){
+    $("winRange").textContent=`${cursorCache.from_date.slice(0,10)} → ${cursorCache.to_date||""}`;
+    $("winCursor").textContent=`${cursorCache.from_date.replace("T"," ")} · page ${cursorCache.next_page}/${cursorCache.total_pages}`;
+  }
+}
+function paceRows(p,gap,cls){
+  if(!p||!Object.keys(p).length)return '<span class="muted" style="font-size:12px">no pacing yet</span>';
+  let h=Object.entries(p).map(([k,v])=>{
+    const frac=v.ceil>0?Math.min(1,v.cur/v.ceil):0;
+    return `<div class="prow ${cls}"><span class="nm">${esc(k)}</span>
+      <span class="pbar"><i style="width:${Math.round(frac*100)}%"></i></span>
+      <span class="val">${v.cur.toFixed(2)}/${v.ceil.toFixed(2)}${esc(v.unit)}</span></div>`;
+  }).join("");
+  if(gap!=null)h+=`<div class="prow ${cls}"><span class="nm">relay gap</span><span class="pbar"></span><span class="val">${gap.toFixed(2)}s</span></div>`;
+  return h;
+}
+let feedOpen=localStorage.getItem("qf-feed")==="1";
+function toggleFeed(){feedOpen=!feedOpen;localStorage.setItem("qf-feed",feedOpen?"1":"0");renderFeed();}
+function feedRow(r,src){
+  const icon=r[1]==="✓"?"ok":r[1]==="◼"?"held":"err";
+  const m=String(r[2]).match(/\b(\d{6,})\b/);
+  const oid=m?m[1]:"";
+  return `<div class="feedrow" ${oid?`onclick="openTrace('${oid}')"`:""}>
+    <span class="t">${esc(r[0].slice(11))}</span>
+    <span class="fico ${icon}">${esc(r[1])}</span>
+    <div style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(r[2])}</div>
+    <span class="spill spill-${src}">${src}</span></div>`;
+}
+function renderFeed(){
+  const lv=(dLive.recent||[]).map(r=>[r,"live"]),bk=(dBack.recent||[]).map(r=>[r,"backfill"]);
+  let rows;
+  if(feedOpen){
+    rows=lv.concat(bk).filter(x=>focusKey?(x[1]===(focusKey==="live"?"live":"backfill")):true)
+      .sort((a,b)=>a[0][0]<b[0][0]?1:-1).slice(0,12);
+    $("feedToggle").textContent="collapse feed ▴";
+  }else{
+    rows=[];
+    if(focusKey!=="back"&&lv.length)rows.push(lv[0]);
+    if(focusKey!=="live"&&bk.length)rows.push(bk[0]);
+    $("feedToggle").textContent="expand feed ▾";
+  }
+  $("feedBox").innerHTML=rows.map(([r,s])=>feedRow(r,s)).join("")||'<span class="muted" style="font-size:12.5px">no completions yet</span>';
+  $("seal").className=ledgerCount?"has":"";
+  $("seal").id="seal";
+  $("seal").textContent=ledgerCount?`${ledgerCount} order${ledgerCount>1?"s":""} failing — open the Ledger`:"0 unrecovered · nothing needs you ●";
+}
+
+/* ================= stream pages ================= */
+function renderStreams(){
+  /* live */
+  const el=engineState(dLive,"live");
+  $("liveHead").textContent=dLive.engine_running?`Live sync is ${el.word}`:"Live sync is stopped";
+  $("liveHeadSub").textContent=dLive.engine_running?`polls the queue every few seconds · ${dLive.processed_today||0} processed today`:"start it to consume the live queue 24/7";
+  $("qDepth").textContent=dLive.queue_depth==null?"–":dLive.queue_depth;
+  $("qAge").textContent=dLive.queue_depth?((dLive.queue_age||0)+"s"):"—";
+  $("qToday").textContent=dLive.processed_today||0;
+  const lc=dLive.counts||{};
+  $("liveCounts").textContent=`${lc.created||0} / ${lc.held||0} / ${lc.skipped||0}`;
+  $("liveLanes").innerHTML=(dLive.lanes||[]).map(l=>ticket(l,"live")).join("")||'<span class="muted" style="font-size:12.5px">no orders in flight</span>';
+  $("liveFeed").innerHTML=(dLive.recent||[]).slice(0,8).map(r=>feedRow(r,"live")).join("")||'<span class="muted" style="font-size:12.5px">none yet</span>';
+  /* backfill */
+  const eb=engineState(dBack,"back");
+  $("backHead").textContent=dBack.engine_running?`Backfill is ${eb.word}`:"Backfill is stopped";
+  $("backHeadSub").textContent=dBack.engine_running?`${((dBack.counts||{}).created||0).toLocaleString()} created this session · ${dBack.rate_h||0}/h`:"resume any time — the cursor is safe and re-scans are free";
+  if(cursorCache&&cursorCache.from_date){
+    $("bWinRange").textContent=`${cursorCache.from_date.slice(0,10)} → ${cursorCache.to_date||""}`;
+    $("bWinCursor").textContent=`${cursorCache.from_date.replace("T"," ")} · ${cursorCache.status||""}`;
+  }
+  $("bSlot").textContent=dBack.slot&&dBack.slot!=="-"?dBack.slot:"—";
+  $("bPage").textContent=`${dBack.page||0} of ${dBack.page_total||"?"} · ${dBack.page_done||0}/${dBack.page_orders||0} done`;
+  const bc=dBack.counts||{};
+  $("bCounts").textContent=`${(bc.created||0).toLocaleString()} / ${bc.held||0} / ${(bc.skipped||0).toLocaleString()} / ${bc.errors||0}`;
+  $("bRate").textContent=`${dBack.rate_h||0} orders/h`;
+  $("backLanes").innerHTML=(dBack.lanes||[]).map(l=>ticket(l,"back")).join("")||'<span class="muted" style="font-size:12.5px">no orders in flight</span>';
+  $("backFeed").innerHTML=(dBack.recent||[]).slice(0,8).map(r=>feedRow(r,"backfill")).join("")||'<span class="muted" style="font-size:12.5px">none yet</span>';
+}
+
+/* ================= master render ================= */
+function renderAll(){
+  composeHealth();
+  const worst=Math.max(dBack.stale_s||0,dLive.stale_s||0);
+  const running=dBack.engine_running||dLive.engine_running;
+  $("freshTxt").textContent=running?("live · "+Math.min(worst, 999)+"s ago"):"engines stopped";
+  $("freshDot").className=(running&&worst>90)?"stale":"";
+  renderFleet();
+  renderStreams();
+  prevLaneIds=new Set([...(dLive.lanes||[]),...(dBack.lanes||[])].map(l=>String(l.id)));
+}
+
+/* ================= run controls (contracts unchanged) ================= */
 let runMode="dry";
 document.querySelectorAll("#modeSeg button").forEach(b=>b.onclick=()=>{
   document.querySelectorAll("#modeSeg button").forEach(x=>x.classList.remove("active"));
   b.classList.add("active");runMode=b.dataset.mode;
-  $("confirmWrap").style.display=(runMode==="live"||runMode==="live-sync")?"":"none";});
+  $("confirmWrap").style.display=(runMode==="live")?"":"none";});
+async function startRun(){
+  const r=await api("/api/run",{mode:runMode,max_orders:$("maxOrders").value||null,
+    workers:$("runWorkers").value||null,confirm:($("confirmRun")||{value:""}).value.trim()});
+  $("runStatus").innerHTML=r.ok?'<span class="ok">✓ started — watch Fleet</span>':`<span class="bad">✗ ${esc(r.error)}</span>`;
+}
+async function stopRun(){
+  const r=await api("/api/stop",{});
+  $("runStatus").innerHTML=`<span class="warn">${esc(r.note)}</span>`;
+}
+async function setWindow(){
+  const from=$("winFrom").value,to=$("winTo").value;
+  if(!from||!to){$("runStatus").innerHTML='<span class="bad">pick both a from and to date</span>';return;}
+  const r=await api("/api/window",{from:from,to:to});
+  $("runStatus").innerHTML=r.ok?`<span class="ok">✓ ${esc(r.note)}</span>`:`<span class="bad">✗ ${esc(r.error)}</span>`;
+  if(r.ok)pollCursor();
+}
+function armLive(){$("liveArm").style.display=$("liveArm").style.display==="none"?"":"none";}
+async function startLiveSync(){
+  const r=await api("/api/run",{mode:"live-sync",max_orders:null,workers:null,confirm:$("confirmLive").value.trim()});
+  $("liveRunStatus").innerHTML=r.ok?'<span class="ok">✓ live sync started</span>':`<span class="bad">✗ ${esc(r.error)}</span>`;
+  if(r.ok){$("liveArm").style.display="none";$("confirmLive").value="";}
+}
+async function stopLive(){
+  const r=await api("/api/stop",{scope:"live"});
+  $("liveRunStatus").innerHTML=`<span class="warn">${esc(r.note)}</span>`;
+}
 
-/* ---- readiness checklist ---- */
+/* ================= first flight ladder ================= */
+let ffPending=0;
+function ffLS(){try{const v=JSON.parse(localStorage.getItem("qf-ff")||"{}");return v&&typeof v==="object"?v:{};}catch(e){return{};}}
+function ffState(){
+  const s=ffLS();
+  const liveDone=s.live||runsCache.some(r=>r.live&&r.created>0&&!r.errors);
+  /* a completed live stage proves the dry stage — never lock an earlier rung */
+  const dryDone=s.dry||liveDone||runsCache.some(r=>!r.live&&(r.created+r.skipped+r.held)>0&&!r.errors);
+  return{dryDone,liveDone};
+}
+function renderFF(){
+  const{dryDone,liveDone}=ffState();
+  $("ff1").classList.toggle("done",dryDone);
+  $("ff2").classList.toggle("locked",!dryDone);$("ff2").classList.toggle("done",liveDone);
+  $("ff3").classList.toggle("locked",!liveDone);
+  $("ff2reason").textContent=dryDone?"2 real orders, smallest possible stakes":"unlocks after a clean dry run";
+  $("ff3reason").textContent=liveDone?"full live run — no cap":"unlocks after 2 clean live orders";
+}
+function ffStart(stage){
+  const{dryDone,liveDone}=ffState();
+  if(stage===2&&!dryDone){$("ffStatus").innerHTML='<span class="warn">locked — finish a clean dry run first</span>';return;}
+  if(stage===3&&!liveDone){$("ffStatus").innerHTML='<span class="warn">locked — finish the capped live run first</span>';return;}
+  if(stage===1){api("/api/run",{mode:"dry",max_orders:2,workers:null,confirm:""}).then(r=>{
+    $("ffStatus").innerHTML=r.ok?'<span class="ok">✓ dry run started — watch Fleet, then click any completion to see its trace</span>':`<span class="bad">✗ ${esc(r.error)}</span>`;
+    if(r.ok){const s=ffLS();s.dry=true;localStorage.setItem("qf-ff",JSON.stringify(s));renderFF();}});return;}
+  ffPending=stage;
+  $("ffConsequence").textContent=stage===2?"2 real orders will be written to HubSpot":"the backfill will run live with no cap";
+  $("ffConfirm").style.display="";$("ffRun").focus();
+}
+function ffConfirmed(){
+  const stage=ffPending;if(!stage)return;
+  api("/api/run",{mode:"live",max_orders:stage===2?2:null,workers:null,confirm:$("ffRun").value.trim()}).then(r=>{
+    $("ffStatus").innerHTML=r.ok?'<span class="ok">✓ started — watch Fleet</span>':`<span class="bad">✗ ${esc(r.error)}</span>`;
+    if(r.ok){$("ffConfirm").style.display="none";$("ffRun").value="";
+      const s=ffLS();if(stage===2)s.live=true;localStorage.setItem("qf-ff",JSON.stringify(s));renderFF();}});
+}
+
+/* ================= readiness + wizard (contracts unchanged) ================= */
 function chip(ok,labelOk,labelBad,warn){return `<span class="chip ${ok?'ok':(warn?'warn':'bad')}">${ok?'✓':(warn?'○':'✗')} ${ok?labelOk:labelBad}</span>`;}
 let statuses=[],stages=[];
 async function refreshState(){
   const s=await api("/api/state");
-  $("engineChip").textContent=s.engine_running?"engine running":(s.stop_file?"stopped (STOP)":"engine idle");
-  $("engineChip").className="chip "+(s.engine_running?"ok":"warn");
+  $("setupTick").textContent=s.config_present?"✓ ":"";
   $("checklist").innerHTML=[
     chip(s.secrets.hubspot_token,"HubSpot token saved","HubSpot token missing"),
     chip(s.secrets.relay_secret,"relay secret saved","relay secret missing"),
@@ -518,6 +1092,20 @@ async function refreshState(){
     const c=s.config;
     $("relayUrl").value=c.relay_url||"";$("sheetId").value=c.spreadsheet_id||"";$("driveId").value=c.drive_folder_id||"";
     $("googleEnabled").value=String(!!c.google_enabled);$("bundlesEnabled").value=String(!!c.bundles_enabled);
+    /* setting the select programmatically does NOT fire onchange — render the
+       bundle inputs and repopulate them from the saved config, or Save would
+       either crash on null inputs or clobber the real ids with "" */
+    bundleArea();
+    if(c.bundles_enabled){
+      const ot=c.object_type_ids||{},at=c.assoc_type_ids||{};
+      if($("objTpl"))$("objTpl").value=ot.bundle_template||"";
+      if($("objBundle"))$("objBundle").value=ot.bundle||"";
+      if($("objComp"))$("objComp").value=ot.component||"";
+      if($("aTpl"))$("aTpl").value=at.template_bundle??"";
+      if($("aOrd"))$("aOrd").value=at.bundle_order??"";
+      if($("aPar"))$("aPar").value=at.bundle_parent_li??"";
+      if($("aCom"))$("aCom").value=at.bundle_component_li??"";
+    }
     $("slotHours").value=c.slot_hours||3;$("tz").value=c.salla_timezone_default||"Asia/Riyadh";
     if(c.workers)$("cfgWorkers").value=c.workers;
     if(c.adaptive_enabled!==undefined)$("cfgAdaptive").value=String(!!c.adaptive_enabled);
@@ -529,8 +1117,6 @@ async function refreshState(){
   $("s2").innerHTML=`credentials.json: <b class="${s.google_credentials_present?'ok':'warn'}">${s.google_credentials_present?'present':'not found'}</b> · token cache: <b>${s.google_token_cached?'present':'—'}</b>`;
   return s;
 }
-
-/* ---- wizard actions (unchanged contracts) ---- */
 async function saveSecrets(){
   $("s0").textContent="saving…";
   await api("/api/secrets",{hubspot_token:$("hsToken").value,relay_secret:$("relaySecret").value});
@@ -549,7 +1135,7 @@ async function loadMapping(){
   const p=await api("/api/hubspot/pipelines");
   if(!p.ok){$("s3").innerHTML=`<span class="bad">✗ ${esc(p.error)}</span>`;return;}
   stages=p.pipelines.flatMap(pl=>pl.stages.map(s=>({...s,pipe:pl.label})));
-  const opts=stages.map(s=>`<option value="${s.id}">${esc(s.pipe)} · ${esc(s.label)}</option>`).join("");
+  const opts=stages.map(s=>`<option value="${esc(s.id)}">${esc(s.pipe)} · ${esc(s.label)}</option>`).join("");
   const slugs=[...new Set(statuses.map(s=>s.slug))];
   $("mapArea").innerHTML=`<label>Default creation stage</label><select id="defStage">${opts}</select>
     <label style="margin-top:10px">Status → stage map</label>`+
@@ -599,42 +1185,23 @@ async function saveConfig(){
     bundles_enabled:$("bundlesEnabled").value==="true",
     default_pipeline_stage:($("defStage")||{}).value||"",
     status_stage_map:map,
-    object_type_ids:$("bundlesEnabled").value==="true"?{bundle_template:$("objTpl").value.trim(),bundle:$("objBundle").value.trim(),component:$("objComp").value.trim()}:{},
-    assoc_type_ids:$("bundlesEnabled").value==="true"?{order_contact:507,order_line_item:513,template_bundle:+$("aTpl").value||null,bundle_order:+$("aOrd").value||null,bundle_parent_li:+$("aPar").value||null,bundle_component_li:+$("aCom").value||null}:{order_contact:507,order_line_item:513},
+    object_type_ids:$("bundlesEnabled").value==="true"?{bundle_template:($("objTpl")||{value:""}).value.trim(),bundle:($("objBundle")||{value:""}).value.trim(),component:($("objComp")||{value:""}).value.trim()}:{},
+    assoc_type_ids:$("bundlesEnabled").value==="true"?{order_contact:507,order_line_item:513,template_bundle:+($("aTpl")||{value:""}).value||null,bundle_order:+($("aOrd")||{value:""}).value||null,bundle_parent_li:+($("aPar")||{value:""}).value||null,bundle_component_li:+($("aCom")||{value:""}).value||null}:{order_contact:507,order_line_item:513},
   };
   const from=$("fromDate").value,to=$("toDate").value;
   if(!from||!to){$("s4").innerHTML='<span class="bad">set the window dates</span>';return;}
   const cursor={from_date:from.length===16?from+":00":from,to_date:to,next_page:1,total_pages:1,status:"running"};
   const r=await api("/api/config",{config:cfg,cursor:cursor,overwrite_cursor:true});
-  $("s4").innerHTML=r.valid?'<span class="ok">✓ Saved and validated — use the Run panel on the right.</span>':`<span class="bad">✗ saved but invalid: ${esc(r.validation_error)}</span>`;
+  $("s4").innerHTML=r.valid?'<span class="ok">✓ Saved and validated — the first-flight ladder is on the right.</span>':`<span class="bad">✗ saved but invalid: ${esc(r.validation_error)}</span>`;
   refreshState();
 }
-async function startRun(){
-  const r=await api("/api/run",{mode:runMode,max_orders:$("maxOrders").value||null,
-    workers:$("runWorkers").value||null,confirm:($("confirmRun")||{value:""}).value.trim()});
-  $("runStatus").innerHTML=r.ok?'<span class="ok">✓ started — watch the Dashboard tab</span>':`<span class="bad">✗ ${esc(r.error)}</span>`;
-}
-async function stopRun(){
-  const r=await api("/api/stop",{});
-  $("runStatus").innerHTML=`<span class="warn">${esc(r.note)}</span>`;
-}
-async function setWindow(){
-  const from=$("winFrom").value,to=$("winTo").value;
-  if(!from||!to){$("runStatus").innerHTML='<span class="bad">pick both a from and to date</span>';return;}
-  const r=await api("/api/window",{from:from,to:to});
-  $("runStatus").innerHTML=r.ok?`<span class="ok">✓ ${esc(r.note)}</span>`:`<span class="bad">✗ ${esc(r.error)}</span>`;
-  if(r.ok)pollCursor();
-}
-async function stopLive(){
-  const r=await api("/api/stop",{scope:"live"});
-  $("runStatus").innerHTML=`<span class="warn">${esc(r.note)}</span>`;
-}
 
-/* ---- run history (holistic) ---- */
+/* ================= runs / events / ledger / raw (contracts unchanged) ================= */
 let runsCache=[],sortKey="end_ts",sortAsc=false;
 async function loadRuns(){
   const r=await api("/api/runs");
   runsCache=r.runs||[];
+  winStartCache=null; /* run history defines the true window start — recompute */
   const t=r.totals||{};
   $("hCreated").textContent=(t.created??0).toLocaleString();
   $("hHeld").textContent=(t.held??0).toLocaleString();
@@ -642,7 +1209,7 @@ async function loadRuns(){
   $("hBest").textContent=(t.best_rate_h??0).toLocaleString();
   $("hErrors").textContent=(t.errors??0).toLocaleString();
   $("runsMeta").textContent=`${t.runs||0} completed · ${(t.created||0).toLocaleString()} orders lifetime`;
-  renderRuns();
+  renderRuns();renderFF();
 }
 function renderRuns(){
   const rows=[...runsCache].sort((a,b)=>{
@@ -666,7 +1233,6 @@ document.querySelectorAll("#runsTable th").forEach(th=>th.onclick=()=>{
   if(sortKey===th.dataset.k)sortAsc=!sortAsc;else{sortKey=th.dataset.k;sortAsc=false;}
   renderRuns();});
 
-/* ---- events feed ---- */
 let evKind="",evSrc="",evOrder="desc",evTimer=null,evCache=[];
 document.querySelectorAll("#evFilters button").forEach(b=>b.onclick=()=>{
   document.querySelectorAll("#evFilters button").forEach(x=>x.classList.remove("active"));
@@ -675,9 +1241,12 @@ document.querySelectorAll("#srcFilters button").forEach(b=>b.onclick=()=>{
   document.querySelectorAll("#srcFilters button").forEach(x=>x.classList.remove("active"));
   b.classList.add("active");evSrc=b.dataset.src;loadEvents();});
 function evDebounce(){clearTimeout(evTimer);evTimer=setTimeout(loadEvents,300);}
+let evSeq=0;
 async function loadEvents(){
   const q=encodeURIComponent($("evSearch").value.trim());
+  const seq=++evSeq;
   const r=await api(`/api/events?kind=${evKind}&source=${evSrc}&q=${q}&limit=300`);
+  if(seq!==evSeq)return; /* a newer filter/search superseded this response */
   evCache=r.events||[];renderEvents();
 }
 const BLOB={created:"blob-created",held:"blob-held",skip:"blob-skip",error:"blob-error",pacing:"blob-pacing",system:"blob-system"};
@@ -686,170 +1255,189 @@ function renderEvents(){
   const evs=evOrder==="desc"?evCache:[...evCache].reverse();
   $("evList").innerHTML=evs.map((e,i)=>{
     const pill=e.source==="live"?'<span class="spill spill-live">live</span>':'<span class="spill spill-backfill">backfill</span>';
-    const drill=e.oid?`<div class="odetail" id="od-${i}"></div>`:"";
-    return `<li class="evrow" data-oid="${esc(e.oid||"")}" data-i="${i}" onclick="evClick(this)">
+    /* the raw line stays reachable even when the row click opens a trace */
+    const rawBtn=e.raw?`<button class="linky" style="border:0;background:none;color:var(--muted);font-size:11px;cursor:pointer;text-decoration:underline;flex-shrink:0" onclick="event.stopPropagation();this.closest('li').classList.toggle('open')">raw</button>`:"";
+    return `<li><div class="evrow" onclick="evClick(this,'${esc(e.oid||"")}')">
      <span class="t">${esc(e.ts.slice(5))}</span>
      <span class="blob ${BLOB[e.kind]||"blob-system"}"></span>
      ${pill}
-     <div style="flex:1">${esc(e.text)}${e.raw?`<div class="raw">${esc(e.raw)}</div>`:""}${drill}</div></li>`;
+     <div style="flex:1">${esc(e.text)}${e.raw?`<div class="raw">${esc(e.raw)}</div>`:""}</div>${rawBtn}</div></li>`;
   }).join("")||'<li class="muted">nothing matches</li>';
 }
-async function evClick(row){
-  const oid=row.dataset.oid;
-  row.classList.toggle("open");
-  if(!oid) return;
-  const box=$("od-"+row.dataset.i);
-  if(!box || box.dataset.loaded) return;
-  box.dataset.loaded="1"; box.innerHTML='<span class="muted" style="font-size:12px">loading checks…</span>';
-  try{
-    const d=await api("/api/order/"+oid);
-    const h=d.header||{}, checks=d.checks||[];
-    const RES={created:["ci-ok","✓","created"],held:["ci-warn","◼","held for catalog"],
-               deduplicated:["ci-ok","↷","deduplicated (no duplicate made)"],error:["ci-err","✗","error"]};
-    const r=RES[h.result]||["ci-ok","·",h.result||"in progress"];
-    const head=`<div class="ohead"><span class="${r[0]}" style="font-weight:700">${r[1]} ${esc(r[2])}</span>`+
-      (h.ref?`<span>ref <b>${esc(h.ref)}</b></span>`:"")+
-      (h.items?`<span><b>${esc(h.items)}</b> item(s)</span>`:"")+
-      (h.hs_order_id?`<span>HS order <b>${esc(h.hs_order_id)}</b></span>`:"")+
-      (h.hs_contact_id?`<span>${esc(h.contact_kind||"")} contact <b>${esc(h.hs_contact_id)}</b></span>`:"")+
-      `<span>via <b>${esc(h.source||"—")}</b></span></div>`;
-    const rows=checks.length?checks.map(c=>`<div class="ocheck">
-        <span class="ci ci-${esc(c.ok)}">${c.ok==="err"?"✗":c.ok==="warn"?"!":"✓"}</span>
-        <span class="cl">${esc(c.label)}</span>
-        <span class="cd">${c.detail?"— "+esc(c.detail):""}</span>
-        <span class="ct">${esc((c.ts||"").slice(11))}</span></div>`).join(""):
-      '<span class="muted" style="font-size:12px">No detailed trace in the recent log window.</span>';
-    box.innerHTML=head+rows;
-  }catch(e){ box.innerHTML='<span class="bad" style="font-size:12px">could not load trace</span>'; }
+function evClick(row,oid){
+  if(oid){openTrace(oid);return;}
+  row.parentElement.classList.toggle("open");
 }
 async function loadLedger(){
   const e=await api("/api/errors");
-  const n=(e.rows||[]).length;
-  $("ledgerTitle").innerHTML=n?`<span class="bad">${n} unrecovered failure(s)</span>`:'<span class="ok">Empty — every order accounted for ✓</span>';
-  $("errBox").textContent=n?e.rows.join("\n"):"none 🎉";
+  const rows=e.rows||[];
+  /* the CSV is append-only history and a stuck order re-flags every retry,
+     so the ALARM counts DISTINCT failing orders in the last 24h — the number
+     of things that actually need a human, not the number of log rows */
+  const cut=new Date(Date.now()-24*3600e3);
+  const recent=rows.filter(r=>{const d=new Date(r.slice(0,19).replace(" ","T"));return !isNaN(d)&&d>=cut;});
+  const byOid={};
+  recent.forEach(r=>{const p=r.split(",");const oid=p[1]||"?";
+    (byOid[oid]=byOid[oid]||{n:0,last:r}).n++;byOid[oid].last=r;});
+  const oids=Object.keys(byOid);
+  ledgerCount=oids.length;
+  $("ledgerBadge").style.display=ledgerCount?"":"none";
+  $("ledgerBadge").textContent=ledgerCount;
+  if($("ledgerTitle")){
+    $("ledgerTitle").innerHTML=ledgerCount
+      ?`<span class="bad">${ledgerCount} order(s) failing in the last 24h</span> <span class="muted" style="font-size:12px;font-weight:500">· ${recent.length} flag event(s)</span>`
+      :'<span class="ok">Nothing in the last 24h — every order accounted for</span>';
+    let h=ledgerCount
+      ?oids.map(o=>{const e=byOid[o],p=e.last.split(",");
+        const click=/^\d+$/.test(o)?`onclick="openTrace('${o}')"`:""; /* only real ids are traceable */
+        return `<div class="feedrow" ${click}>
+          <span class="fico err">✗</span>
+          <div style="flex:1"><b class="mono">${esc(o)}</b> — ${esc(p.slice(3).join(",").slice(0,120))}
+            <div class="muted" style="font-size:11.5px">${e.n} flag event(s) · last ${esc(p[0]||"")} · stage ${esc(p[2]||"")}</div></div></div>`;}).join("")
+      :'<div class="serene">Failure ledger: 0 — nothing needs you.</div>';
+    const older=rows.length-recent.length;
+    if(older>0)h+=`<details style="margin-top:10px"><summary class="muted" style="cursor:pointer;font-size:12.5px">history — ${older} older row(s)</summary>
+      <pre>${esc(rows.filter(r=>!recent.includes(r)).join("\n"))}</pre></details>`;
+    $("ledgerBody").innerHTML=h;
+  }
+  composeHealth();
 }
+let rawSrc="";
+document.querySelectorAll("[data-rlsrc]").forEach(b=>b.onclick=()=>{
+  document.querySelectorAll("[data-rlsrc]").forEach(x=>x.classList.remove("active"));
+  b.classList.add("active");rawSrc=b.dataset.rlsrc;loadRaw();});
 async function loadRaw(){
-  const l=await api("/api/log?lines=300");$("logBox").textContent=l.lines.join("\n")||"(empty)";
+  const l=await api("/api/log?lines=300"+(rawSrc?"&source="+rawSrc:""));
+  $("logBox").textContent=(l.lines||[]).join("\n")||"(empty)";
   $("logBox").scrollTop=$("logBox").scrollHeight;
 }
 
-/* ---- dashboard live rendering ---- */
-function laneCard(l,cls,tag){
-  return `<div class="lane ${cls}"><span class="tag">${tag}</span>
-    <b>${esc(l.id)}</b>
-    <span class="ph">${esc(l.phase)}</span>
-    <span class="meta">${esc((l.lane||"").replace("lane_","lane "))||tag.toLowerCase()} · ref ${esc(l.ref)} · ${esc(l.items)} item(s) · ${l.age_s}s</span>
-  </div>`;
+/* ================= trace drawer ================= */
+let traceOid="";
+const STAGES=[
+  ["IDENTITY",["Deduplication check","Contact lookup by phone","Contact created"]],
+  ["CATALOG",["Catalog / product check","Bundle / component check","Held for catalog approval"]],
+  ["WRITE",["Order created in HubSpot","Order patched (stage / sync)","Line item created","Line item stamped with product","Records linked (association)"]],
+  ["RECORD",["Order JSON archived to Drive","Audit row written","Audit row updated"]],
+];
+function stageOf(label){
+  for(const[name,labels]of STAGES)if(labels.includes(label))return name;
+  return "OUTCOME";
 }
-function renderLanes(){
-  const bl=(dBack.lanes||[]), ll=(dLive.lanes||[]);
-  const cards=[];
-  /* live orders first — deep blue/green, most time-sensitive */
-  ll.forEach(l=>cards.push(laneCard(l,"live","LIVE")));
-  /* backfill worker lanes — light green */
-  bl.forEach(l=>cards.push(laneCard(l,"backfill","BACKFILL")));
-  /* backfill working but skipping (no create lane) — show it as active, not idle */
-  const bStale=dBack.stale_s==null?999:dBack.stale_s;
-  const bScanning=!!dBack.engine_running && !bl.length && bStale<15;
-  if(bScanning){
-    const sk=(dBack.counts&&dBack.counts.skipped)||0;
-    const pg=dBack.page?`page ${dBack.page}/${dBack.page_total||"?"}`:"scanning";
-    cards.push(`<div class="lane scanning"><span class="tag">backfill</span>
-      <b>scanning window</b>
-      <span class="ph">skipping already-synced orders</span>
-      <span class="meta">${esc(pg)} · ${sk.toLocaleString()} skipped this session</span></div>`);
+async function openTrace(oid){
+  if(!oid)return;
+  traceOid=String(oid);
+  $("overlay").style.display="block";$("drawer").classList.add("open");
+  $("trOid").textContent=traceOid;$("trSrc").textContent="";$("trSrc").className="spill";
+  $("trPill").textContent="…";$("trPill").className="tpill progress";
+  $("trIdem").textContent="";$("trLog").style.display="none";
+  $("drawerBody").innerHTML='<p class="muted">loading trace…</p>';
+  let d;
+  try{d=await api("/api/order/"+traceOid);}
+  catch(e){$("drawerBody").innerHTML='<p class="bad">could not load the trace</p>';return;}
+  const h=d.header||{},checks=d.checks||[];
+  const res=h.result||"progress";
+  $("trPill").textContent={created:"synced",held:"parked",deduplicated:"deduplicated",error:"failed"}[res]||"in progress";
+  $("trPill").className="tpill "+(res==="progress"?"progress":res);
+  $("trSrc").style.display=h.source?"":"none";
+  if(h.source){$("trSrc").textContent=h.source;$("trSrc").className="spill spill-"+(h.source==="live"?"live":"backfill");}
+  /* hero */
+  let hero="";
+  if(res==="held"){
+    const heldChk=checks.find(c=>c.ok==="warn");
+    hero=`<div class="hero held"><span class="hseal">⛉ Parked — catalog gate</span>
+      <div class="hbody">A product in this order isn't approved in the HubSpot catalog yet.
+      This is intentional parking, not a failure — the order will sync automatically once the catalog releases it.</div>
+      <div class="hmeta">${heldChk&&heldChk.detail?esc(heldChk.detail)+" · ":""}${h.ts?("first seen "+esc(h.ts)):""}</div></div>`;
+  }else if(res==="created"){
+    hero=`<div class="hero created"><span class="hseal">✓ Fully synced</span>
+      <div class="hbody">Order, contact, line items and associations are all in HubSpot${h.hs_order_id?" — HS order <b>"+esc(h.hs_order_id)+"</b>":""}.</div>
+      <div class="hmeta">${h.contact_kind?esc(h.contact_kind)+" contact "+esc(h.hs_contact_id||""):""}</div></div>`;
+  }else if(res==="error"){
+    const errChk=checks.find(c=>c.ok==="err");
+    hero=`<div class="hero error"><span class="hseal">✗ Failed</span>
+      <div class="hbody">${errChk?esc(errChk.label)+(errChk.detail?" — "+esc(errChk.detail):""):"See the checks below."}</div>
+      <div class="hmeta">The engine retries errors automatically; unrecovered ones land in the Ledger.</div></div>`;
+  }else if(res==="deduplicated"){
+    hero=`<div class="hero created"><span class="hseal">✓✓ Already synced — never twice</span>
+      <div class="hbody">This order already exists in HubSpot; the engine skipped it rather than create a duplicate.</div></div>`;
   }
-  /* idle backfill lanes for context, only while creating */
-  if(bl.length){const max=dBack.lanes_max||bl.length;
-    for(let i=0;i<Math.max(0,max-bl.length);i++)
-      cards.push('<div class="lane idle"><b>—</b><span class="ph">waiting for next order</span></div>');}
-  const title = (ll.length||bl.length)
-      ? `${ll.length} live · ${bl.length} backfill in flight `
-      : (bScanning?"backfill scanning ":"idle ");
-  $("laneTitle").firstChild.textContent=title;
-  const max=dBack.lanes_max||0;
-  $("laneCount").textContent=max?`${bl.length} of ${max} backfill lanes busy`:"";
-  $("laneGrid").innerHTML=cards.join("")||'<div class="lane idle"><b>both engines idle</b></div>';
+  /* meta row */
+  const meta=`<div class="hint" style="margin:0 0 12px">${h.ref?`ref <b>${esc(h.ref)}</b> · `:""}${h.items?`<b>${esc(h.items)}</b> item(s) · `:""}${h.ts?esc(h.ts):""}</div>`;
+  /* stages */
+  const buckets={};
+  checks.forEach(c=>{(buckets[stageOf(c.label)]=buckets[stageOf(c.label)]||[]).push(c);});
+  const order=["IDENTITY","CATALOG","WRITE","RECORD","OUTCOME"];
+  let body="";
+  for(const name of order){
+    const list=buckets[name];if(!list||!list.length)continue;
+    const bad=list.some(c=>c.ok!=="ok");
+    const sum=bad?"":`${list.length} step${list.length>1?"s":""} · all ✓`;
+    body+=`<details class="tstage" ${bad?"open":""}><summary>${name}<span class="sum ${bad?"":"ci-ok"}">${bad?"needs a look":sum}</span></summary>
+      <div class="steps">${list.map(c=>`<div class="ocheck">
+        <span class="ci ci-${esc(c.ok)}">${c.ok==="err"?"✗":c.ok==="warn"?"!":"✓"}</span>
+        <span class="cl">${esc(c.label)}</span>
+        <span class="cd">${c.detail?"— "+esc(c.detail):""}</span>
+        <span class="ct">${esc((c.ts||"").slice(11))}</span></div>`).join("")}</div></details>`;
+  }
+  if(!checks.length)body+='<p class="muted" style="font-size:12.5px">No detailed trace in the recent log window — the raw log link below may still find it.</p>';
+  $("drawerBody").innerHTML=hero+meta+body;
+  $("trIdem").textContent=res==="deduplicated"?"✓✓ idempotency guarantee: nothing was written twice":"";
 }
-function renderPace(d){
-  const p=d.pacing||{};
-  if(!Object.keys(p).length)return;
-  let atCeil=0,rows=Object.entries(p).map(([k,v])=>{
-    const frac=v.ceil>0?Math.min(1,v.cur/v.ceil):0;
-    if(frac>=0.97)atCeil++;
-    /* sage deepens as utilization rises — full bar = full utility = the goal */
-    const col=`color-mix(in srgb, var(--sage-strong) ${Math.round(40+60*frac)}%, var(--line))`;
-    return `<div class="prow"><span class="nm">${esc(k)}</span>
-      <span class="pbar"><i style="width:${Math.round(frac*100)}%;background:${col}"></i></span>
-      <span class="val">${v.cur.toFixed(2)} / ${v.ceil.toFixed(2)}${esc(v.unit)}</span></div>`;
-  });
-  if(d.relay_gap!=null)rows.push(`<div class="prow"><span class="nm">relay gap</span><span class="pbar"></span><span class="val">${d.relay_gap.toFixed(2)}s</span></div>`);
-  $("paceArea").innerHTML=rows.join("");
-  $("utilBadge").textContent=atCeil>=3?"✦ full utilization — exactly where we want to be":"";
-  $("adaptNote").textContent=d.last_adapt||"";
+function closeTrace(){
+  $("overlay").style.display="none";$("drawer").classList.remove("open");
+  if(location.hash.startsWith("#/trace/"))history.replaceState(null,"","#/"+route);
 }
-/* line chart with hover */
-let sparkData=[],sparkTimes=[];
-function renderSpark(d){
-  const data=d.spark||[];
-  if(!data.length)return;
-  sparkData=data;
-  const now=Date.now();
-  sparkTimes=data.map((_,i)=>new Date(now-(data.length-1-i)*60000));
-  const peak=Math.max(1,...data);
-  const W=600,H=150,P=6;
-  const x=i=>P+i*(W-2*P)/(data.length-1);
-  const y=v=>H-P-(v/peak)*(H-2*P-14);
-  const pts=data.map((v,i)=>`${x(i).toFixed(1)},${y(v).toFixed(1)}`);
-  const line=`M${pts.join(" L")}`;
-  const area=`${line} L${x(data.length-1).toFixed(1)},${H-P} L${x(0).toFixed(1)},${H-P} Z`;
-  $("tpChart").innerHTML=`
-    <defs><linearGradient id="tg" x1="0" y1="0" x2="0" y2="1">
-      <stop offset="0" stop-color="var(--sage)" stop-opacity="0.35"/>
-      <stop offset="1" stop-color="var(--sage)" stop-opacity="0.02"/></linearGradient></defs>
-    <path d="${area}" fill="url(#tg)"/>
-    <path d="${line}" fill="none" stroke="var(--sage-strong)" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
-    <circle id="tpDot" r="4" fill="var(--sage-strong)" stroke="var(--panel)" stroke-width="2" style="display:none"/>`;
-  $("tpPeak").textContent=peak+"/min";
-  $("tpNow").textContent=(d.rate_h/60).toFixed(1);
+async function traceRaw(){
+  $("trLog").style.display="";$("trLog").textContent="loading…";
+  try{
+    const[a,b]=await Promise.all([api("/api/log?lines=900"),api("/api/log?lines=900&source=live")]);
+    const lines=[...(a.lines||[]),...(b.lines||[])].filter(l=>l.includes(traceOid));
+    $("trLog").textContent=lines.join("\n")||"(no lines mentioning this order in the recent tails)";
+  }catch(e){$("trLog").textContent="(could not load logs)";}
 }
-const chartEl=$("tpChart");
-chartEl.addEventListener("mousemove",ev=>{
-  if(!sparkData.length)return;
-  const r=chartEl.getBoundingClientRect();
-  const i=Math.round((ev.clientX-r.left)/r.width*(sparkData.length-1));
-  const idx=Math.max(0,Math.min(sparkData.length-1,i));
-  const W=600,H=150,P=6,peak=Math.max(1,...sparkData);
-  const cx=P+idx*(W-2*P)/(sparkData.length-1);
-  const cy=H-P-(sparkData[idx]/peak)*(H-2*P-14);
-  const dot=$("tpDot");
-  if(dot){dot.setAttribute("cx",cx);dot.setAttribute("cy",cy);dot.style.display="";}
-  const tip=$("tpTip");
-  tip.style.display="block";
-  tip.style.left=(cx/W*r.width)+"px";
-  tip.style.top=(cy/H*r.height)+"px";
-  const t=sparkTimes[idx];
-  tip.textContent=`${t.getHours().toString().padStart(2,"0")}:${t.getMinutes().toString().padStart(2,"0")} — ${sparkData[idx]} order${sparkData[idx]===1?"":"s"}/min`;
+document.addEventListener("keydown",e=>{
+  if(e.key==="Escape"){closeTrace();closePal();}
+  if((e.metaKey||e.ctrlKey)&&e.key.toLowerCase()==="k"){e.preventDefault();openPal();}
 });
-chartEl.addEventListener("mouseleave",()=>{$("tpTip").style.display="none";const d=$("tpDot");if(d)d.style.display="none";});
 
-/* window/day math for the period card */
-function renderWindow(d,cursor){
-  if(!cursor||!cursor.from_date){$("winTitle").textContent="no window configured";return;}
-  const from=new Date(cursor.from_date), to=new Date(cursor.to_date+"T00:00:00");
-  $("winRange").textContent=`${cursor.from_date.slice(0,10)} → ${cursor.to_date}`;
-  $("winCursor").textContent=`${cursor.from_date.replace("T"," ")} · page ${cursor.next_page}/${cursor.total_pages} · ${cursor.status}`;
-  const start=windowStart(cursor), span=(to-start), donept=(from-start);
-  const pct=span>0?Math.max(0,Math.min(100,donept/span*100)):0;
-  $("winBar").style.width=pct.toFixed(1)+"%";
-  const daysLeft=Math.max(0,(to-from)/864e5);
-  $("winTitle").textContent=`${pct.toFixed(0)}% of the window swept · ${daysLeft.toFixed(1)} day(s) of orders remaining`;
-  $("winCounts").textContent=`${(d.counts?.created||0).toLocaleString()} / ${(d.counts?.held||0)}`;
-  $("winRate").textContent=`${d.rate_h||0} orders/h`;
+/* ================= command palette ================= */
+const PAL_NAV=[
+  {t:"Fleet — all streams",r:"fleet"},{t:"Orders · Live",r:"stream-live"},
+  {t:"Orders · Backfill",r:"stream-back"},{t:"Ledger — unrecovered failures",r:"ledger"},
+  {t:"Audit — runs · events · raw log",r:"audit"},{t:"Setup — wizard & first flight",r:"setup"},
+];
+let palSel=0;
+function openPal(){$("palWrap").style.display="flex";$("palInput").value="";palSel=0;palRender();$("palInput").focus();}
+function closePal(){$("palWrap").style.display="none";}
+function palItems(){
+  const q=$("palInput").value.trim();
+  const items=[];
+  if(/^\d{5,}$/.test(q))items.push({t:`Open trace for order ${q}`,oid:q});
+  PAL_NAV.filter(n=>!q||n.t.toLowerCase().includes(q.toLowerCase())).forEach(n=>items.push(n));
+  return items;
 }
+function palRender(){
+  const items=palItems();
+  if(palSel>=items.length)palSel=0;
+  $("palList").innerHTML=items.map((it,i)=>`<div class="palItem ${i===palSel?"sel":""}" onclick="palGo(${i})">${esc(it.t)}<span class="pk">${it.oid?"trace":"go"}</span></div>`).join("")
+    ||'<div class="palItem muted">nothing matches</div>';
+}
+function palGo(i){
+  const it=palItems()[i];if(!it)return;
+  closePal();
+  if(it.oid)openTrace(it.oid);else go(it.r);
+}
+$("palInput").addEventListener("keydown",e=>{
+  const items=palItems();
+  if(e.key==="ArrowDown"){palSel=Math.min(palSel+1,items.length-1);palRender();e.preventDefault();}
+  if(e.key==="ArrowUp"){palSel=Math.max(palSel-1,0);palRender();e.preventDefault();}
+  if(e.key==="Enter")palGo(palSel);
+});
+
+/* ================= window math + pollers ================= */
 let winStartCache=null;
 function windowStart(cursor){
-  /* earliest run in history with the same window end = window start */
   if(winStartCache&&winStartCache.to===cursor.to_date)return winStartCache.d;
   let d=new Date(cursor.from_date);
   for(const r of runsCache)
@@ -858,77 +1446,22 @@ function windowStart(cursor){
   winStartCache={to:cursor.to_date,d};
   return d;
 }
-
-/* ---- SSE · both engines streamed at once (consolidated view) ---- */
-let dBack={},dLive={},cursorCache=null,esBack=null,esLive=null;
-function initStreams(){
-  if(esBack)esBack.close(); if(esLive)esLive.close();
-  esBack=new EventSource("/api/stream");
-  esBack.onmessage=e=>{dBack=JSON.parse(e.data);renderAll();};
-  esLive=new EventSource("/api/stream?source=live");
-  esLive.onmessage=e=>{dLive=JSON.parse(e.data);renderAll();};
-}
-function engineStatus(d,kind){
-  if(!d||d.engine_running===undefined)return "connecting…";
-  if(!d.engine_running)return "stopped";
-  const stale=d.stale_s||0;
-  if(stale>90)return "silent "+stale+"s";
-  if(kind==="live")return (d.queue_depth>0)?`working · ${d.queue_depth} queued`:"watching · queue empty";
-  if((d.lanes||[]).length)return `creating · ${(d.lanes||[]).length} lane(s)`;
-  if(stale<15)return "scanning · skipping synced orders";
-  return "running";
-}
-function renderAll(){
-  const bRun=!!(dBack.engine_running&&(dBack.stale_s||0)<90);
-  const lRun=!!(dLive.engine_running&&(dLive.stale_s||0)<90);
-  $("eBackSt").textContent=engineStatus(dBack,"back");
-  $("eBack").classList.toggle("on-back",bRun);
-  $("eLiveSt").textContent=engineStatus(dLive,"live");
-  $("eLive").classList.toggle("on-live",lRun);
-  const anyRun=dBack.engine_running||dLive.engine_running;
-  $("engineChip").textContent=anyRun?"engine running":"engine idle";
-  $("engineChip").className="chip "+(anyRun?"ok":"warn");
-  /* current period + slot come from the backfill engine */
-  $("slotTitle").textContent=dBack.slot&&dBack.slot!=="-"?`slot ${dBack.slot}`
-      :(dBack.engine_running?"scanning…":"between slots");
-  $("slotPage").textContent=`${dBack.page||0} of ${dBack.page_total||"?"}`;
-  $("slotOrders").textContent=`${dBack.page_done||0} done / ${dBack.page_orders||0}`;
-  $("slotSkipped").textContent=((dBack.counts&&dBack.counts.skipped)||0).toLocaleString();
-  $("slotErrors").textContent=(dBack.counts&&dBack.counts.errors)||0;
-  const pct=dBack.page_orders?Math.round(100*dBack.page_done/dBack.page_orders):0;
-  $("pageBar").style.width=pct+"%";
-  /* live queue always visible */
-  $("qDepth").textContent=dLive.queue_depth==null?"–":dLive.queue_depth;
-  $("qAge").textContent=dLive.queue_depth?((dLive.queue_age||0)+"s"):"—";
-  $("qToday").textContent=dLive.processed_today||0;
-  renderLanes();renderPace(dBack);renderSpark(dBack);
-  if(cursorCache)renderWindow(dBack,cursorCache);
-  const lastr=dLive.last_result||dBack.last_result;
-  $("curOrder").textContent=lastr?("last: "+lastr):"";
-  /* merged completions feed, newest first, source-tagged */
-  const merged=[].concat((dLive.recent||[]).map(r=>[r[0],r[1],r[2],"live"]),
-                         (dBack.recent||[]).map(r=>[r[0],r[1],r[2],"backfill"]))
-    .sort((a,b)=>a[0]<b[0]?1:-1).slice(0,12);
-  $("feed").innerHTML=merged.map(r=>`<li><span class="t">${esc(r[0].slice(11))}</span>`
-    +`<span class="evt-icon evt-${r[1]==="✓"?"created":r[1]==="◼"?"held":"error"}">${esc(r[1])}</span>`
-    +`<div>${esc(r[2])} <span class="spill spill-${r[3]}">${r[3]}</span></div></li>`).join("");
-}
-initStreams();
 async function pollCursor(){
   const s=await api("/api/state");cursorCache=s.cursor||null;
-  if(cursorCache)renderWindow(dBack,cursorCache);
-  const c=cursorCache;
-  if(c&&c.from_date){
-    $("winCurrent").innerHTML=`current: <b>${esc(c.from_date.replace("T"," "))} → ${esc(c.to_date||"")}</b> · page ${c.next_page}/${c.total_pages} · ${esc(c.status)}`;
-    if(!$("winFrom").value)$("winFrom").value=c.from_date.slice(0,16);
-    if(!$("winTo").value)$("winTo").value=c.to_date||"";
+  $("setupTick").textContent=s.config_present?"✓ ":"";
+  if(cursorCache&&cursorCache.from_date){
+    $("winCurrent").innerHTML=`current: <b>${esc(cursorCache.from_date.replace("T"," "))} → ${esc(cursorCache.to_date||"")}</b> · page ${cursorCache.next_page}/${cursorCache.total_pages} · ${esc(cursorCache.status)}`;
+    if(!$("winFrom").value)$("winFrom").value=cursorCache.from_date.slice(0,16);
+    if(!$("winTo").value)$("winTo").value=cursorCache.to_date||"";
   }
+  renderAll();
 }
 setInterval(pollCursor,5000);
-setInterval(()=>{if($("tab-activity").style.display!=="none")loadEvents();},7000);
-setInterval(()=>{loadRuns();},30000);
+setInterval(loadLedger,15000);
+setInterval(()=>{if(route==="audit")loadEvents();},7000);
+setInterval(loadRuns,30000);
 
-refreshState();loadRuns();pollCursor();
+initStreams();refreshState();loadRuns();loadLedger();pollCursor();routeFromHash();
 </script>
 </body>
 </html>
