@@ -346,23 +346,31 @@ Defaults (42,802 orders · 3 min/order · 1,000 orders/h · $25/h) yield **≈ 5
 
 ---
 
-## 8. The web dashboard
+## 8. The web dashboard — "Quiet Fleet" (v2.0)
 
-`serve.py` launches a Flask UI (`http://127.0.0.1:8377`) — a read-only tail of
-the engine logs plus run controls. The **consolidated dashboard** streams *both*
-engines at once:
+`serve.py` launches a Flask UI (`http://127.0.0.1:8377`). v2.0 replaced the
+three-tab layout with a **stream-object shell** (design rationale:
+[`UIUX_VISION.md`](UIUX_VISION.md)) — a left rail of sync streams, a **Fleet**
+home aggregating both engines, and per-stream pages with their own run
+controls:
 
-![Consolidated dashboard](img/dashboard-consolidated.png)
+![Quiet Fleet](img/fleet.png)
 
-- **Both engines, one view** — no toggle; each has its own live status pill.
-- **Color-coded activity** — backfill worker lanes in light green, live-order
-  cards in deep blue-green, live sorted first:
-
-![Color-coded worker lanes](img/activity-lanes.png)
-
-- **Skip-work is surfaced** — a skip-heavy backfill slot reads as *"scanning"*,
-  not idle, so a working engine never looks dead.
-- **Adaptive pacing bars** show each limiter's live rate vs its 90–95 % ceiling.
+- **Beacon + health sentence** — `NOMINAL / ATTENTION / FAULT` plus one
+  composed sentence; the 2-second answer is literally readable.
+- **Shared Budget Commons** — the live-priority yield (§6) rendered as a
+  stacked bar: live's ocean segment grows as backfill's sage segment
+  compresses, annotated `yielding to live`, and ramps back stepwise (AIMD
+  made visible).
+- **Color-coded lanes** — ocean live tickets sorted above sage backfill, a
+  dashed *scanning* ghost when skip-heavy, every ticket click-through to the
+  order's trace drawer (stages folded, held orders led by a gold *Parked*
+  seal with the release condition).
+- **Strict alarm ladder** — red is confined to the beacon, the banner and the
+  Ledger badge and never animates; gold (parked) and amber (stale) are
+  separate tokens.
+- **⌘K palette** — jump to any surface, or paste an order ID straight into
+  its trace. Light and dark are both first-class.
 
 ---
 

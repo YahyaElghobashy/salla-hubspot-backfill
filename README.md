@@ -20,7 +20,7 @@ They can run **together** and coordinate over the shared HubSpot rate budget.
 > together, plus a **real ~50× efficiency calculation with an interactive
 > calculator** and **GCP deployment** — see **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)**.
 
-![Consolidated dashboard — both engines live at once](docs/img/dashboard-consolidated.png)
+![Quiet Fleet — both engines in one view, a live yield event in progress](docs/img/fleet.png)
 
 ## How it works
 
@@ -86,77 +86,80 @@ Prefer terminals? Everything works without the UI:
 `systemd-inhibit`), relaunches the engine if it's killed abnormally, and stops
 cleanly on the STOP file or when the cursor reaches `done`.
 
-## The web UI, page by page
+## The web UI — "Quiet Fleet" (v2.0)
 
 Everything runs locally (`python serve.py`), talks only to your own HubSpot
 portal, Make relay, and Google account, and never sends data anywhere else.
-Three pages: **Control** to set up and launch, **Dashboard** to watch,
-**Activity** to audit. All screenshots use synthetic demo data.
+The UI is a **stream-object shell**: sync streams are first-class objects in a
+left rail, a **Fleet** home aggregates health across all of them, and every
+stream gets the same anatomy — so future streams (contacts, status relay,
+custom objects, multi-store) arrive as new rail entries, never a redesign.
+Design rationale: [`docs/UIUX_VISION.md`](docs/UIUX_VISION.md). All
+screenshots use synthetic demo data.
 
-### Control — set up and run from one place
+### Fleet — the 2-second answer
 
-![Control page](docs/screenshots/control.png)
+![Fleet — both streams, a live yield event, nothing needs you](docs/img/fleet.png)
 
-The readiness strip at the top tells you at a glance what is still missing
-before a run can start. Below it, the five setup steps live in collapsible
-cards — each with a status dot — and the sticky **Run** panel sits beside
-them so configuration and launch never drift apart:
+- **The beacon + health sentence** — one word (`NOMINAL / ATTENTION / FAULT`)
+  and one composed English sentence answer "is everything OK?" without
+  scanning a single number. When something genuinely fails, the sentence is
+  *replaced* by the alarm — calm and alarm never share the screen.
+- **Stream tiles** — identical anatomy per stream: status pill, hero number
+  (live: queue depth + oldest age; backfill: % of window + cursor),
+  orders/min now + peak, a live sparkline, and a calm gold `held n ⛉` chip
+  when orders are parked at the catalog gate.
+- **Shared HubSpot budget** — the signature element: one stacked bar for the
+  account-wide search budget. When live orders arrive, the ocean segment
+  visibly grows as the sage segment compresses — `yielding to live` — and
+  ramps back step-by-step when live idles. The v1.7 coordination is watched,
+  not inferred.
+- **Lanes** — one ticket per in-flight order, edge-striped by stream (ocean
+  live sorted first, sage backfill), phase as its eyebrow; a dashed
+  *scanning* ghost appears when the backfill is skip-heavy so a working
+  engine never looks idle. Click any ticket to open its trace.
+- **Feed + the seal** — a whisper feed (latest completion per stream,
+  expandable) and the serenity seal: **“0 unrecovered · nothing needs you”**.
+  The alarm ladder is strict: red appears only in the beacon, the banner and
+  the Ledger badge, and it never animates. Gold means *parked*, amber means
+  *stale* — they are different tokens and can never be confused.
 
-1. **Connect** — HubSpot private-app token + relay secret. Stored only in a
-   local `.env` (0600), never echoed back; the button live-tests the token.
-2. **Salla relay** — paste the Make webhook URL; the test pulls your store's
-   order-status list through it, proving the entire relay path.
-3. **Google Sheets & Drive** *(optional)* — live audit sheet + JSON archive,
-   or skip and rely on the always-on local CSV mirrors.
-4. **Pipeline mapping** — pulls your portal's stages and your store's
-   statuses; click the status→stage map together.
-5. **Window, pacing & save** — date range, worker lanes, adaptive-pacing
-   limits (safe defaults match the documented quotas), validated through
-   the engine's own loader.
+### Trace — any order, from anywhere, without logs
 
-The Run panel: **Dry run** is the default and writes nothing; **LIVE** only
-arms after you type `RUN`; max-orders gives cheap test gates; stop is always
-graceful (in-flight orders finish, the cursor stays safe, resume is free).
+![Order trace — a parked order, diagnosed in three clicks](docs/img/trace-held.png)
 
-### Dashboard — both engines, every lane and limit, live (v1.9 consolidated)
+Click any order anywhere (lane ticket, feed row, event, Ledger entry) — or
+press **⌘K and paste an order ID** — and its trace drawer slides over the
+current surface. The ~13 pipeline checks group into four stages (Identity /
+Catalog / Write / Record); all-green stages fold to one line so the drawer
+opens focused on the step that matters. A held order leads with a gold
+**Parked** seal, the plain-language reason, and what releases it — parked
+reads as paused-mid-journey, never as failure. The footer greps both engine
+logs for just this order, and `#/trace/<id>` deep-links are shareable.
 
-![Consolidated dashboard](docs/img/dashboard-consolidated.png)
+### Streams, Ledger, Audit, Setup
 
-- **Both engines at once** — the dashboard streams `backfill.log` **and**
-  `live.log` together (no toggle). Each engine has its own live status pill:
-  *backfill* creating/scanning, *live sync* working/watching.
-- **All-time strip** — lifetime metrics across *every* backfill run ever:
-  orders created, held, run count and engine hours, best rate.
-- **Current period** — how much of the configured window is swept, cursor
-  position, session counts, live rate.
-- **Current slot** — the exact time-slot and page being processed right now.
-  A skip-heavy slot reads as **"scanning"**, not idle — a working engine never
-  looks dead.
-- **Color-coded activity** — one card per unit of work: **backfill** worker
-  lanes in light green, **live-order** cards in deep blue-green (sorted first),
-  each showing the order it carries, its live phase, and its age:
+![Lanes and feed — color-coded by stream](docs/img/lanes.png)
 
-  ![Color-coded worker lanes and live orders](docs/img/activity-lanes.png)
-- **Adaptive pacing** — request rate vs the 90–95% ceiling per provider.
-  The bars deepen toward sage green as utilization rises: **a full bar is
-  the goal** (full utility), not a warning. Throttle events appear in the
-  ticker below.
-- **Throughput** — a continuous line chart of orders/minute, live-updating;
-  hover anywhere for the exact minute and count.
+- **Orders · Live / Orders · Backfill** — each stream's page carries its own
+  run controls (dry/LIVE with the type-`RUN` arm, max-orders test gate,
+  window, worker lanes, pause; live-sync start/stop), its queue or cursor
+  progress, its lanes and its completions.
+- **Ledger** — distinct *failing orders* from `mirror/errors.csv`, alarm
+  keyed to the last 24 h (a stuck order re-flags every retry — the ledger
+  counts things needing a human, not log rows), with full history behind a
+  disclosure. Empty state is celebrated, not blank.
+- **Audit** — every run ever (sortable), every event as a plain sentence
+  (filter by kind and source, search, newest/oldest, per-event raw line),
+  and the raw tail of **both** `backfill.log` and `live.log`.
+- **Setup** — the same 5-step wizard (token+relay test, Salla relay probe,
+  Google, pipeline mapping incl. bundles, window & pacing) plus the
+  **first-flight ladder**: ① dry run · 2 → ② LIVE · 2 → ③ open the throttle,
+  each stage physically locked until the previous one completes cleanly.
 
-### Activity — the human-readable history of everything
+Dark and light are both first-class (auto-detects, manual toggle):
 
-![Activity page](docs/screenshots/activity.png)
-
-- **Unrecovered failures** — the ledger that must stay empty, front and
-  center. Log "errors" can be recovered incidents; this cannot.
-- **Run history** — every backfill ever, parsed from the log: window, mode,
-  duration, created/held/skipped/errors, rate. Click any column to sort.
-- **Events** — the log translated into plain sentences ("Order X created in
-  HubSpot (new contact) — lane 2"), with filter chips (created / held /
-  skipped / errors / pacing / system), free-text search, newest/oldest
-  toggle, and click-to-expand raw log lines for any event.
-- **Raw log tail** — still there for debugging, one click away.
+![Fleet in dark](docs/img/fleet-dark.png)
 
 ## The Make relay (one-time, ~5 minutes)
 
