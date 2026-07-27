@@ -123,6 +123,33 @@ screenshots use synthetic demo data.
   The alarm ladder is strict: red appears only in the beacon, the banner and
   the Ledger badge, and it never animates. Gold means *parked*, amber means
   *stale* — they are different tokens and can never be confused.
+- **View switch** — one segmented control filters the whole Fleet to
+  **Both / Live / Backfill**; clicking a stream tile does the same, and a
+  second click opens that stream's page.
+
+### Right now — the running operation, in plain sight
+
+![Right now — the terminal operation with graceful stop](docs/img/now-strip.png)
+
+A terminal-style ticker of exactly what each engine process is doing this
+second — the slot and page for the backfill, the queue for live, and every
+worker lane's current phase and order id, with a blinking cursor while it
+moves. Each engine has a two-step **graceful stop**: click once to arm
+("Sure? lanes finish first"), again to confirm. Graceful means graceful —
+in-flight orders finish, the cursor and queue stay safe, and starting again
+later is free.
+
+### Trends — hover any minute, pin any moment, click any run
+
+![Trends — orders/min chart and the run-history bar list](docs/img/trends.png)
+
+- **Orders/min chart** — both streams overlaid; hover for a tooltip on any
+  minute, **click to pin** that moment (live, backfill and combined rate).
+- **Run history** — every run's speed as a bar. Hover for the summary; click
+  a row to pin its full story: window swept, rate, duration, created / held /
+  skipped / errors, live or dry.
+- The whole card follows the **view switch**, so "Backfill" hides live's line
+  and vice-versa.
 
 ### Trace — any order, from anywhere, without logs
 
@@ -142,9 +169,14 @@ logs for just this order, and `#/trace/<id>` deep-links are shareable.
 ![Lanes and feed — color-coded by stream](docs/img/lanes.png)
 
 - **Orders · Live / Orders · Backfill** — each stream's page carries its own
-  run controls (dry/LIVE with the type-`RUN` arm, max-orders test gate,
-  window, worker lanes, pause; live-sync start/stop), its queue or cursor
-  progress, its lanes and its completions.
+  run controls, its queue or cursor progress, its lanes and its completions.
+  The backfill page asks the question in plain English — *"Which period should
+  the backfill sweep?"* — and answers it with **one-click month presets**
+  (plus Custom), the dry/LIVE mode switch with its type-`RUN` arm, a
+  max-orders test gate, and a standing reassurance that changing the window is
+  always safe:
+
+  ![Backfill run controls with month presets](docs/img/backfill-controls.png)
 - **Ledger** — distinct *failing orders* from `mirror/errors.csv`, alarm
   keyed to the last 24 h (a stuck order re-flags every retry — the ledger
   counts things needing a human, not log rows), with full history behind a
@@ -160,6 +192,11 @@ logs for just this order, and `#/trace/<id>` deep-links are shareable.
 Dark and light are both first-class (auto-detects, manual toggle):
 
 ![Fleet in dark](docs/img/fleet-dark.png)
+
+**White-labeling:** drop a `webui/static/brand/` folder (a `brand.json` naming
+a CSS file, a logo, a page title, and footer lines) and the UI skins itself —
+logo in the top strip, your palette, your footer attribution. No folder, no
+change; the folder is gitignored so client branding never enters the repo.
 
 ## The Make relay (one-time, ~5 minutes)
 
