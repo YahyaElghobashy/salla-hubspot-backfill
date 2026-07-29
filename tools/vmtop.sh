@@ -13,15 +13,28 @@ cd "$(dirname "$0")/.."
 B=$'\033[1m'; DIM=$'\033[2m'; R=$'\033[0m'
 GRN=$'\033[32m'; YEL=$'\033[33m'; RED=$'\033[31m'; CYN=$'\033[36m'
 
-svc() {  # svc <unit> -> colored state word
-  local s
-  s=$(systemctl is-active "$1" 2>/dev/null || true)
-  case "$s" in
-    active)   printf '%s' "${GRN}● running${R}";;
-    inactive) printf '%s' "${DIM}○ stopped${R}";;
-    failed)   printf '%s' "${RED}✗ FAILED${R}";;
-    *)        printf '%s' "${DIM}○ ${s:-not installed}${R}";;
+svc() {  # svc <unit> -> "state|uptime|restarts|enabled"
+  local props state up rst en t0 mins
+  props=$(systemctl show "$1" --property ActiveState,ActiveEnterTimestamp,NRestarts,UnitFileState 2>/dev/null || true)
+  state=$(sed -n "s/^ActiveState=//p" <<<"$props")
+  rst=$(sed -n "s/^NRestarts=//p" <<<"$props")
+  en=$(sed -n "s/^UnitFileState=//p" <<<"$props")
+  t0=$(sed -n "s/^ActiveEnterTimestamp=//p" <<<"$props" | awk "{print \$2\" \"\$3}")
+  up=""
+  if [ -n "$t0" ] && [ "$state" = active ]; then
+    mins=$(( ($(date +%s) - $(date -d "$t0" +%s 2>/dev/null || echo $(date +%s))) / 60 ))
+    if   [ "$mins" -ge 1440 ]; then up="$((mins/1440))d $((mins%1440/60))h"
+    elif [ "$mins" -ge 60 ];   then up="$((mins/60))h $((mins%60))m"
+    else up="${mins}m"; fi
+  fi
+  case "$state" in
+    active)   printf '%b  up %-9s' "${GRN}● running${R}" "${up:-…}";;
+    failed)   printf '%b            ' "${RED}✗ FAILED ${R}";;
+    *)        printf '%b            ' "${DIM}○ ${state:-absent}${R}";;
   esac
+  if [ "${rst:-0}" -gt 0 ]; then printf ' %b' "${YEL}↻ ${rst} restart(s)${R}"
+  else printf ' %b' "${GRN}↻ never restarted${R}"; fi
+  [ "$en" = enabled ] && printf ' %b' "${DIM}· survives reboot${R}"
 }
 
 last_match() { grep -E "$2" "$1" 2>/dev/null | tail -1 || true; }
@@ -92,4 +105,21 @@ ecol=$GRN; [ "${err:-0}" -gt 0 ] && ecol=$YEL
 printf '  error ledger  %b%s rows%b\n' "$ecol" "${err:-0}" "$R"
 df -h / | awk 'NR==2 {printf "  disk          %s used of %s (%s)\n", $3, $2, $5}'
 echo
-echo "${DIM}dashboard.py = full TUI · serve.py via SSH tunnel = web UI · journalctl -u salla-live-sync -f = raw${R}"
+echo "${B}RECENT ACTIVITY${R}  ${DIM}(newest last)${R}"
+{ grep -hE "CREATED order|HELD order|live loop error|LIVE SYNC start|RESOLVED|ALERT" live.log 2>/dev/null | tail -5 | while IFS= read -r l; do
+    ts=${l:11:8}
+    case "$l" in
+      *"CREATED order"*)   o=$(sed -E "s/.*CREATED order ([0-9]+).*/\1/" <<<"$l"); printf '  %s%s%s  %b✓%b order %s → HubSpot\n' "$DIM" "$ts" "$R" "$GRN" "$R" "$o";;
+      *"HELD order"*)      o=$(sed -E "s/.*HELD order ([0-9]+).*/\1/" <<<"$l");    printf '  %s%s%s  %b◼%b order %s held (catalog)\n' "$DIM" "$ts" "$R" "$YEL" "$R" "$o";;
+      *"LIVE SYNC start"*) printf '  %s%s%s  %b▶%b engine started\n' "$DIM" "$ts" "$R" "$CYN" "$R";;
+      *"loop error"*)      printf '  %s%s%s  %b✗%b cycle error (auto-retried)\n' "$DIM" "$ts" "$R" "$RED" "$R";;
+      *ALERT*)             printf '  %s%s%s  %b⚠%b %s\n' "$DIM" "$ts" "$R" "$RED" "$R" "$(sed -E "s/.*ALERT: //" <<<"$l" | cut -c1-60)";;
+    esac
+  done; } || true
+echo
+echo "${B}LOG FILES${R}"
+for lf in live.log credit_watch.log slack_reporter.log backfill.log drain.log; do
+  [ -f "$lf" ] && printf '  %-22s %8s   %slast: %s%s\n' "$lf" "$(du -h "$lf" | cut -f1)" "$DIM" "$(tail -c 4096 "$lf" | grep -E "^20" | tail -1 | cut -c1-19)" "$R"
+done
+echo
+echo "${DIM}watch -c -n 5 ./tools/vmtop.sh = live · dashboard.py = full TUI · journalctl -u salla-live-sync -f = raw stream${R}"

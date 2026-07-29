@@ -449,6 +449,8 @@ class Config:
     make_backfill_scenario_id: str = ""
     make_intake_scenario_id: str = ""
     credit_alert_thresholds: tuple = (50000, 10000, 1000)
+    # ---- v2.4 slack reporter --------------------------------------------
+    report_interval_minutes: float = 30.0
 
     @staticmethod
     def load(path):
