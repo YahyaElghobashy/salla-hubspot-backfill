@@ -102,3 +102,31 @@ See `docs/QUEUE_DRAIN_RUNBOOK.md` for the drain's scan → verify → pilot cycl
 - Watch for: `SWEEP enqueued` (webhook losses), `UNRECOVERED FAILURES`
   banners, `FOREIGN LIVE INSTANCE` (two consumers), queue depth growth in
   the `QUEUE` lines.
+
+## Security posture (applied 2026-07-29)
+
+Principle: the VM does exactly its job — outbound HTTPS to five providers —
+and nothing else. Every control below is free and adds zero operational
+turbulence.
+
+| Layer | Rule | Why |
+|---|---|---|
+| Ingress | `deny-all` (prio 1000, tag-scoped) | the engine accepts no inbound traffic, ever |
+| Ingress | `allow tcp:22` **only from 35.235.240.0/20** (Google IAP) | SSH exists solely through IAP tunnels; the public IP answers nothing |
+| Egress | `allow tcp:443` + `deny all` | HubSpot, Make, Google APIs, Slack, GitHub, apt — all HTTPS; anything else (exfil channels, port-80, SMTP relays) is dead. DNS/NTP use the link-local metadata server, unaffected |
+| Legacy holes | `default-allow-ssh/rdp/icmp` **deleted** | network-wide 0.0.0.0/0 allows removed; future VMs don't inherit them |
+| Identity | **no service account** on the VM | a compromised box holds zero GCP permissions |
+| SSH auth | **OS Login enforced project-wide** | access granted/revoked via IAM roles, every login audited; metadata SSH keys disabled |
+| Boot | Shielded VM (secure boot, vTPM, integrity monitoring) | detects boot-level tampering |
+| Patching | `unattended-upgrades` + apt over HTTPS | always-on box patches itself |
+| Secrets | `.env`/tokens `0600`, never in git | |
+| Dashboard | loopback only, via SSH tunnel | it has run controls and no auth — never expose it |
+
+Deliberately **not** done (cost/benefit):
+- FQDN egress filtering — needs Cloud NGFW or a proxy; provider IPs rotate, so
+  it breaks things for near-zero gain once egress is 443-only on a box with no
+  service account
+- Dropping the external IP — requires Cloud NAT (~$32/mo, ≈2× the VM) for no
+  additional exposure given deny-all ingress; revisit if policy demands it
+
+Owner-side (billing perms required): a **budget alert** on the billing account.
