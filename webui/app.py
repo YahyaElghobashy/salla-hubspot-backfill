@@ -18,6 +18,7 @@ import sys
 import threading
 import time
 import urllib.request
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from flask import Flask, Response, jsonify, request, send_from_directory
@@ -713,5 +714,88 @@ def create_app():
             return jsonify({"rows": []})
         rows = p.read_text(encoding="utf-8", errors="replace").splitlines()
         return jsonify({"rows": rows[1:][-100:]})
+
+    @app.get("/api/health")
+    def health():
+        """v2.0 relay-outage state written by relay_health.py.
+
+        `state` is one of ok|local|scenario|platform|unknown. `stale` marks a
+        signal older than 5 min -- if both engines are stopped nobody is
+        refreshing it, so a stale 'ok' must not be read as 'healthy now'.
+        """
+        p = ROOT / "mirror" / "relay_health.json"
+        if not p.exists():
+            return jsonify({"state": "ok", "detail": "", "stale": False,
+                            "never_written": True})
+        try:
+            d = json.loads(p.read_text())
+        except Exception as e:
+            return jsonify({"state": "unknown", "detail": f"unreadable: {e}",
+                            "stale": True})
+        d["stale"] = (time.time() - float(d.get("ts", 0) or 0)) > 300
+        return jsonify(d)
+
+    @app.get("/api/credits")
+    def credits():
+        """v2.2 credit gauge, fed by credit_watch.py's state file.
+
+        Aggregates the watcher's per-day engine attribution into today / this
+        week / this calendar month, and derives the (deliberately understated)
+        savings figure: orders synced in the month x the per-order credit gap
+        between the old all-Make automation (~36 ops) and the relay pipeline
+        (~2.3 ops), at $1 per 1,000 credits.
+        """
+        p = ROOT / "mirror" / "credit_state.json"
+        if not p.exists():
+            return jsonify({"remaining": None, "note": "credit watcher not running"})
+        try:
+            st = json.loads(p.read_text())
+        except Exception:
+            return jsonify({"remaining": None})
+        org = st.get("org") or {}
+        daily = st.get("daily") or {}
+        now = datetime.now()
+        week_start = (now - timedelta(days=now.weekday())).strftime("%Y-%m-%d")
+        month_start = now.strftime("%Y-%m-01")
+        today_key = now.strftime("%Y-%m-%d")
+
+        def agg(since):
+            out = {"backfill": 0, "live": 0, "other": 0, "total": 0}
+            for day, d in daily.items():
+                if day >= since:
+                    for k in out:
+                        out[k] += int(d.get(k, 0))
+            return out
+
+        month = agg(month_start)
+        # savings: orders actually synced this month, from the created-ledger
+        orders_month = 0
+        led = ROOT / "mirror" / "created.csv"
+        try:
+            with open(led) as f:
+                next(f, None)
+                for line in f:
+                    if line[:7] == month_start[:7]:
+                        orders_month += 1
+        except Exception:
+            pass
+        OLD_OPS, NEW_OPS = 36.0, 2.3   # measured: pre-engine scenario vs relay
+        naive = orders_month * OLD_OPS
+        actual = orders_month * NEW_OPS
+        return jsonify({
+            "remaining": org.get("remaining"),
+            "consumed_cycle": org.get("consumed"),
+            "extra_cycle": org.get("extra"),
+            "next_reset": org.get("next_reset"),
+            "out": bool(st.get("out")),
+            "ts": st.get("ts"),
+            "stale": (time.time() - float(st.get("ts", 0) or 0)) > 900,
+            "today": agg(today_key),
+            "week": agg(week_start),
+            "month": month,
+            "period_credits": actual,
+            "naive_credits": naive,
+            "saved_usd": max(0.0, (naive - actual) / 1000.0),
+        })
 
     return app

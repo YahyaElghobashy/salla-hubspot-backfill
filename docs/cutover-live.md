@@ -19,7 +19,7 @@ scenario to the local engine's live mode. Read fully before touching Make.
 1. `./venv/bin/python3 live.py --init-queue` → creates the "Salla Live
    Queue" spreadsheet; put its id into `config.live.json`
    (`queue_spreadsheet_id`).
-2. Make → Scenarios → Import Blueprint → `docs/Salla_Live_Order_Intake.blueprint.json`.
+2. Make → Scenarios → Import Blueprint → `relay/live_intake_blueprint.template.json`.
    On import: create a **new** webhook on the existing Salla connection,
    select the "Salla Live Queue" spreadsheet + "Live Queue" tab. In scenario
    settings enable **Allow storing of incomplete executions** (the retry
@@ -78,5 +78,5 @@ double-processing if you later switch forward again.
 
 the old scenario: ~25–40 ops per order. Intake: **2 ops** per order (trigger + append)
 + ~1–2 relay ops amortized per fetched batch + hourly sweep (~30–60
-ops/day). At ~600 orders/day: ≈ **1.3–1.5k ops/day vs ~15–20k** — the same
+ops/day). At a few hundred orders/day: ≈ **1.3–1.5k ops/day vs ~15–20k** — the same
 ~92–94% cut the backfill achieved.

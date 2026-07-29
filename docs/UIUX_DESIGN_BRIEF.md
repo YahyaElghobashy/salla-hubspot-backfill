@@ -126,6 +126,6 @@ I am **not** asking you to reskin the current UI or move boxes around. I'm askin
 
 - [`docs/ARCHITECTURE.md`](ARCHITECTURE.md) — full engineering deep-dive with diagrams, the relay architecture, both engines, pacing, idempotency, coordination, efficiency calculation, and GCP deployment
 - [`README.md`](../README.md) — user-facing documentation with current screenshots
-- [`docs/img/dashboard-consolidated.png`](img/dashboard-consolidated.png) — current consolidated dashboard screenshot
-- [`docs/img/activity-lanes.png`](img/activity-lanes.png) — current color-coded lane cards closeup
+- [`docs/img/fleet.png`](img/fleet.png) — current consolidated dashboard screenshot
+- [`docs/img/lanes.png`](img/lanes.png) — current color-coded lane cards closeup
 - The current UI source is a single `index.html` (933 lines) — functional, responsive, dark/light aware, but built by engineers for engineers. Your job is to make it built for operators.

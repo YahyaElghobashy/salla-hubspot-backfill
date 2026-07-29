@@ -429,6 +429,27 @@ class Config:
     hs_search_yield_per_s: float = 0.6
     hs_general_yield_per_10s: float = 20.0
 
+    # ---- v2.2 outage detection, alerting & credit watch -----------------
+    # Drives relay_health.py + credit_watch.py: consecutive/windowed failure
+    # thresholds, slow-poll backoff once an outage is confirmed, intake
+    # staleness cutoff for platform-vs-scenario triage, alert cooldown, and
+    # the Make ids the watchers read (all read-only). Secrets (SLACK_*,
+    # SMTP_*, MAKE_API_TOKEN) live in .env, never here. store_label appears
+    # in alert copy so no client name is baked into code.
+    relay_outage_threshold: int = 3
+    relay_outage_poll_s: float = 300.0
+    relay_failure_window_minutes: float = 15.0
+    intake_stale_minutes: int = 30
+    alert_cooldown_minutes: int = 30
+    alerts_enabled: bool = True
+    make_org_id: str = ""
+    make_hook_id: str = ""
+    store_label: str = "the store"
+    make_team_id: str = ""
+    make_backfill_scenario_id: str = ""
+    make_intake_scenario_id: str = ""
+    credit_alert_thresholds: tuple = (50000, 10000, 1000)
+
     @staticmethod
     def load(path):
         with open(path) as f:
@@ -1404,6 +1425,10 @@ class Engine:
         # to False so real-time orders are stamped "No". (self.live is the
         # dry-run flag -- true for both modes -- so it can't drive this.)
         self.is_live_sync = False
+        # v2.2 outage detection. Attached by main()/LiveEngine when the
+        # optional relay_health + notify modules import cleanly; None means
+        # the engine behaves exactly as before, just without alerting.
+        self.health = None
         self.stats = Stats()
         self.stop = False
         self._next_rate_report = 0.0  # v1.4
@@ -2031,7 +2056,21 @@ class Engine:
             log.info("PAGE slot %s -> %s page %s", start, end, page)
             self._yield_to_live()  # v1.7: give the live engine priority
             self._rates_report()  # v1.4
-            body = self.relay.get_path(path)                    # [M302]
+            try:
+                body = self.relay.get_path(path)                # [M302]
+            except RelayError as e:
+                # v2.2: previously this propagated and the run.py supervisor
+                # restarted the process silently, up to its max-restarts cap.
+                # Classify, alert out-of-band, stop cleanly: a credit-paused
+                # Make org won't recover because we retried harder, and every
+                # doomed call is queued by Make and replayed at full credit
+                # cost after the refill.
+                if self.health is not None:
+                    self.health.record_failure(str(e), gio=self.gio)
+                log.error("Relay unavailable, halting this run: %s", e)
+                break
+            if self.health is not None:
+                self.health.record_success()
             total_pages = int(dig(body, "pagination.totalPages", 0) or 0)
             ids = [str(o.get("id")) for o in body.get("data", []) or []]
             self._bump("pages")
@@ -2192,8 +2231,17 @@ def main():
     mirror = LocalMirror("mirror")
     relay = RelayClient(cfg, secret)
     hs = HubSpot(cfg, token, live=args.live)
+    # v2.2: optional outage detection + out-of-band alerting. Import failures
+    # must never stop a backfill, so this is best-effort.
     engine = Engine(cfg, cursor, relay, hs, gio, mirror, live=args.live,
                     workers=args.workers)
+    try:
+        import notify
+        from relay_health import RelayHealth
+        engine.health = RelayHealth(cfg, mirror_dir=mirror.dir, notifier=notify)
+        log.info("outage alerting: %s", notify.channels_summary())
+    except Exception as e:
+        log.warning("outage alerting disabled: %s", e)
     engine.run(max_pages=args.max_pages, max_orders=args.max_orders)
 
 

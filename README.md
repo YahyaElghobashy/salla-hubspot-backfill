@@ -15,7 +15,7 @@ reconciliation against Salla's own counts.
 and a **live sync** that mirrors new orders 24/7 (§ [Live sync](#live-sync-mode-v18--247-order-syncing-without-the-big-scenario)).
 They can run **together** and coordinate over the shared HubSpot rate budget.
 
-> **Current version: v1.9.** For the full engineering deep-dive — how the relay,
+> **Current version: v2.2.** For the full engineering deep-dive — how the relay,
 > both engines, idempotency, adaptive pacing, and live-priority coordination fit
 > together, plus a **real ~50× efficiency calculation with an interactive
 > calculator** and **GCP deployment** — see **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)**.
@@ -153,7 +153,6 @@ later is free.
 
 ### Trace — any order, from anywhere, without logs
 
-![Order trace — a parked order, diagnosed in three clicks](docs/img/trace-held.png)
 
 Click any order anywhere (lane ticket, feed row, event, Ledger entry) — or
 press **⌘K and paste an order ID** — and its trace drawer slides over the
@@ -191,7 +190,6 @@ logs for just this order, and `#/trace/<id>` deep-links are shareable.
 
 Dark and light are both first-class (auto-detects, manual toggle):
 
-![Fleet in dark](docs/img/fleet-dark.png)
 
 **White-labeling:** drop a `webui/static/brand/` folder (a `brand.json` naming
 a CSS file, a logo, a page title, and footer lines) and the UI skins itself —
@@ -234,7 +232,7 @@ python live.py --once            # dry run: one poll cycle, plan only
 python run.py --mode live --live # the 24/7 service (restarts forever)
 ```
 
-Poll (every **5 s** by default) → claim queued rows → fetch full orders through
+Poll (every few seconds — `live_poll_s`; the example config ships **5 s**) → claim queued rows → fetch full orders through
 the relay → the exact same worker-lane pipeline as the backfill (dedup, catalog
 gate, contact guardrails, bundles, audit trail, adaptive pacing) → write
 `done/held/error/gone` back to the row.
@@ -343,6 +341,41 @@ Sharing the portal with live automations? The 5/s search pool is
 account-wide — set `hs_search_limit_per_s` to your fair share of it (e.g.
 `3.0` if a live integration needs the rest). Set `adaptive_enabled: false`
 to pin every rate at its starting value (pre-v1.4 behavior).
+
+## Outage alerting & credit watch (v2.2)
+
+The engines can now tell you when something is wrong — out-of-band, so the
+alert path never depends on the platform being monitored.
+
+- **`relay_health.py`** — when relay calls fail, it triages before blaming
+  anyone: local config first (a wrong secret produces the same symptom as a
+  platform outage), then cross-checks whether the *intake* scenario is still
+  writing queue rows. Intake silent too → the whole Make org is down
+  (credits); intake alive → only the fetch scenario is broken. Alerts are
+  written for a non-technical reader: what happened, the checks that prove
+  it, what it means for orders, what to do. A sliding failure window (not a
+  consecutive counter) catches flapping outages, and confirmed platform
+  outages switch the engine to a slow poll so it stops feeding a dead
+  webhook queue.
+- **`credit_watch.py`** — a standalone daemon that polls the Make API
+  (read-only) for the exact credit balance. Escalating alerts as the balance
+  crosses configurable thresholds (default 50k / 10k / 1k), an out-of-credits
+  alert that keeps checking and posts an all-clear on recovery, exact refill
+  detection (+N credits, before/after), and a note at each billing-cycle
+  renewal. It also attributes daily burn to backfill vs live sync, which
+  feeds the dashboard's credits card.
+- **`notify.py`** — Slack (`chat.postMessage`, threaded details) + SMTP
+  email. Configure via `.env`: `SLACK_BOT_TOKEN`, `SLACK_CHANNEL_ID`,
+  `SMTP_HOST/PORT/USER/PASSWORD/FROM/TO`, `MAKE_API_TOKEN`. Any channel left
+  unconfigured is skipped gracefully.
+
+```bash
+python credit_watch.py --once --dry-run   # one check, alerts logged not sent
+python credit_watch.py                    # the 24/7 watcher (STOP.credits stops it)
+```
+
+The dashboard gains a **credits card** (balance, burn today/this week/this
+month split by engine) and `/api/health` + `/api/credits` endpoints.
 
 ## Verification tools
 

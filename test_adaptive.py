@@ -3,7 +3,10 @@ import json
 import os
 import tempfile
 import time
+import types
 import unittest
+from datetime import datetime, timedelta
+from pathlib import Path
 from unittest import mock
 
 import backfill
@@ -226,6 +229,17 @@ class TestConfigCompat(unittest.TestCase):
         cfg = self._load(dict(self.OLD, future_flag=True))  # must not raise
         self.assertEqual(cfg.per_page, 30)
 
+    def test_old_config_gets_v2_outage_defaults(self):
+        """A pre-v2.0 config must load and pick up the alerting defaults."""
+        cfg = self._load(self.OLD)
+        self.assertEqual(cfg.relay_outage_threshold, 3)
+        self.assertEqual(cfg.relay_outage_poll_s, 300.0)
+        self.assertEqual(cfg.intake_stale_minutes, 30)
+        self.assertEqual(cfg.alert_cooldown_minutes, 30)
+        self.assertTrue(cfg.alerts_enabled)
+        self.assertEqual(cfg.make_org_id, "")
+        self.assertEqual(cfg.make_hook_id, "")
+
 
 class TestConcurrency(unittest.TestCase):
     """v1.5: worker lanes share limiters; pacing must hold globally."""
@@ -415,6 +429,193 @@ class TestV16Live(unittest.TestCase):
                                "customer": {}, "status": {}},
                               "C1", "Asia/Riyadh")
         self.assertEqual(out, (None, False))
+
+
+class TestRelayHealth(unittest.TestCase):
+    """v2.0 outage triage.
+
+    The whole point is telling three look-alike failures apart: they all surface
+    as the relay returning HTTP 200 `Accepted`, so the classification has to come
+    from evidence outside the relay response itself.
+    """
+
+    GOOD_SECRET = "a" * 64
+
+    def setUp(self):
+        import tempfile as _tf
+        from relay_health import RelayHealth
+        self.tmp = _tf.mkdtemp()
+        self.sent = []
+
+        class _Notifier:
+            @staticmethod
+            def send_alert(subject, body, dry_run=False, thread_ts=None):
+                self_outer.sent.append((subject, thread_ts, body))
+                return "1700000000.0001"
+        self_outer = self
+        self.notifier = _Notifier
+
+        cfg = types.SimpleNamespace(
+            relay_url="https://hook.eu1.make.com/abc",
+            queue_spreadsheet_id="sheet1",
+            relay_outage_threshold=3, relay_outage_poll_s=300.0,
+            intake_stale_minutes=30, alert_cooldown_minutes=30,
+            alerts_enabled=True, make_org_id="", make_hook_id="")
+        self.cfg = cfg
+        self.h = RelayHealth(cfg, mirror_dir=self.tmp, notifier=self.notifier)
+        os.environ["RELAY_SECRET"] = self.GOOD_SECRET
+        os.environ.pop("MAKE_API_TOKEN", None)
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    class _Gio:
+        """Stub GoogleIO whose newest queue row is `age_min` minutes old."""
+        def __init__(self, age_min):
+            self.age_min = age_min
+
+        def queue_read(self, qsid, start_row=2):
+            if self.age_min is None:
+                raise RuntimeError("sheets unavailable")
+            ts = datetime.now() - timedelta(minutes=self.age_min)
+            return [{"received_at": ts.strftime("%Y-%m-%d %H:%M:%S")}]
+
+    def test_local_misconfig_wins_before_blaming_make(self):
+        """A short/empty secret must be caught first.
+
+        During the 2026-07-26 incident a mis-parsed secret produced a byte
+        identical `Accepted`, and ~1h was lost blaming Make. Local always first.
+        """
+        os.environ["RELAY_SECRET"] = "too-short"
+        state, detail = self.h.triage(gio=self._Gio(1))
+        self.assertEqual(state, "local")
+        self.assertIn("RELAY_SECRET", detail)
+
+    def test_platform_when_intake_also_silent(self):
+        """Relay down AND intake silent -> the whole Make org is down."""
+        state, detail = self.h.triage(gio=self._Gio(120))
+        self.assertEqual(state, "platform")
+        self.assertIn("intake silent", detail)
+
+    def test_scenario_when_intake_still_writing(self):
+        """Relay down BUT intake writing -> just this scenario is broken."""
+        state, detail = self.h.triage(gio=self._Gio(1))
+        self.assertEqual(state, "scenario")
+        self.assertIn("Make is up", detail)
+
+    def test_unknown_when_sheet_unreadable(self):
+        state, _ = self.h.triage(gio=self._Gio(None))
+        self.assertEqual(state, "unknown")
+
+    def test_threshold_suppresses_early_failures(self):
+        """No alert before relay_outage_threshold consecutive failures."""
+        gio = self._Gio(120)
+        self.h.record_failure("boom", gio=gio)
+        self.h.record_failure("boom", gio=gio)
+        self.assertEqual(self.sent, [])
+        self.h.record_failure("boom", gio=gio)
+        self.assertEqual(len(self.sent), 1)
+        # message is written for an on-call human, not an engineer
+        self.assertIn("ran out of credits", self.sent[0][0])
+
+    def test_flapping_outage_still_alerts(self):
+        """Regression for the 2026-07-29 miss.
+
+        Real log: relay failed at 08:12, 08:17, 08:22, 08:27 but an innocuous
+        queue-only poll succeeded between each one. A strictly-consecutive
+        counter reset to 0 every time and never reached the threshold, so a
+        genuine credits outage produced no alert for hours. Failures inside the
+        sliding window must trip it regardless of interleaved successes.
+        """
+        gio = self._Gio(120)
+        for _ in range(3):
+            self.h.record_failure("relay returned non JSON: Accepted", gio=gio)
+            self.h.record_success()          # harmless cycle resets `consecutive`
+        self.assertEqual(self.h.consecutive, 0)
+        self.assertEqual(len(self.sent), 1, "flapping outage must still alert")
+        self.assertIn("ran out of credits", self.sent[0][0])
+
+    def test_window_prunes_old_failures(self):
+        """Failures older than the window must not accumulate into a false alarm."""
+        gio = self._Gio(1)               # intake healthy -> would be 'scenario'
+        self.h.record_failure("boom", gio=gio)
+        self.h.record_failure("boom", gio=gio)
+        # age both failures out of the window
+        self.h._failure_times = [t - 3600 for t in self.h._failure_times]
+        self.h.consecutive = 0
+        self.h.record_failure("boom", gio=gio)
+        self.assertEqual(self.h._recent_failures(), 1)
+        self.assertEqual(self.sent, [], "stale failures must not trip the alert")
+
+    def test_cooldown_suppresses_duplicates(self):
+        """A multi-day outage must not send hundreds of mails.
+
+        Gmail/Workspace caps at 2k/day and blocks for 24h on breach -- i.e. the
+        alerting would die exactly when it is needed.
+        """
+        gio = self._Gio(120)
+        for _ in range(10):
+            self.h.record_failure("boom", gio=gio)
+        self.assertEqual(len(self.sent), 1)
+
+    def test_recovery_emits_one_threaded_resolved(self):
+        gio = self._Gio(120)
+        for _ in range(3):
+            self.h.record_failure("boom", gio=gio)
+        self.assertEqual(len(self.sent), 1)
+        # a quiet window is required before "resolved" -- otherwise a harmless
+        # queue-only poll would declare recovery while the relay is still down
+        self.h._failure_times = []
+        self.h.record_success()
+        self.assertEqual(len(self.sent), 2)
+        self.assertIn("syncing again", self.sent[1][0])
+        # recovery is top-level, not buried in a thread nobody opens
+        self.assertIsNone(self.sent[1][1])
+        self.h.record_success()  # already ok -> no repeat
+        self.assertEqual(len(self.sent), 2)
+
+    def test_state_published_atomically_and_readable(self):
+        gio = self._Gio(120)
+        for _ in range(3):
+            self.h.record_failure("boom", gio=gio)
+        d = json.loads((Path(self.tmp) / "relay_health.json").read_text())
+        self.assertEqual(d["state"], "platform")
+        self.assertIn("ts", d)
+
+    def test_alerts_disabled_sends_nothing(self):
+        self.cfg.alerts_enabled = False
+        gio = self._Gio(120)
+        for _ in range(3):
+            self.h.record_failure("boom", gio=gio)
+        self.assertEqual(self.sent, [])
+
+
+class TestNotifySafety(unittest.TestCase):
+    def test_channels_off_without_credentials(self):
+        import notify
+        for k in ("SLACK_BOT_TOKEN", "SLACK_CHANNEL_ID", "SMTP_HOST",
+                  "SMTP_FROM", "SMTP_TO"):
+            os.environ.pop(k, None)
+        self.assertFalse(notify.slack_enabled())
+        self.assertFalse(notify.email_enabled())
+        # must not raise, and must not attempt any network call
+        self.assertIsNone(notify.send_alert("subject", "body"))
+
+    def test_slack_non_ok_json_is_not_treated_as_success(self):
+        """Slack returns HTTP 200 even on failure -- same trap as Make's 200
+        `Accepted`. The JSON `ok` field is the real status."""
+        import notify
+        os.environ["SLACK_BOT_TOKEN"] = "xoxb-test"
+        os.environ["SLACK_CHANNEL_ID"] = "C123"
+        try:
+            with mock.patch.object(
+                    notify, "http_request",
+                    return_value=(200, {}, '{"ok":false,"error":"not_in_channel"}')):
+                self.assertIsNone(notify.post_slack("hi"))
+        finally:
+            os.environ.pop("SLACK_BOT_TOKEN", None)
+            os.environ.pop("SLACK_CHANNEL_ID", None)
 
 
 if __name__ == "__main__":

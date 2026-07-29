@@ -44,7 +44,7 @@ from pathlib import Path
 
 import backfill
 from backfill import (Config, Cursor, Engine, GoogleIO, HubSpot, LocalMirror,
-                      RelayClient, dig, now_str, install_dns_cache)
+                      RelayClient, RelayError, dig, now_str, install_dns_cache)
 
 log = logging.getLogger("backfill")  # share the engine's logger/format
 
@@ -106,6 +106,29 @@ class LiveEngine(Engine):
         self._last_trim_day = None
         self._start_row = 2
         self._load_state()
+        # v2.2: outage detection. Optional -- if the modules or credentials are
+        # absent the engine runs exactly as before, just without alerting.
+        self.health = None
+        try:
+            import notify
+            from relay_health import RelayHealth
+            self.health = RelayHealth(cfg, mirror_dir=mirror.dir, notifier=notify)
+            log.info("outage alerting: %s", notify.channels_summary())
+        except Exception as e:
+            log.warning("outage alerting disabled: %s", e)
+
+    def _outage_backoff(self):
+        """Seconds to sleep after a failed cycle.
+
+        Normal errors keep the historical 60s. Once triage has confirmed the
+        Make platform itself is down there is nothing to poll for, so widen to
+        relay_outage_poll_s -- this is what stops the engine generating
+        thousands of doomed relay calls that Make queues and later replays at
+        full credit cost.
+        """
+        if self.health is not None and getattr(self.health, "state", "ok") == "platform":
+            return float(getattr(self.cfg, "relay_outage_poll_s", 300.0) or 300.0)
+        return 60.0
 
     # -- state pointer (optimization only; restart rescans) -------------------
 
@@ -496,9 +519,24 @@ class LiveEngine(Engine):
                     except Exception as e:
                         log.error("SWEEP failed (will retry next cycle): %s", e)
                 self._maybe_trim(rows)
+                # v2.2: a clean cycle clears the outage state (and emits a
+                # "resolved" notice if we had been alerting) -- but only once
+                # the failure window is genuinely quiet; see relay_health.
+                if self.health is not None:
+                    self.health.record_success()
             except Exception as e:
-                log.exception("live loop error (backing off 60s): %s", e)
-                time.sleep(60)
+                log.exception("live loop error (backing off %ss): %s",
+                              int(self._outage_backoff()), e)
+                # v2.2: this handler used to swallow RelayError silently and
+                # retry forever -- that is how a 68.9h platform outage produced
+                # no alarm. Classify it, alert out-of-band, and slow down so we
+                # stop hammering a dead platform.
+                if self.health is not None and isinstance(e, RelayError):
+                    try:
+                        self.health.record_failure(str(e), gio=self.gio)
+                    except Exception as he:
+                        log.warning("relay health triage failed: %s", he)
+                time.sleep(self._outage_backoff())
                 continue
             if once:
                 log.info("--once: single poll cycle complete")

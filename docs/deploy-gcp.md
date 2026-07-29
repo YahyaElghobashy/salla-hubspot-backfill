@@ -1,7 +1,7 @@
 # Running the live sync 24/7 on GCP
 
 The engine is plain Python + outbound HTTPS — a e2-micro (free tier) is
-plenty (~25 orders/hour average, bursts of a few hundred after downtime).
+plenty (a modest hourly order rate, bursts of a few hundred after downtime).
 
 ## Setup (Debian/Ubuntu VM)
 

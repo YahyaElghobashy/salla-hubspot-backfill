@@ -342,10 +342,42 @@ li.open .raw{display:block}
   animation:blink 1.1s steps(1) infinite;margin-left:2px}
 .nowline.live .cursorblk{background:var(--ocean)}
 @keyframes blink{50%{opacity:0}}
-.stopbtn{border:1px solid var(--line);background:var(--panel);color:var(--muted);border-radius:99px;
-  padding:4px 12px;font-size:11.5px;font-weight:650;cursor:pointer;font-family:-apple-system,sans-serif;flex-shrink:0}
-.stopbtn:hover{background:var(--chip)}
-.stopbtn.arm{background:var(--gold-tint);color:var(--gold);border-color:var(--gold)}
+/* engine control buttons: the STATE lives in the chip next to the button, the
+   button itself is only ever the ACTION you can take right now. Filled = go,
+   outlined = stop, amber pulse = armed and waiting for the confirm click. */
+.stopbtn{border:1px solid var(--line);background:var(--panel);color:var(--ink);border-radius:9px;
+  padding:5px 13px;font-size:11.5px;font-weight:700;cursor:pointer;font-family:-apple-system,sans-serif;
+  flex-shrink:0;transition:all .15s;line-height:1.4}
+.stopbtn:hover{border-color:var(--red);color:var(--red);background:var(--red-tint,rgba(245,81,87,.07))}
+.stopbtn.gobtn{background:var(--sage);border-color:var(--sage);color:#fff}
+.stopbtn.gobtn:hover{opacity:.85;color:#fff}
+.stopbtn.arm{background:var(--gold-tint);color:var(--gold);border-color:var(--gold);
+  animation:armpulse 1s ease-in-out infinite}
+@keyframes armpulse{0%,100%{box-shadow:0 0 0 0 rgba(226,177,60,.35)}50%{box-shadow:0 0 0 5px rgba(226,177,60,0)}}
+.statechip{border-radius:99px;padding:2px 10px;font-size:10.5px;font-weight:800;letter-spacing:.05em;
+  text-transform:uppercase;flex-shrink:0}
+.statechip.on{background:var(--sage-tint,rgba(132,189,155,.16));color:var(--sage)}
+.statechip.on.live{background:var(--ocean-tint,rgba(47,154,160,.14));color:var(--ocean)}
+.statechip.off{background:var(--chip);color:var(--muted)}
+.statechip.stopping{background:var(--gold-tint);color:var(--gold)}
+
+/* ---------- credits card ---------- */
+#creditsCard .c-hero{font-size:26px;font-weight:750;font-variant-numeric:tabular-nums;letter-spacing:-.01em}
+#creditsCard .c-hero small{font-size:13px;font-weight:600;color:var(--muted);margin-left:6px}
+.credbar{height:9px;border-radius:99px;background:var(--line-soft);overflow:hidden;display:flex;margin:6px 0 3px}
+.credbar>i{display:block;height:100%}
+.credbar .cb-back{background:var(--sage)}
+.credbar .cb-live{background:var(--ocean)}
+.credbar .cb-other{background:var(--line)}
+.credrow{display:flex;justify-content:space-between;align-items:baseline;font-size:12.5px;margin-top:9px}
+.credrow .cr-k{color:var(--muted);font-weight:650}
+.credrow .cr-v{font-variant-numeric:tabular-nums;font-weight:700}
+.credlegend{display:flex;gap:14px;font-size:11px;color:var(--muted);margin-top:8px}
+.credlegend i{display:inline-block;width:8px;height:8px;border-radius:2px;margin-right:5px;vertical-align:baseline}
+.credsave{margin-top:12px;padding-top:9px;border-top:1px dashed var(--line);font-size:11px;color:var(--muted);line-height:1.5}
+.credwarn{border-radius:10px;padding:7px 11px;font-size:12px;font-weight:650;margin-top:10px}
+.credwarn.w{background:var(--gold-tint);color:var(--gold)}
+.credwarn.c{background:var(--red-tint,rgba(245,81,87,.09));color:var(--red)}
 
 /* ---------- trends: interactive charts ---------- */
 .chartwrap2{position:relative;margin-top:6px}
@@ -467,19 +499,26 @@ li.open .raw{display:block}
     <div id="nowStrip">
       <div class="nowline back">
         <span class="ntag spill-backfill">backfill</span>
+        <span class="statechip off" id="stateBack">stopped</span>
         <span class="ntxt" id="nowBack">—</span>
-        <button class="stopbtn" id="goBack" onclick="go('stream-back')" style="display:none">▶ open controls</button>
-        <button class="stopbtn" id="stopBack" onclick="armStop('back')">⏸ Graceful stop</button>
+        <button class="stopbtn gobtn" id="goBack" onclick="go('stream-back')" style="display:none"
+          title="Backfill is stopped. Opens its controls page where you can start it.">▶ Start / controls</button>
+        <button class="stopbtn" id="stopBack" onclick="armStop('back')"
+          title="Two clicks needed: first arms, second confirms. In-flight orders always finish first.">⏸ Stop backfill</button>
       </div>
       <div class="nowline live">
         <span class="ntag spill-live">live</span>
+        <span class="statechip off live" id="stateLive">stopped</span>
         <span class="ntxt" id="nowLive">—</span>
-        <button class="stopbtn" id="goLive" onclick="go('stream-live')" style="display:none">▶ open controls</button>
-        <button class="stopbtn" id="stopLiveBtn" onclick="armStop('live')">■ Graceful stop</button>
+        <button class="stopbtn gobtn" id="goLive" onclick="go('stream-live')" style="display:none"
+          title="Live sync is stopped. Opens its controls page where you can start it.">▶ Start / controls</button>
+        <button class="stopbtn" id="stopLiveBtn" onclick="armStop('live')"
+          title="Two clicks needed: first arms, second confirms. The queue is never lost.">■ Stop live sync</button>
       </div>
     </div>
-    <p class="hint" style="margin:8px 0 0">Graceful means graceful: in-flight orders finish, the cursor
-      and queue stay safe, and starting again later is free (deduplication makes re-scans cost nothing).</p>
+    <p class="hint" style="margin:8px 0 0">Stopping is always graceful and always safe: in-flight orders
+      finish, the cursor and queue are untouched, and starting again later costs nothing — deduplication
+      makes re-scans free. Stop buttons ask twice so a stray click can't halt anything.</p>
   </div>
 
   <div class="card" id="commonsCard">
@@ -494,6 +533,25 @@ li.open .raw{display:block}
     <details><summary class="muted" style="cursor:pointer;font-size:12.5px">All limiters</summary>
       <div class="pace-grid"><div id="paceBack"></div><div id="paceLive"></div></div>
     </details>
+  </div>
+
+  <div class="card" id="creditsCard" style="display:none">
+    <p class="eyebrow">Make.com credits · the fuel gauge</p>
+    <div class="c-hero"><span id="credLeft">—</span><small>credits left</small>
+      <small id="credCycle" style="float:right;margin-top:8px"></small></div>
+    <div id="credWarnBox"></div>
+    <div class="credrow"><span class="cr-k">consumed today</span><span class="cr-v" id="credToday">—</span></div>
+    <div class="credbar" id="credBarToday"></div>
+    <div class="credrow"><span class="cr-k">this week</span><span class="cr-v" id="credWeek">—</span></div>
+    <div class="credbar" id="credBarWeek"></div>
+    <div class="credrow"><span class="cr-k">this calendar month</span><span class="cr-v" id="credMonth">—</span></div>
+    <div class="credbar" id="credBarMonth"></div>
+    <div class="credlegend">
+      <span><i style="background:var(--sage)"></i>backfill</span>
+      <span><i style="background:var(--ocean)"></i>live sync</span>
+      <span><i style="background:var(--line)"></i>everything else</span>
+    </div>
+    <div class="credsave" id="credSave"></div>
   </div>
 
   <div id="band">
@@ -1169,18 +1227,59 @@ function renderNow(){
   $("stopLiveBtn").style.display=dLive.engine_running?"":"none";
   $("goBack").style.display=dBack.engine_running?"none":"";
   $("goLive").style.display=dLive.engine_running?"none":"";
+  /* the chip states the fact; the button only ever offers the action */
+  const chip=(el,running,stopping,liveCls)=>{
+    el.className="statechip "+(stopping?"stopping":(running?("on"+(liveCls?" live":"")):"off"));
+    el.textContent=stopping?"stopping…":(running?"running":"stopped");};
+  chip($("stateBack"),dBack.engine_running,dBack.stop_file&&dBack.engine_running,false);
+  chip($("stateLive"),dLive.engine_running,dLive.stop_file&&dLive.engine_running,true);
 }
+const STOP_LABELS={back:"⏸ Stop backfill",live:"■ Stop live sync"};
 function armStop(which){
   const btn=which==="back"?$("stopBack"):$("stopLiveBtn");
   if(!stopArm[which]){
     stopArm[which]=setTimeout(()=>{stopArm[which]=0;btn.classList.remove("arm");
-      btn.textContent=which==="back"?"⏸ Graceful stop":"■ Graceful stop";},6000);
-    btn.classList.add("arm");btn.textContent="Sure? lanes finish first — click to confirm";
+      btn.textContent=STOP_LABELS[which];},6000);
+    btn.classList.add("arm");btn.textContent="Click again to confirm — lanes finish first";
     return;
   }
   clearTimeout(stopArm[which]);stopArm[which]=0;btn.classList.remove("arm");
-  btn.textContent="stopping gracefully…";
-  api("/api/stop",which==="live"?{scope:"live"}:{}).then(r=>{btn.textContent=which==="back"?"⏸ Graceful stop":"■ Graceful stop";});
+  btn.textContent="stopping gracefully…";btn.disabled=true;
+  api("/api/stop",which==="live"?{scope:"live"}:{}).then(r=>{
+    btn.textContent=STOP_LABELS[which];btn.disabled=false;});
+}
+
+/* ================= credits card ================= */
+function credBar(el,d){
+  const t=Math.max(1,(d.backfill||0)+(d.live||0)+(d.other||0));
+  el.innerHTML=`<i class="cb-back" style="width:${(d.backfill||0)/t*100}%"></i>`
+    +`<i class="cb-live" style="width:${(d.live||0)/t*100}%"></i>`
+    +`<i class="cb-other" style="width:${(d.other||0)/t*100}%"></i>`;
+}
+async function loadCredits(){
+  try{
+    const c=await api("/api/credits");
+    if(!c||c.remaining==null){$("creditsCard").style.display="none";return;}
+    $("creditsCard").style.display="";
+    $("credLeft").textContent=Math.round(c.remaining).toLocaleString();
+    $("credCycle").textContent=c.next_reset?("renews "+c.next_reset.slice(0,10)):"";
+    const fmt=d=>`${Math.round(d.total||0).toLocaleString()} — ${Math.round(d.backfill||0).toLocaleString()} backfill · ${Math.round(d.live||0).toLocaleString()} live`;
+    $("credToday").textContent=fmt(c.today||{});
+    $("credWeek").textContent=fmt(c.week||{});
+    $("credMonth").textContent=fmt(c.month||{});
+    credBar($("credBarToday"),c.today||{});
+    credBar($("credBarWeek"),c.week||{});
+    credBar($("credBarMonth"),c.month||{});
+    const w=$("credWarnBox");
+    if(c.out)w.innerHTML='<div class="credwarn c">⛔ Out of credits — syncing is paused. Orders queue safely meanwhile.</div>';
+    else if(c.remaining<10000)w.innerHTML='<div class="credwarn c">🔴 Critically low — top up now to avoid an interruption.</div>';
+    else if(c.remaining<50000)w.innerHTML='<div class="credwarn w">🟡 Running low — worth planning the next top-up.</div>';
+    else w.innerHTML="";
+    /* subtle by design: the savings line is a footnote, not a headline */
+    if(c.saved_usd!=null&&c.saved_usd>0)
+      $("credSave").textContent=`fwiw: the relay-optimized pipeline used ~${Math.round(c.period_credits).toLocaleString()} credits this month where the previous per-order automation would have needed ~${Math.round(c.naive_credits).toLocaleString()} — about $${c.saved_usd.toLocaleString(undefined,{maximumFractionDigits:0})} kept in pocket, at $1 per 1,000.`;
+    else $("credSave").textContent="";
+  }catch(e){/* keep the card hidden rather than show a broken one */}
 }
 
 /* ================= trends — hoverable, pinnable ================= */
@@ -1781,6 +1880,7 @@ setInterval(pollCursor,5000);
 setInterval(loadLedger,15000);
 setInterval(()=>{if(route==="audit")loadEvents();},7000);
 setInterval(loadRuns,30000);
+loadCredits();setInterval(loadCredits,60000);
 
 initStreams();refreshState();loadRuns();loadLedger();pollCursor();routeFromHash();buildPresets();
 </script>

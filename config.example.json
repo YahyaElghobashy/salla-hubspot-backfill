@@ -62,5 +62,22 @@
   "live_trim_hour": 4,
   "live_yield_enabled": true,
   "hs_search_yield_per_s": 0.6,
-  "hs_general_yield_per_10s": 20
+  "hs_general_yield_per_10s": 20,
+  "store_label": "My Store",
+  "alerts_enabled": true,
+  "relay_outage_threshold": 3,
+  "relay_failure_window_minutes": 15,
+  "relay_outage_poll_s": 300,
+  "intake_stale_minutes": 30,
+  "alert_cooldown_minutes": 30,
+  "make_org_id": "",
+  "make_team_id": "",
+  "make_hook_id": "",
+  "make_backfill_scenario_id": "",
+  "make_intake_scenario_id": "",
+  "credit_alert_thresholds": [
+    50000,
+    10000,
+    1000
+  ]
 }

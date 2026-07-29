@@ -7,7 +7,7 @@ live web dashboard. This document explains how every piece works, why it is buil
 the way it is, and includes a **real efficiency calculation** (~50× vs manual
 entry) with an interactive calculator.
 
-> **Version:** v1.9 · Python 3.11+ · stdlib HTTP + Google API client · Flask UI
+> **Version:** v2.2 · Python 3.11+ · stdlib HTTP + Google API client · Flask UI
 
 ---
 
@@ -265,7 +265,7 @@ order in HubSpot through the UI:
 | **Total** | **~180 s = 3 min/order → ~20 orders/h** |
 
 The engine's **measured** sustained throughput is **~1,000 orders/h** (all-time:
-42,802 orders created in ~42.5 h of engine time — this *includes* skips, held
+~43,000 orders created in ~42.5 h of engine time — this *includes* skips, held
 orders, dry runs, and resume re-scans; the documented pure-create ceiling is
 ~1,600–1,800 orders/h).
 
@@ -275,11 +275,11 @@ speedup = ───────────────────── ≈ 50
         manual 20 orders/h
 ```
 
-Cross-check on the real corpus of **42,802 orders**:
+Cross-check on a production corpus of **~43,000 orders**:
 
 | | Manual (@3 min) | Engine |
 |---|---|---|
-| Wall-clock | 42,802 × 3 min = **2,140 h** ≈ 267 work-days (8 h) | **~42.5 h** |
+| Wall-clock | ~43,000 × 3 min = **2,140 h** ≈ 267 work-days (8 h) | **~42.5 h** |
 | Ratio | | **≈ 50×** |
 
 ### 7.2 Why the engine reaches 1,000/h (the engineering layers)
@@ -306,7 +306,7 @@ live.
 ```html
 <div id="eff-calc" style="font:14px/1.5 system-ui,sans-serif;max-width:560px;border:1px solid #e5e5e5;border-radius:14px;padding:18px 20px">
   <h4 style="margin:0 0 12px">Efficiency calculator — Salla → HubSpot engine</h4>
-  <label>Orders to migrate <b id="oc-v">42,802</b><br>
+  <label>Orders to migrate <b id="oc-v">~43,000</b><br>
     <input id="oc" type="range" min="100" max="200000" step="100" value="42802" style="width:100%"></label>
   <label>Manual time per order (min) <b id="mm-v">3.0</b><br>
     <input id="mm" type="range" min="1" max="8" step="0.5" value="3" style="width:100%"></label>
@@ -341,7 +341,7 @@ live.
 </div>
 ```
 
-Defaults (42,802 orders · 3 min/order · 1,000 orders/h · $25/h) yield **≈ 50×**,
+Defaults (~43,000 orders · 3 min/order · 1,000 orders/h · $25/h) yield **≈ 50×**,
 **~2,097 hours saved**, **~$52,000 labor avoided**.
 
 ---
@@ -469,5 +469,5 @@ with `scp`.
 
 ---
 
-*Generated for the v1.9 release. Numbers in §6–§7 are from real runs; the
+*Generated for the v2.2 release. Numbers in §6–§7 are from real runs; the
 calculator lets you substitute your own store's figures.*
