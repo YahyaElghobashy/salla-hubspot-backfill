@@ -369,12 +369,24 @@ li.open .raw{display:block}
 .credbar .cb-back{background:var(--sage)}
 .credbar .cb-live{background:var(--ocean)}
 .credbar .cb-other{background:var(--line)}
-.credrow{display:flex;justify-content:space-between;align-items:baseline;font-size:12.5px;margin-top:9px}
+/* label left, figure right -- but on a narrow pane the figure drops to its own
+   line rather than shattering the label across two rows */
+.credrow{display:flex;justify-content:space-between;align-items:baseline;gap:10px;
+  flex-wrap:wrap;font-size:12.5px;margin-top:9px}
+.credrow .cr-k{white-space:nowrap}
+.credrow .cr-v{margin-left:auto}
 .credrow .cr-k{color:var(--muted);font-weight:650}
 .credrow .cr-v{font-variant-numeric:tabular-nums;font-weight:700}
 .credlegend{display:flex;gap:14px;font-size:11px;color:var(--muted);margin-top:8px}
 .credlegend i{display:inline-block;width:8px;height:8px;border-radius:2px;margin-right:5px;vertical-align:baseline}
 .credsave{margin-top:12px;padding-top:9px;border-top:1px dashed var(--line);font-size:11px;color:var(--muted);line-height:1.5}
+/* "other scenarios" drill-down: the biggest slice of the bill was a black box */
+.credother{width:100%;border-collapse:collapse;margin-top:7px;font-size:11.5px}
+.credother td{padding:3px 0;border:0;vertical-align:middle}
+.credother .co-name{color:var(--ink)}
+.credother .co-bar{width:34%;padding-left:10px}
+.credother .co-bar i{display:block;height:6px;border-radius:99px;background:var(--line);min-width:2px}
+.credother .co-val{text-align:right;font-variant-numeric:tabular-nums;color:var(--muted);white-space:nowrap;padding-left:10px}
 .credwarn{border-radius:10px;padding:7px 11px;font-size:12px;font-weight:650;margin-top:10px}
 .credwarn.w{background:var(--gold-tint);color:var(--gold)}
 .credwarn.c{background:var(--red-tint,rgba(245,81,87,.09));color:var(--red)}
@@ -546,11 +558,20 @@ li.open .raw{display:block}
     <div class="credbar" id="credBarWeek"></div>
     <div class="credrow"><span class="cr-k">this calendar month</span><span class="cr-v" id="credMonth">—</span></div>
     <div class="credbar" id="credBarMonth"></div>
+    <p class="hint" style="margin:8px 0 0;font-size:11px" id="credWindowNote"></p>
+    <div class="credrow" style="margin-top:12px"><span class="cr-k">this billing cycle, by role</span>
+      <span class="cr-v" id="credCycleTotal">—</span></div>
+    <div class="credbar" id="credBarRole"></div>
     <div class="credlegend">
-      <span><i style="background:var(--sage)"></i>backfill</span>
-      <span><i style="background:var(--ocean)"></i>live sync</span>
-      <span><i style="background:var(--line)"></i>everything else</span>
+      <span><i style="background:var(--sage)"></i>order fetch relay <span class="muted">(both engines)</span></span>
+      <span><i style="background:var(--ocean)"></i>live intake</span>
+      <span><i style="background:var(--line)"></i>other scenarios</span>
     </div>
+    <details id="credOtherWrap" style="margin-top:9px;display:none">
+      <summary class="muted" style="cursor:pointer;font-size:11.5px;font-weight:650">
+        what's in “other scenarios”? <span id="credOtherHint"></span></summary>
+      <table class="credother" id="credOtherList"></table>
+    </details>
     <div class="credsave" id="credSave"></div>
   </div>
 
@@ -1250,11 +1271,18 @@ function armStop(which){
 }
 
 /* ================= credits card ================= */
-function credBar(el,d){
-  const t=Math.max(1,(d.backfill||0)+(d.live||0)+(d.other||0));
-  el.innerHTML=`<i class="cb-back" style="width:${(d.backfill||0)/t*100}%"></i>`
-    +`<i class="cb-live" style="width:${(d.live||0)/t*100}%"></i>`
-    +`<i class="cb-other" style="width:${(d.other||0)/t*100}%"></i>`;
+/* one bar, scaled against the largest window so today/week/month are
+   visually comparable rather than each filling their own 100% */
+function credScale(el,val,max){
+  const pct=max>0?Math.min(100,val/max*100):0;
+  el.innerHTML=`<i class="cb-back" style="width:${pct}%"></i>`;
+}
+function credRoleBar(el,b){
+  const f=b.fetch_relay||0,l=b.live_intake||0,o=b.other||0;
+  const t=Math.max(1,f+l+o);
+  el.innerHTML=`<i class="cb-back" style="width:${f/t*100}%"></i>`
+    +`<i class="cb-live" style="width:${l/t*100}%"></i>`
+    +`<i class="cb-other" style="width:${o/t*100}%"></i>`;
 }
 async function loadCredits(){
   try{
@@ -1263,21 +1291,43 @@ async function loadCredits(){
     $("creditsCard").style.display="";
     $("credLeft").textContent=Math.round(c.remaining).toLocaleString();
     $("credCycle").textContent=c.next_reset?("renews "+c.next_reset.slice(0,10)):"";
-    const fmt=d=>`${Math.round(d.total||0).toLocaleString()} — ${Math.round(d.backfill||0).toLocaleString()} backfill · ${Math.round(d.live||0).toLocaleString()} live`;
-    $("credToday").textContent=fmt(c.today||{});
-    $("credWeek").textContent=fmt(c.week||{});
-    $("credMonth").textContent=fmt(c.month||{});
-    credBar($("credBarToday"),c.today||{});
-    credBar($("credBarWeek"),c.week||{});
-    credBar($("credBarMonth"),c.month||{});
+    const n=v=>Math.round(v||0).toLocaleString();
+    $("credToday").textContent=n(c.today);
+    $("credWeek").textContent=n(c.week);
+    $("credMonth").textContent=n(c.month);
+    const mx=Math.max(c.today||0,c.week||0,c.month||0,1);
+    credScale($("credBarToday"),c.today||0,mx);
+    credScale($("credBarWeek"),c.week||0,mx);
+    credScale($("credBarMonth"),c.month||0,mx);
+    $("credWindowNote").textContent=c.days_observed
+      ? `from Make's own daily ledger · ${c.days_observed} days of history available`:"";
+    const b=c.breakdown||{};
+    const bt=(b.fetch_relay||0)+(b.live_intake||0)+(b.other||0);
+    $("credCycleTotal").textContent=bt
+      ? `${n(bt)} — ${n(b.fetch_relay)} fetch · ${n(b.live_intake)} intake · ${n(b.other)} other`:"—";
+    credRoleBar($("credBarRole"),b);
+    /* drill into the "other" bucket: it is usually the largest slice, and an
+       unexplained largest slice is where overspend hides */
+    const top=b.other_top||[];
+    if(top.length){
+      $("credOtherWrap").style.display="";
+      $("credOtherHint").textContent=`${top.length} of ${b.other_count} scenarios = ${b.other_covered_pct}% of it`;
+      const mx=Math.max(...top.map(s=>s.credits),1);
+      $("credOtherList").innerHTML=top.map(s=>
+        `<tr><td class="co-name">${esc(s.name)}</td>`
+        +`<td class="co-bar"><i style="width:${Math.max(2,s.credits/mx*100)}%"></i></td>`
+        +`<td class="co-val">${n(s.credits)} · ${s.pct}%</td></tr>`).join("");
+    } else $("credOtherWrap").style.display="none";
     const w=$("credWarnBox");
     if(c.out)w.innerHTML='<div class="credwarn c">⛔ Out of credits — syncing is paused. Orders queue safely meanwhile.</div>';
     else if(c.remaining<10000)w.innerHTML='<div class="credwarn c">🔴 Critically low — top up now to avoid an interruption.</div>';
     else if(c.remaining<50000)w.innerHTML='<div class="credwarn w">🟡 Running low — worth planning the next top-up.</div>';
     else w.innerHTML="";
-    /* subtle by design: the savings line is a footnote, not a headline */
-    if(c.saved_usd!=null&&c.saved_usd>0)
-      $("credSave").textContent=`fwiw: the relay-optimized pipeline used ~${Math.round(c.period_credits).toLocaleString()} credits this month where the previous per-order automation would have needed ~${Math.round(c.naive_credits).toLocaleString()} — about $${c.saved_usd.toLocaleString(undefined,{maximumFractionDigits:0})} kept in pocket, at $1 per 1,000.`;
+    /* subtle by design: a footnote, not a headline. Compares MEASURED spend
+       against what the old per-order automation would have cost for the same
+       orders -- so the left-hand number is real, not modelled. */
+    if(c.saved_usd>0&&c.orders_cycle>0)
+      $("credSave").textContent=`fwiw: ${n(c.orders_cycle)} orders synced this billing cycle on ${n(c.engine_credits)} credits of relay traffic; the previous per-order automation would have needed ~${n(c.naive_credits)} — roughly $${Math.round(c.saved_usd).toLocaleString()} kept in pocket, at $1 per 1,000.`;
     else $("credSave").textContent="";
   }catch(e){/* keep the card hidden rather than show a broken one */}
 }

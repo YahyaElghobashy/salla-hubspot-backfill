@@ -215,8 +215,10 @@ change; the folder is gitignored so client branding never enters the repo.
 | Local `mirror/` | CSV mirror of every audit/queue row + `errors.csv`, the unrecovered-failure ledger |
 | Google Sheets / Drive (optional) | live audit rows and JSON archive uploads, if you enable them in the wizard |
 
-**Privacy note:** `archive/`, `mirror/`, and logs contain customer data. They
-are gitignored; keep them local.
+**Privacy note:** `archive/`, `mirror/`, `backfill.log`, `live.log` and the
+per-deployment configs (`config.json`, `config.live.json`) contain customer
+data and deployment identifiers. All are gitignored — keep them local, and
+copy them to a server with `scp`, never through the repo.
 
 ## Live sync mode (v1.8) — 24/7 order syncing without the big scenario
 
@@ -225,6 +227,14 @@ created" automation. Instead of a 25-40-op Make scenario per order, a
 **2-op intake scenario** (`relay/live_intake_blueprint.template.json`:
 Salla trigger → append one row) writes every new order's id to a dedicated
 **Live Queue spreadsheet**, and the engine's live mode consumes it:
+
+Live mode reads its own config file, `config.live.json`, so it can run
+alongside a backfill with different pacing. Create it once from the config the
+wizard produced:
+
+```bash
+cp config.json config.live.json   # then set queue_spreadsheet_id in it
+```
 
 ```bash
 python live.py --init-queue      # one-time: creates the queue spreadsheet
@@ -362,20 +372,27 @@ alert path never depends on the platform being monitored.
   crosses configurable thresholds (default 50k / 10k / 1k), an out-of-credits
   alert that keeps checking and posts an all-clear on recovery, exact refill
   detection (+N credits, before/after), and a note at each billing-cycle
-  renewal. It also attributes daily burn to backfill vs live sync, which
-  feeds the dashboard's credits card.
+  renewal. Daily spend comes from Make's own 30-day usage ledger, so
+  today / this week / this month are real figures rather than a total
+  accumulated since the watcher happened to start.
 - **`notify.py`** — Slack (`chat.postMessage`, threaded details) + SMTP
-  email. Configure via `.env`: `SLACK_BOT_TOKEN`, `SLACK_CHANNEL_ID`,
+  email. Configure via `.env`: `SLACK_BOT_TOKEN`, `SLACK_CHANNEL_IDS` (comma-separated),
   `SMTP_HOST/PORT/USER/PASSWORD/FROM/TO`, `MAKE_API_TOKEN`. Any channel left
   unconfigured is skipped gracefully.
 
 ```bash
+# both default to --config config.live.json (see the live-sync section above)
 python credit_watch.py --once --dry-run   # one check, alerts logged not sent
 python credit_watch.py                    # the 24/7 watcher (STOP.credits stops it)
 ```
 
-The dashboard gains a **credits card** (balance, burn today/this week/this
-month split by engine) and `/api/health` + `/api/credits` endpoints.
+The dashboard gains a **credits card** — balance, spend for today / this
+week / this calendar month, and a cycle-to-date split **by role**: the order
+fetch relay (called by *both* engines, so it is deliberately not attributed to
+either), live intake, and everything else. That last bucket is usually the
+largest share of the bill, so it expands to name the scenarios behind it —
+enough of them, largest first, to cover ~80% of that spend. New `/api/health`
+and `/api/credits` endpoints back it.
 
 ## Verification tools
 

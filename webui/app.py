@@ -63,6 +63,36 @@ def live_running():
     return _pid_alive(LIVEPID)
 
 
+def _tail_line(path, nbytes=4096):
+    """Last non-empty line of a logfile, cheaply."""
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, 2)
+            size = f.tell()
+            f.seek(max(0, size - nbytes))
+            lines = [l for l in f.read().decode("utf-8", "replace").splitlines()
+                     if l.strip()]
+            return lines[-1] if lines else ""
+    except OSError:
+        return ""
+
+
+def _proc_info(pidfile, logpath):
+    """v2.1: what the terminal-side engine process is doing right now."""
+    alive = _pid_alive(pidfile)
+    pid = None
+    since = None
+    if pidfile.exists():
+        try:
+            pid = int(pidfile.read_text().strip())
+            since = pidfile.stat().st_mtime
+        except (ValueError, OSError):
+            pass
+    return {"alive": alive, "pid": pid if alive else None,
+            "since": since if alive else None,
+            "last": _tail_line(logpath) if logpath.exists() else ""}
+
+
 def hs_get(path, token):
     req = urllib.request.Request("https://api.hubapi.com" + path,
                                  headers={"Authorization": f"Bearer {token}"})
@@ -391,6 +421,8 @@ def create_app():
             "live_running": live_running(),
             "stop_file": (ROOT / "STOP").exists(),
             "stop_live_file": (ROOT / "STOP.live").exists(),
+            "procs": {"backfill": _proc_info(PIDFILE, LOG),
+                      "live": _proc_info(LIVEPID, LIVELOG)},
             "log_present": LOG.exists(),
             "live_log_present": LIVELOG.exists(),
         })
@@ -739,11 +771,12 @@ def create_app():
     def credits():
         """v2.2 credit gauge, fed by credit_watch.py's state file.
 
-        Aggregates the watcher's per-day engine attribution into today / this
-        week / this calendar month, and derives the (deliberately understated)
-        savings figure: orders synced in the month x the per-order credit gap
-        between the old all-Make automation (~36 ops) and the relay pipeline
-        (~2.3 ops), at $1 per 1,000 credits.
+        Windows (today / this week / this calendar month) come from Make's own
+        30-day usage ledger, not from anything this app accumulates. The
+        cycle-to-date split is by ROLE, because the fetch relay is one scenario
+        both engines call. The savings figure compares MEASURED engine credits
+        against what the old per-order automation (~36 ops/order) would have
+        cost for the orders synced in the same billing cycle, at $1 per 1,000.
         """
         p = ROOT / "mirror" / "credit_state.json"
         if not p.exists():
@@ -753,35 +786,44 @@ def create_app():
         except Exception:
             return jsonify({"remaining": None})
         org = st.get("org") or {}
-        daily = st.get("daily") or {}
+        # Make's own 30-day daily ledger. Authoritative -- unlike deriving
+        # windows from our polling deltas, which only cover the period since
+        # the watcher started and made today/week/month identical on day one.
+        usage = st.get("usage_daily") or {}
         now = datetime.now()
         week_start = (now - timedelta(days=now.weekday())).strftime("%Y-%m-%d")
         month_start = now.strftime("%Y-%m-01")
         today_key = now.strftime("%Y-%m-%d")
 
-        def agg(since):
-            out = {"backfill": 0, "live": 0, "other": 0, "total": 0}
-            for day, d in daily.items():
-                if day >= since:
-                    for k in out:
-                        out[k] += int(d.get(k, 0))
-            return out
+        def total_since(since):
+            return sum(v for day, v in usage.items() if day >= since)
 
-        month = agg(month_start)
-        # savings: orders actually synced this month, from the created-ledger
-        orders_month = 0
-        led = ROOT / "mirror" / "created.csv"
+        today, week, month = (total_since(today_key), total_since(week_start),
+                              total_since(month_start))
+        # Cycle-to-date split by ROLE, straight from per-scenario consumption.
+        # NOT "backfill vs live": the fetch relay is one Make scenario that both
+        # engines call, so splitting it between them would be invented.
+        breakdown = st.get("breakdown") or {}
+
+        # Savings, apples to apples: OUR pipeline's own credits (the fetch relay
+        # + live intake scenarios) against what the old per-order automation
+        # would have cost for the orders WE synced, over the same window.
+        # Comparing the whole org's spend here would fold in unrelated
+        # scenarios and understate the difference.
+        cycle_start = str(org.get("last_reset") or "")[:10] or month_start
+        orders_cycle = 0
         try:
-            with open(led) as f:
+            with open(ROOT / "mirror" / "created.csv") as f:
                 next(f, None)
                 for line in f:
-                    if line[:7] == month_start[:7]:
-                        orders_month += 1
+                    if line[:10] >= cycle_start:
+                        orders_cycle += 1
         except Exception:
             pass
-        OLD_OPS, NEW_OPS = 36.0, 2.3   # measured: pre-engine scenario vs relay
-        naive = orders_month * OLD_OPS
-        actual = orders_month * NEW_OPS
+        OLD_OPS = 36.0   # measured cost/order of the old all-Make scenario
+        engine_credits = (breakdown.get("fetch_relay", 0)
+                          + breakdown.get("live_intake", 0))
+        naive = orders_cycle * OLD_OPS
         return jsonify({
             "remaining": org.get("remaining"),
             "consumed_cycle": org.get("consumed"),
@@ -790,12 +832,14 @@ def create_app():
             "out": bool(st.get("out")),
             "ts": st.get("ts"),
             "stale": (time.time() - float(st.get("ts", 0) or 0)) > 900,
-            "today": agg(today_key),
-            "week": agg(week_start),
-            "month": month,
-            "period_credits": actual,
+            "today": today, "week": week, "month": month,
+            "days_observed": len(usage),
+            "breakdown": breakdown,
+            "cycle_start": cycle_start,
+            "orders_cycle": orders_cycle,
+            "engine_credits": engine_credits,
             "naive_credits": naive,
-            "saved_usd": max(0.0, (naive - actual) / 1000.0),
+            "saved_usd": max(0.0, (naive - engine_credits) / 1000.0),
         })
 
     return app

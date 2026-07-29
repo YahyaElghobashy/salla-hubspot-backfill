@@ -94,8 +94,12 @@ class LiveEngine(Engine):
         self.is_live_sync = True  # stamp "Older Backfill? = No" on live orders
         self.qsid = cfg.queue_spreadsheet_id
         self.instance_id = f"{socket.gethostname()}-{os.getpid()}"
-        self.processed_today = 0
         self._today = datetime.now().date()
+        # v2.2: seed from the created-ledger rather than starting at zero.
+        # A mid-day restart used to reset this counter, so the dashboard showed
+        # "0 synced today" while hundreds of orders had already landed. The
+        # ledger is the authoritative record of what actually reached HubSpot.
+        self.processed_today = self._count_ledger_today()
         self._active_until = 0.0  # v1.7: live-priority signal cooldown
         self._last_hb_check = 0.0  # v1.8: full heartbeat cycle decoupled from poll
         # sweep: 0 or >=1440 minutes disables it; otherwise the first sweep
@@ -116,6 +120,24 @@ class LiveEngine(Engine):
             log.info("outage alerting: %s", notify.channels_summary())
         except Exception as e:
             log.warning("outage alerting disabled: %s", e)
+
+    def _count_ledger_today(self):
+        """Orders this engine put in HubSpot today, from mirror/created.csv.
+
+        Cheap (tail-scan) and safe: a missing or unreadable ledger just yields
+        0, which is the old behaviour.
+        """
+        try:
+            day = self._today.strftime("%Y-%m-%d")
+            n = 0
+            with open(Path(self.mirror.dir) / "created.csv") as f:
+                next(f, None)
+                for line in f:
+                    if line[:10] == day:
+                        n += 1
+            return n
+        except Exception:
+            return 0
 
     def _outage_backoff(self):
         """Seconds to sleep after a failed cycle.
@@ -285,6 +307,13 @@ class LiveEngine(Engine):
         # v1.8: stamp the whole in-flight batch 'processing' so the Live Queue
         # sheet shows exactly which orders are being worked on right now. Each
         # row flips to done/held/error/gone as its lane finishes.
+        # v2.2: baseline for the in-batch progress line below. done_counter is a
+        # RUN-lifetime accumulator (it enforces --max-orders across the whole
+        # process), so subtracting it raw understates the remaining depth and
+        # pins it to 0 on a long-lived engine -- which would make the dashboard
+        # read "idle" mid-drain, the exact failure the progress line exists to
+        # prevent.
+        base_done = done_counter[0]
         if claimed:
             ts = now_str()
             self.gio.queue_mark_batch(self.qsid, [
@@ -348,6 +377,20 @@ class LiveEngine(Engine):
                     done_counter[0] += 1
                 self._in_flight = len(pending)
                 self._rates_report()
+                # v2.2: emit the QUEUE status line DURING the batch, not only
+                # at the top of a poll cycle. A large reclaim (hundreds of rows)
+                # keeps one cycle alive for tens of minutes, and the dashboard
+                # parses this line for depth / processed_today -- without it the
+                # UI froze on the pre-batch snapshot (showing "0 synced today"
+                # while the engine was actively creating). Throttled to 30s so
+                # it costs nothing.
+                nowm = time.monotonic()
+                if nowm - getattr(self, "_last_progress", 0.0) >= 30.0:
+                    self._last_progress = nowm
+                    remaining = len(claimed) - (done_counter[0] - base_done)
+                    log.info("QUEUE depth=%d oldest_age=%ss processed_today=%d "
+                             "lanes=%d/%d", max(0, remaining), 0,
+                             self.processed_today, self._in_flight, self.workers)
         self._in_flight = 0
 
     # -- sweep (producer) -------------------------------------------------------

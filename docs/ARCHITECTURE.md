@@ -449,9 +449,11 @@ and reach it over an SSH tunnel or IAP — never expose it publicly (it has run
 controls).
 
 **Secrets & cost:** an `e2-small` is a few dollars a month; the API caps mean a
-bigger VM buys nothing. Keep `.env`, `credentials.json`, `token.json`, and
-`config.json` **out of git** (they already are, via `.gitignore`) and ship them
-with `scp`.
+bigger VM buys nothing. Keep `.env`, `credentials.json`, `token.json`,
+`config.json` and `config.live.json` **out of git** (all are covered by
+`.gitignore`) and ship them with `scp`. `config.live.json` matters most: it
+carries the relay webhook URL, the queue spreadsheet id and your Make
+org/team/scenario ids.
 
 ---
 

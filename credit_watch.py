@@ -12,7 +12,13 @@ What it watches (one read-only GET /organizations/{id} per tick):
   * centicreditsExtra   -> exact extra credits purchased this cycle, so a refill
                            is detected as a precise delta, not a guess
   * lastReset/nextReset -> billing-cycle boundaries -> renewal notice
-  * a second GET /scenarios/consumptions attributes burn to backfill vs live
+  * GET /organizations/{id}/usage -> Make's own 30-day daily ledger, so
+    today/this week/this month are real figures rather than a total
+    accumulated since this watcher happened to start
+  * GET /scenarios/consumptions -> cycle-to-date spend per scenario, grouped
+    by ROLE (fetch relay / live intake / other). Deliberately not "backfill vs
+    live": both engines call the same fetch-relay scenario, so splitting it
+    between them would be invented (see scenario_breakdown)
 
 What it says (via notify.py -- Slack + email, never through Make itself):
   * threshold alerts as the balance crosses 50k / 10k / 1k (configurable)
@@ -115,6 +121,91 @@ class CreditWatch:
         return {str(r.get("scenarioId")): int(r.get("operations") or 0)
                 for r in (d.get("scenarioConsumptions") or [])}
 
+    def read_usage(self):
+        """Make's own 30-day daily ledger -- the authoritative per-day spend.
+
+        This replaces deriving daily totals from our own polling deltas, which
+        could only ever cover the period since the watcher started (and so made
+        'today', 'this week' and 'this month' identical on day one).
+        """
+        org_id = str(getattr(self.cfg, "make_org_id", "") or "")
+        if not org_id:
+            return {}
+        d = _get(f"/organizations/{org_id}/usage?organizationTimezone=true")
+        rows = d.get("usage") or d.get("data") or []
+        out = {}
+        for r in rows:
+            day = str(r.get("date") or "")[:10]
+            if not day:
+                continue
+            cc = r.get("centicredits")
+            out[day] = (int(cc) / 100.0) if cc is not None else float(
+                r.get("operations") or 0)
+        return out
+
+    def read_scenario_names(self):
+        """{scenarioId: name} for the team. Cached ~1h -- names rarely change
+        and the Core plan's API budget is only 60 req/min."""
+        team_id = str(getattr(self.cfg, "make_team_id", "") or "")
+        if not team_id:
+            return {}
+        cached = self.state.get("names") or {}
+        if cached and (time.time() - float(self.state.get("names_ts", 0))) < 3600:
+            return cached
+        d = _get(f"/scenarios?teamId={team_id}")
+        names = {str(s.get("id")): str(s.get("name") or "")
+                 for s in (d.get("scenarios") or [])}
+        if names:
+            self.state["names"] = names
+            self.state["names_ts"] = time.time()
+        return names or cached
+
+    def scenario_breakdown(self, cons):
+        """Cycle-to-date credits per scenario, grouped by ROLE.
+
+        Deliberately not labelled "backfill vs live": the fetch relay is a
+        single Make scenario that BOTH engines call (identical relay_url), so
+        attributing it to either engine would be a fabrication. Roles are what
+        the API can actually prove.
+
+        The "other" bucket is the biggest share of the bill and used to be a
+        black box, so it also returns the named scenarios behind it -- enough
+        of them, largest first, to cover ~80% of that spend (Pareto).
+        """
+        fetch = str(getattr(self.cfg, "make_backfill_scenario_id", "") or "")
+        intake = str(getattr(self.cfg, "make_intake_scenario_id", "") or "")
+        out = {"fetch_relay": 0, "live_intake": 0, "other": 0}
+        others = []
+        try:
+            names = self.read_scenario_names()
+        except Exception as e:
+            log.debug("scenario names unavailable: %s", e)
+            names = {}
+        for sid, ops in cons.items():
+            ops = int(ops)
+            if sid == fetch:
+                out["fetch_relay"] += ops
+            elif sid == intake:
+                out["live_intake"] += ops
+            else:
+                out["other"] += ops
+                if ops > 0:
+                    others.append({"id": sid,
+                                   "name": names.get(sid) or f"scenario {sid}",
+                                   "credits": ops})
+        others.sort(key=lambda x: -x["credits"])
+        total = out["other"] or 1
+        top, run = [], 0
+        for s in others:
+            top.append(dict(s, pct=round(s["credits"] / total * 100, 1)))
+            run += s["credits"]
+            if run / total >= 0.80 or len(top) >= 8:
+                break
+        out["other_top"] = top
+        out["other_count"] = len(others)
+        out["other_covered_pct"] = round(run / total * 100, 1) if others else 0
+        return out
+
     def _attribute(self, cons):
         """Fold per-scenario consumption deltas into today's engine buckets."""
         bf = str(getattr(self.cfg, "make_backfill_scenario_id", "") or "")
@@ -183,9 +274,17 @@ class CreditWatch:
     def tick(self):
         org = self.read_org()
         try:
-            self._attribute(self.read_consumptions())
+            cons = self.read_consumptions()
+            self._attribute(cons)
+            self.state["breakdown"] = self.scenario_breakdown(cons)
         except Exception as e:
             log.debug("consumption attribution skipped: %s", e)
+        try:
+            usage = self.read_usage()
+            if usage:
+                self.state["usage_daily"] = usage
+        except Exception as e:
+            log.debug("usage history skipped: %s", e)
 
         prev = self.state.get("org") or {}
         remaining = org["remaining"]

@@ -1,6 +1,7 @@
 # Secrets and per-deployment config
 .env
 config.json
+config.live.json
 credentials.json
 token.json
 
@@ -8,9 +9,19 @@ token.json
 cursor.json
 cursor.tmp
 backfill.log
+live.log
+credit_watch.log
 supervisor.out
+supervisor.*.out
 engine.pid
+live.pid
+live.lock
+live_state.json
+credit_watch.lock
+relay_health.json
 STOP
+STOP.live
+STOP.credits
 STOP.retro
 mirror/
 archive/
