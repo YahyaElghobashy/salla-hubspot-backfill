@@ -22,7 +22,10 @@ relay_health.json
 STOP
 STOP.live
 STOP.credits
+STOP.drain
 STOP.retro
+drain.log
+drain.lock
 mirror/
 archive/
 

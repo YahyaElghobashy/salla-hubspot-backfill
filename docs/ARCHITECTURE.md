@@ -167,6 +167,51 @@ unapproved/inactive item is **held** (parked in a review queue, not dropped) so 
 human can approve the catalog entry; on the next pass the held order sails
 through. This is why "held" is a healthy state, not an error.
 
+### 4.4 The queue drain (v2.3) — the gate's release valve
+
+The gate parks held orders in the audit workbook's **Queue Log** tab, and they
+are **never created in HubSpot** until something drains them. Over a long
+backfill that tab accumulates the whole backlog of "the catalog wasn't ready
+yet". `queue_drain.py` is that something.
+
+It is a third engine in the same family, and it deliberately reuses rather than
+reimplements:
+
+| Component | Source | Role in the drain |
+|-----------|--------|-------------------|
+| `Engine` | `backfill.py` | Subclassed as `QueueDrainEngine`. The create pipeline, contact guardrails, bundle explosion, worker lanes and adaptive limiters are inherited unchanged, so a drained order is byte-for-byte the same as a backfilled one. |
+| `RelayClient` | `backfill.py` | Batched order fetch. The drain's intake is the Queue Log tab rather than a cursor or the Live Queue. |
+| `CreatedLedger` | `backfill.py` | Short-circuits before any fetch: a row whose order id is already in the ledger settles as `Processed` for free, locally. |
+| `GoogleIO` | `backfill.py` | Subclassed as `DrainGoogleIO` (below). |
+| live-active signal | `mirror/` | Same yield-to-live coordination as §6, so the drain never competes with the live engine for the HubSpot budget. |
+
+**`DrainGoogleIO` adds exactly two things** on top of `GoogleIO`:
+
+1. **Buffered audit updates.** A created order has to flip its *original* audit
+   row (not the queue row) to `Order Approved`. Those updates are accumulated
+   and flushed in batches rather than written per order, which keeps a drain of
+   thousands of orders inside the Sheets write quota.
+2. **Verify-then-write queue marking.** `qlog_mark_batch` re-reads the row's
+   order id before writing its terminal state, so a concurrent edit or a shifted
+   row can never cause the engine to stamp the wrong row.
+
+Three modes, escalating in cost and consequence: `--scan` (sheet only, zero API
+calls, name-level blocker matrix), `--verify` (fetch + real gate check,
+read-only, product-id-level matrix at `mirror/blocker_matrix.csv`), and
+`--live [--max-orders N]` (create, mark, flip).
+
+Gate results are **cached per product id**. The backlog is dominated by a small
+number of distinct blockers, so a few dozen searches classify tens of thousands
+of orders and re-runs after each catalog fix stay cheap.
+
+Blocked orders are left `Queued` with the blocker recorded in `notes` — the
+engine *is* the retry loop. Nothing is ever deleted from the sheet; the terminal
+states are `Processed`, `Duplicate`, `Error` (retried up to
+`live_max_attempts`), and `Gone` (Salla 404).
+
+Own namespace so it coexists with live sync but is trivially separable:
+`drain.log`, `STOP.drain`, `drain.lock`.
+
 ---
 
 ## 5. The live-sync engine (24/7)
@@ -463,6 +508,7 @@ org/team/scenario ids.
 |------|------|
 | `backfill.py` | the `Engine`, all limiters, HubSpot/Google/relay clients, idempotency |
 | `live.py` | `LiveEngine` — queue loop, single-consumer guard, sweep |
+| `queue_drain.py` | `QueueDrainEngine` + `DrainGoogleIO` — drains catalog-held orders from the Queue Log (§4.4) |
 | `run.py` | cross-platform supervisor (restart, keep-awake, STOP files) |
 | `dashboard.py` | terminal TUI (rich) — the same parser the web UI reuses |
 | `serve.py` / `webui/` | Flask UI: setup wizard, run controls, live dashboard |

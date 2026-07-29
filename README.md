@@ -279,6 +279,76 @@ running it as a **systemd service on GCP**, and the coordination that lets the
 backfill and live engines run together on one HubSpot rate budget. The web
 dashboard shows the live queue and both engines in one consolidated view.
 
+## Queue drain (v2.3) — releasing catalog-held orders
+
+Both engines refuse to create an order whose products aren't approved in the
+catalog yet (the **catalog gate**). Held orders are not dropped: each one is
+appended to the audit workbook's **Queue Log** tab and **never created in
+HubSpot**. Over a long backfill that tab becomes the backlog of everything the
+catalog wasn't ready for.
+
+`queue_drain.py` is the engine that drains it. It subclasses the backfill
+`Engine`, so held orders are created by the *same* pipeline as everything else —
+contact guardrails, bundle explosion, created-ledger idempotency, adaptive
+limiters, and the same yield-to-live coordination.
+
+```bash
+python queue_drain.py --scan                    # sheet only, no API calls
+python queue_drain.py --verify                  # read-only: fetch + gate check
+python queue_drain.py --live --max-orders 50    # pilot batch
+python queue_drain.py --live                    # full drain
+```
+
+| Mode | Cost | What it does |
+|------|------|--------------|
+| `--scan` | free | Reads the Queue Log and aggregates the blocker names already stored on the rows. Produces a name-level blocker matrix. No API calls at all. |
+| `--verify` | read-only | Fetches every claimable order through the relay and runs the real gate check. Writes nothing to HubSpot or the sheet; produces the **product-id level** blocker matrix at `mirror/blocker_matrix.csv`. |
+| `--live` | writes | Creates the READY orders, marks the sheet, flips the audit rows. `--max-orders N` caps the run for a pilot batch. |
+
+Both report modes write `mirror/blocker_matrix.csv` — the approval list you hand
+to whoever owns the catalog. It is sorted by how many orders each blocker holds,
+so the top few rows usually unblock most of the backlog.
+
+### Row lifecycle (nothing is ever deleted)
+
+```
+Queued ──▶ Processing ──▶ Processed          created, or already existed
+   ▲                  ├──▶ Duplicate         another row for the same order id
+   │                  ├──▶ Error             retried next run, to live_max_attempts
+   │                  └──▶ Gone              Salla returned 404
+   └──────────────────── still blocked: stays Queued, notes = blocker + timestamp
+```
+
+Blocked rows stay `Queued` on purpose — **the engine is the retry loop**. Fix a
+product in the catalog, re-run, and the rows that were waiting on it drain
+themselves. Duplicate rows for one order id collapse to a single primary; the
+twins are marked `Duplicate` and inherit the primary's outcome.
+
+When an order is created, its **original audit row** is flipped to
+`Order Approved` with the hold reason cleared and the HubSpot id + URL written —
+the same contract the sheet's "Approve Held" tooling uses, so the workbook's
+auto-verify pass fills the verification columns exactly as it would for any
+other approval.
+
+### Safety model
+
+- **Idempotent.** Created-ledger short-circuit (free, local, before any fetch) +
+  `salla_order_id` dedup search + line-item verification. Re-running any row is
+  a skip, never a second order. A crash mid-run loses nothing.
+- **Live sync stays on.** The drain reads the live-active signal and yields the
+  HubSpot budget to it, like the backfill does.
+- **Don't run it beside the backfill** — both compete for the same search budget
+  and the same Queue Log. Pause the backfill first.
+- **Own namespace** so it can't collide with the other engines: `drain.log`,
+  `STOP.drain` (graceful stop — finishes in flight, leaves the rest queued),
+  `drain.lock` (single instance).
+- **Gate results are cached per product id**, so a handful of distinct blockers
+  covers a backlog of thousands of orders and re-runs stay cheap.
+
+`--live` prompts for a typed `RUN` confirmation unless you pass `--yes`.
+See [`docs/QUEUE_DRAIN_RUNBOOK.md`](docs/QUEUE_DRAIN_RUNBOOK.md) for the full
+scan → verify → fix → pilot → drain cycle.
+
 ## Concurrent worker lanes (v1.5)
 
 One order is ~13 sequential API round-trips, so a single-lane engine is
