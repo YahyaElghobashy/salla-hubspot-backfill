@@ -536,8 +536,8 @@ li.open .raw{display:block}
   <div class="card" id="commonsCard">
     <p class="eyebrow">Shared HubSpot budget <span class="fullutil" id="utilBadge"></span></p>
     <div id="commonsBar">
-      <div id="segLive" style="width:8%"></div>
-      <div id="segBack" style="width:70%"></div>
+      <div id="segLive" style="width:0%"></div>
+      <div id="segBack" style="width:0%"></div>
       <div id="commonsGoal" style="left:98%"></div>
     </div>
     <div id="commonsLabels"><span id="clLive">live —</span><span id="clNote"></span><span id="clBack">backfill —</span></div>
@@ -1477,9 +1477,27 @@ document.querySelectorAll("#modeSeg button").forEach(b=>b.onclick=()=>{
   b.classList.add("active");runMode=b.dataset.mode;
   $("confirmWrap").style.display=(runMode==="live")?"":"none";});
 async function startRun(){
+  /* the two silent ways this button used to "not work":
+     1. LIVE selected but the RUN confirmation empty -> server rejected it and
+        the error rendered in a small line nobody saw
+     2. Dry selected (the default) -> a dry run starts, writes nothing, and
+        looks like nothing happened
+     Both now announce themselves. */
+  if(runMode==="live"&&!($("confirmRun")||{value:""}).value.trim()){
+    $("runStatus").innerHTML='<span class="bad">✗ type <b>RUN</b> in the confirmation box first — it\'s the safety latch for live writes</span>';
+    const c=$("confirmRun"); if(c){c.focus();c.style.borderColor="var(--red)";
+      setTimeout(()=>c.style.borderColor="",1500);}
+    $("runStatus").scrollIntoView({block:"nearest"});
+    return;
+  }
   const r=await api("/api/run",{mode:runMode,max_orders:$("maxOrders").value||null,
     workers:$("runWorkers").value||null,confirm:($("confirmRun")||{value:""}).value.trim()});
-  $("runStatus").innerHTML=r.ok?'<span class="ok">✓ started — watch Fleet</span>':`<span class="bad">✗ ${esc(r.error)}</span>`;
+  $("runStatus").innerHTML=r.ok
+    ?(runMode==="dry"
+      ?'<span class="ok">✓ dry run started — it reads everything and writes nothing. Switch to LIVE and type RUN to actually resume syncing.</span>'
+      :'<span class="ok">✓ started — watch Fleet</span>')
+    :`<span class="bad">✗ ${esc(r.error)}</span>`;
+  $("runStatus").scrollIntoView({block:"nearest"});
 }
 async function stopRun(){
   const r=await api("/api/stop",{});

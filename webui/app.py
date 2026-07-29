@@ -55,12 +55,33 @@ def _pid_alive(pidfile):
         return False
 
 
+def _procs_matching(pattern):
+    """PIDs whose full command line matches, via pgrep -f. The process table is
+    the single source of truth for "is it running" -- pidfiles are only hints.
+
+    Why: supervisors write/unlink engine.pid per launch, and two overlapping
+    launches race -- the loser's exit deletes the winner's pidfile, leaving a
+    RUNNING engine that the UI calls stopped (and, worse, lets a second Start
+    spawn a duplicate engine). The reverse race leaves a stale pidfile whose
+    recycled PID makes a STOPPED engine read as running, which blocks resume.
+    Both were observed on 2026-07-29.
+    """
+    try:
+        out = subprocess.run(["pgrep", "-f", pattern],
+                             capture_output=True, text=True, timeout=5)
+        return [int(x) for x in out.stdout.split()]
+    except Exception:
+        return []
+
+
 def engine_running():
-    return _pid_alive(PIDFILE)
+    return bool(_procs_matching(r"backfill\.py --(live|dry)")
+                or _pid_alive(PIDFILE))
 
 
 def live_running():
-    return _pid_alive(LIVEPID)
+    return bool(_procs_matching(r"live\.py --live")
+                or _pid_alive(LIVEPID))
 
 
 def _tail_line(path, nbytes=4096):
@@ -603,7 +624,41 @@ def create_app():
             while True:
                 if f is None and src.exists():
                     f = open(src, encoding="utf-8", errors="replace")
-                    f.seek(0, 2)
+                    # v2.2: replay the recent tail through the state machine
+                    # BEFORE going live. Previously this seeked straight to the
+                    # end with a blank State, so every page refresh forgot
+                    # everything -- slot, pacing, counts, lanes -- until the
+                    # engine happened to log again. With a quiet engine that
+                    # meant permanent zeros/placeholders after a refresh. 4 MB
+                    # covers hours of normal logging; parsing it takes well
+                    # under a second, and the browser sees a fully
+                    # reconstructed snapshot on its very first SSE event.
+                    try:
+                        f.seek(0, 2)
+                        size = f.tell()
+                        f.seek(max(0, size - 4_000_000))
+                        if size > 4_000_000:
+                            f.readline()  # drop the partial first line
+                        last_ts = None
+                        for line in f:
+                            m = dash.LINE.match(line.rstrip("\n"))
+                            if m:
+                                st.feed(*m.groups())
+                                last_ts = m.group(1)
+                        # feed() stamps last_line with wall time, so a replay
+                        # of old lines would fake a live engine. Restore truth:
+                        # freshness = the age of the last REAL line, and lanes
+                        # older than a couple of minutes are certainly done.
+                        if last_ts:
+                            try:
+                                st.last_line = time.mktime(time.strptime(
+                                    last_ts, "%Y-%m-%d %H:%M:%S"))
+                            except ValueError:
+                                pass
+                            if time.time() - st.last_line > 120:
+                                st.lanes.clear()
+                    except OSError:
+                        f.seek(0, 2)
                 if f:
                     while True:
                         line = f.readline()
@@ -771,12 +826,11 @@ def create_app():
     def credits():
         """v2.2 credit gauge, fed by credit_watch.py's state file.
 
-        Windows (today / this week / this calendar month) come from Make's own
-        30-day usage ledger, not from anything this app accumulates. The
-        cycle-to-date split is by ROLE, because the fetch relay is one scenario
-        both engines call. The savings figure compares MEASURED engine credits
-        against what the old per-order automation (~36 ops/order) would have
-        cost for the orders synced in the same billing cycle, at $1 per 1,000.
+        Aggregates the watcher's per-day engine attribution into today / this
+        week / this calendar month, and derives the (deliberately understated)
+        savings figure: orders synced in the month x the per-order credit gap
+        between the old all-Make automation (~36 ops) and the relay pipeline
+        (~2.3 ops), at $1 per 1,000 credits.
         """
         p = ROOT / "mirror" / "credit_state.json"
         if not p.exists():
