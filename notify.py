@@ -45,24 +45,37 @@ def _env(name, default=""):
     return (os.environ.get(name) or default).strip()
 
 
+def slack_channels():
+    """All configured channel ids.
+
+    SLACK_CHANNEL_IDS (comma-separated) wins; SLACK_CHANNEL_ID kept for
+    backward compatibility. Multiple channels exist because audiences differ:
+    e.g. an internal ops channel plus a shared channel with the client -- an
+    alert that only reaches the team that already knows is half an alert.
+    """
+    raw = _env("SLACK_CHANNEL_IDS") or _env("SLACK_CHANNEL_ID")
+    return [c.strip() for c in raw.split(",") if c.strip()]
+
+
 def slack_enabled():
-    return bool(_env("SLACK_BOT_TOKEN") and _env("SLACK_CHANNEL_ID"))
+    return bool(_env("SLACK_BOT_TOKEN") and slack_channels())
 
 
 def email_enabled():
     return bool(_env("SMTP_HOST") and _env("SMTP_FROM") and _env("SMTP_TO"))
 
 
-def post_slack(text, blocks=None, thread_ts=None, dry_run=False):
-    """Post to Slack. Returns the message ts (for threading) or None.
+def post_slack(text, blocks=None, thread_ts=None, dry_run=False, channel=None):
+    """Post to one Slack channel. Returns the message ts (for threading) or None.
 
     Slack returns HTTP 200 even for application errors -- the same trap as Make's
     `200 Accepted`. The JSON `ok` field is the real status and must be checked.
     """
     if not slack_enabled():
-        log.debug("slack alert skipped: SLACK_BOT_TOKEN/SLACK_CHANNEL_ID not set")
+        log.debug("slack alert skipped: SLACK_BOT_TOKEN/SLACK_CHANNEL_ID(S) not set")
         return None
-    payload = {"channel": _env("SLACK_CHANNEL_ID"), "text": text}
+    chans = slack_channels()
+    payload = {"channel": channel or chans[0], "text": text}
     if blocks:
         payload["blocks"] = blocks
     if thread_ts:
@@ -155,10 +168,19 @@ def send_alert(subject, body, blocks=None, thread_ts=None, dry_run=False):
     """
     ts = None
     try:
-        ts = post_slack(subject, blocks=blocks, thread_ts=thread_ts,
-                        dry_run=dry_run)
-        if body and ts:
-            post_slack(body, thread_ts=ts, dry_run=dry_run)
+        # every configured channel gets the headline + its own detail thread;
+        # a failure in one channel must not silence the others
+        for ch in (slack_channels() or [None]):
+            if ch is None:
+                break
+            try:
+                cts = post_slack(subject, blocks=blocks, thread_ts=thread_ts,
+                                 dry_run=dry_run, channel=ch)
+                if body and cts:
+                    post_slack(body, thread_ts=cts, dry_run=dry_run, channel=ch)
+                ts = ts or cts  # first channel's ts kept for callers that thread
+            except Exception as e:
+                log.warning("slack alert to %s failed: %s", ch, e)
     except Exception as e:
         log.warning("slack alert dispatch error: %s", e)
     try:
@@ -172,4 +194,6 @@ def send_alert(subject, body, blocks=None, thread_ts=None, dry_run=False):
 
 def channels_summary():
     """Human-readable channel status for startup logs. No secret values."""
-    return f"slack={'on' if slack_enabled() else 'off'} email={'on' if email_enabled() else 'off'}"
+    n = len(slack_channels()) if slack_enabled() else 0
+    return (f"slack={'on x' + str(n) + ' channel' + ('s' if n != 1 else '') if n else 'off'} "
+            f"email={'on' if email_enabled() else 'off'}")
