@@ -9,6 +9,7 @@ Design rules:
   - the dashboard is a read-only tail of backfill.log via the same parser
     the terminal TUI uses (dashboard.State)
 """
+import csv
 import json
 import os
 import re
@@ -37,6 +38,9 @@ LOG = ROOT / "backfill.log"
 LIVELOG = ROOT / "live.log"          # v1.6 live-sync service log
 PIDFILE = ROOT / "engine.pid"
 LIVEPID = ROOT / "live.pid"
+DRAINLOG = ROOT / "drain.log"        # v2.3 queue drain
+DRAINSTOP = ROOT / "STOP.drain"
+MATRIX = ROOT / "mirror" / "blocker_matrix.csv"
 
 
 def _env():
@@ -82,6 +86,95 @@ def engine_running():
 def live_running():
     return bool(_procs_matching(r"live\.py --live")
                 or _pid_alive(LIVEPID))
+
+
+def drain_running():
+    # queue_drain holds drain.lock, but the process table is the truth (same
+    # reasoning as _procs_matching): a stale lock from a killed run would
+    # otherwise wedge the UI into "already running" forever.
+    return bool(_procs_matching(r"queue_drain\.py"))
+
+
+# "DRAIN start mode=LIVE rows=16376 claimable=... unique=... twins=... workers=8"
+R_DRAIN_START = re.compile(
+    r"DRAIN start mode=(\S+) rows=(\d+) claimable=(\d+) unique=(\d+) twins=(\d+)")
+# "DRAIN progress ~42%  created=10 blocked=3 skipped_existing=5 errors=0"
+R_DRAIN_PROG = re.compile(
+    r"DRAIN progress ~(\d+)%\s+created=(\d+) blocked=(\d+) "
+    r"skipped_existing=(\d+) errors=(\d+)")
+R_DRAIN_DONE = re.compile(r"DRAIN SUMMARY mode=(\S+)\s+([\d.]+) min")
+R_TS = re.compile(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})")
+
+
+def _drain_last_run(nbytes=400_000):
+    """Progress of the most recent drain, parsed from the tail of drain.log.
+
+    Deliberately log-derived: the alternative (reading the Queue Log tab) costs
+    a Sheets round-trip per poll and needs credentials the UI may not have.
+    Only the counters the engine actually prints are reported -- no per-status
+    sheet totals are inferred here, because the log does not carry them.
+    """
+    out = {"mode": None, "rows": None, "claimable": None, "unique": None,
+           "twins": None, "pct": None, "created": 0, "blocked": 0,
+           "skipped_existing": 0, "errors": 0, "finished": False,
+           "minutes": None, "started": None, "progress_at": None}
+    if not DRAINLOG.exists():
+        return out
+    try:
+        with open(DRAINLOG, "rb") as f:
+            f.seek(0, 2)
+            f.seek(max(0, f.tell() - nbytes))
+            lines = f.read().decode("utf-8", "replace").splitlines()
+    except OSError:
+        return out
+    # walk forward so the LAST start wins, then any progress after it
+    for ln in lines:
+        m = R_DRAIN_START.search(ln)
+        if m:
+            ts = R_TS.match(ln)
+            out.update(mode=m.group(1), rows=int(m.group(2)),
+                       claimable=int(m.group(3)), unique=int(m.group(4)),
+                       twins=int(m.group(5)),
+                       started=ts.group(1) if ts else None,
+                       pct=0, created=0, blocked=0, skipped_existing=0,
+                       errors=0, finished=False, minutes=None,
+                       progress_at=None)
+            continue
+        m = R_DRAIN_PROG.search(ln)
+        if m:
+            ts = R_TS.match(ln)
+            out.update(pct=int(m.group(1)), created=int(m.group(2)),
+                       blocked=int(m.group(3)),
+                       skipped_existing=int(m.group(4)),
+                       errors=int(m.group(5)),
+                       progress_at=ts.group(1) if ts else None)
+            continue
+        m = R_DRAIN_DONE.search(ln)
+        if m:
+            out.update(finished=True, minutes=float(m.group(2)), pct=100)
+    return out
+
+
+def _drain_blockers(top=12):
+    """Top rows of mirror/blocker_matrix.csv -- the catalog approval list."""
+    if not MATRIX.exists():
+        return []
+    try:
+        with open(MATRIX, newline="", encoding="utf-8") as f:
+            rows = list(csv.DictReader(f))
+    except (OSError, csv.Error):
+        return []
+    def cnt(r):
+        try:
+            return int(float(r.get("blocked_orders") or 0))
+        except (TypeError, ValueError):
+            return 0
+    rows.sort(key=cnt, reverse=True)
+    return [{"product_id": r.get("salla_product_id") or "",
+             "name": (r.get("item_name") or "")[:90],
+             "orders": cnt(r),
+             "action": (r.get("suggested_action") or "")[:110]}
+            for r in rows[:top]]
 
 
 def _tail_line(path, nbytes=4096):
@@ -895,5 +988,61 @@ def create_app():
             "naive_credits": naive,
             "saved_usd": max(0.0, (naive - engine_credits) / 1000.0),
         })
+
+    # ---- queue drain (v2.3) ------------------------------------------------
+    # The drain releases catalog-held orders from the Queue Log. Everything
+    # here is derived from drain.log and mirror/blocker_matrix.csv: both are
+    # local files, so polling this endpoint costs no API calls and works even
+    # when the engines are stopped.
+
+    @app.get("/api/drain")
+    def drain_state():
+        run = _drain_last_run()
+        return jsonify({
+            "running": drain_running(),
+            "backfill_running": engine_running(),   # the --live guard
+            "stop_file": DRAINSTOP.exists(),
+            "log_present": DRAINLOG.exists(),
+            "matrix_present": MATRIX.exists(),
+            "matrix_mtime": (MATRIX.stat().st_mtime if MATRIX.exists() else None),
+            "blockers": _drain_blockers(),
+            "last": _tail_line(DRAINLOG) if DRAINLOG.exists() else "",
+            **run,
+        })
+
+    @app.post("/api/drain/run")
+    def drain_run():
+        body = request.get_json(force=True) or {}
+        mode = body.get("mode", "scan")
+        if mode not in ("scan", "verify", "live"):
+            return jsonify({"ok": False, "error": f"unknown mode {mode!r}"})
+        if drain_running():
+            return jsonify({"ok": False, "error": "a drain is already running"})
+        if mode == "live":
+            # Both engines compete for the same HubSpot search budget AND the
+            # same Queue Log rows, so a concurrent backfill can double-claim.
+            # Live sync is fine: the drain yields the budget to it.
+            if engine_running():
+                return jsonify({"ok": False, "error": "backfill is running -- "
+                                "stop it before draining (they share the search "
+                                "budget and the Queue Log)"})
+            if body.get("confirm") != "RUN":
+                return jsonify({"ok": False, "error": 'type RUN to confirm a live drain'})
+        DRAINSTOP.unlink(missing_ok=True)
+        cmd = [sys.executable, "-u", "queue_drain.py", f"--{mode}"]
+        if mode == "live":
+            cmd.append("--yes")          # the typed RUN happened in the UI
+            if body.get("max_orders"):
+                cmd += ["--max-orders", str(int(body["max_orders"]))]
+        logf = open(ROOT / "supervisor.drain.out", "a")
+        subprocess.Popen(cmd, stdout=logf, stderr=logf, start_new_session=True)
+        return jsonify({"ok": True, "mode": mode})
+
+    @app.post("/api/drain/stop")
+    def drain_stop():
+        DRAINSTOP.touch()
+        return jsonify({"ok": True, "note": "drain finishes the orders in flight, "
+                        "then halts; every remaining row stays Queued and the "
+                        "next run picks up where this one stopped"})
 
     return app

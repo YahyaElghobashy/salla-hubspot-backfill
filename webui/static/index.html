@@ -361,6 +361,33 @@ li.open .raw{display:block}
 .statechip.off{background:var(--chip);color:var(--muted)}
 .statechip.stopping{background:var(--gold-tint);color:var(--gold)}
 
+/* ---------- queue drain card (v2.3) ---------- */
+#drainCard .c-hero{font-size:26px;font-weight:750;font-variant-numeric:tabular-nums;letter-spacing:-.01em}
+#drainCard .c-hero small{font-size:13px;font-weight:600;color:var(--muted);margin-left:6px}
+#drainCard .drainbar{height:7px;border-radius:99px;background:var(--chip);overflow:hidden;margin-top:10px}
+#drainCard .drainbar i{display:block;height:100%;background:var(--sage);border-radius:99px;transition:width .5s ease}
+#drainCard .drainstats{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-top:12px}
+#drainCard .ds{background:var(--chip);border-radius:10px;padding:8px 10px}
+#drainCard .ds b{display:block;font-size:16px;font-weight:750;font-variant-numeric:tabular-nums;letter-spacing:-.01em}
+#drainCard .ds span{font-size:10.5px;color:var(--muted);font-weight:600}
+#drainCard .ds.warn b{color:var(--gold,#C8881A)}
+#drainCard .ds.bad b{color:var(--red)}
+#drainCard .drainrun{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin-top:14px}
+#drainCard .dbtn{border:1px solid var(--line);background:var(--chip);border-radius:99px;
+  padding:5px 12px;font-size:11.5px;font-weight:650;cursor:pointer;color:var(--fg,inherit)}
+#drainCard .dbtn span{color:var(--muted);font-weight:600;margin-left:4px;font-size:10px}
+#drainCard .dbtn:hover:not(:disabled){border-color:var(--muted)}
+#drainCard .dbtn:disabled{opacity:.45;cursor:not-allowed}
+#drainCard .dbtn.live{border-color:var(--sage)}
+#drainCard .dbtn.stop{border-color:var(--red)}
+#drainCard .drainrun input{border:1px solid var(--line);background:transparent;border-radius:99px;
+  padding:5px 10px;font-size:11.5px;width:96px;font-family:inherit}
+#drainCard .drainlast{margin-top:8px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;
+  font-size:10.5px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+#drainCard .drainwarn{border-radius:10px;padding:7px 10px;margin-top:9px;font-size:11.5px;font-weight:600}
+#drainCard .drainwarn.g{background:color-mix(in srgb,var(--gold,#C8881A) 14%,transparent)}
+#drainCard .drainwarn.c{background:color-mix(in srgb,var(--red) 12%,transparent)}
+
 /* ---------- credits card ---------- */
 #creditsCard .c-hero{font-size:26px;font-weight:750;font-variant-numeric:tabular-nums;letter-spacing:-.01em}
 #creditsCard .c-hero small{font-size:13px;font-weight:600;color:var(--muted);margin-left:6px}
@@ -573,6 +600,39 @@ li.open .raw{display:block}
       <table class="credother" id="credOtherList"></table>
     </details>
     <div class="credsave" id="credSave"></div>
+  </div>
+
+  <div class="card" id="drainCard" style="display:none">
+    <p class="eyebrow">Queue drain · catalog-held orders
+      <span class="muted" id="drainState" style="text-transform:none;letter-spacing:0;float:right"></span></p>
+    <div class="c-hero"><span id="drainHero">—</span><small id="drainHeroSub">held orders in the queue</small></div>
+    <div id="drainWarnBox"></div>
+
+    <div class="drainbar" id="drainProgWrap" style="display:none">
+      <i id="drainProg"></i>
+    </div>
+    <p class="hint" id="drainProgNote" style="margin:6px 0 0;font-size:11px"></p>
+
+    <div class="drainstats" id="drainStats"></div>
+
+    <div class="credrow" style="margin-top:12px"><span class="cr-k">top blockers
+      <span class="muted" id="drainMatrixAge" style="font-weight:600"></span></span>
+      <span class="cr-v" id="drainBlockerCount">—</span></div>
+    <table class="credother" id="drainBlockers"></table>
+    <p class="hint" id="drainNoMatrix" style="margin:6px 0 0;font-size:11px;display:none">
+      No blocker matrix yet. Run a <b>scan</b> (free, no API calls) to build one from
+      the names already stored on the queue rows.</p>
+
+    <div class="drainrun">
+      <button class="dbtn" onclick="drainRun('scan')" id="dBtnScan">scan <span>free</span></button>
+      <button class="dbtn" onclick="drainRun('verify')" id="dBtnVerify">verify <span>read-only</span></button>
+      <input id="drainMax" type="number" min="1" placeholder="max orders" title="cap this live run (pilot batch)">
+      <input id="drainConfirm" placeholder="type RUN" title="live drain creates orders in HubSpot">
+      <button class="dbtn live" onclick="drainRun('live')" id="dBtnLive">drain live</button>
+      <button class="dbtn stop" onclick="drainStop()" id="dBtnStop">stop</button>
+    </div>
+    <div id="drainStatus" class="hint" style="margin-top:7px;font-size:11.5px"></div>
+    <div class="drainlast" id="drainLast"></div>
   </div>
 
   <div id="band">
@@ -1270,6 +1330,105 @@ function armStop(which){
     btn.textContent=STOP_LABELS[which];btn.disabled=false;});
 }
 
+/* ================= queue drain (v2.3) =================
+   Everything shown here is parsed from drain.log + mirror/blocker_matrix.csv,
+   so the panel costs no API calls and still works with both engines stopped.
+   Counters are only what the engine actually prints -- nothing is inferred. */
+let drainBusy=false;
+async function loadDrain(){
+  try{
+    const d=await api("/api/drain");
+    if(!d||(!d.log_present&&!d.matrix_present&&!d.running)){
+      $("drainCard").style.display="none";return;}
+    $("drainCard").style.display="";
+    const n=v=>Math.round(v||0).toLocaleString();
+
+    /* state chip states the fact; the buttons offer the action */
+    const st=$("drainState");
+    st.textContent=d.running?("running · "+(d.mode||"").toLowerCase())
+      :(d.last_finished||d.finished)?"idle · last run finished":"idle";
+    st.style.color=d.running?"var(--sage)":"var(--muted)";
+
+    /* hero: the queue itself, from the last run's claim numbers */
+    if(d.unique!=null){
+      $("drainHero").textContent=n(d.unique);
+      $("drainHeroSub").textContent=`unique held orders · ${n(d.rows)} queue rows`
+        +(d.twins?` · ${n(d.twins)} duplicate`:"");
+    }else{
+      $("drainHero").textContent="—";
+      $("drainHeroSub").textContent="run a scan to size the backlog";
+    }
+
+    /* progress */
+    const pw=$("drainProgWrap");
+    if(d.pct!=null&&(d.running||!d.finished)){
+      pw.style.display="";$("drainProg").style.width=Math.max(1,d.pct)+"%";
+      $("drainProgNote").textContent=`~${d.pct}% of this run`
+        +(d.progress_at?` · last update ${d.progress_at}`:"");
+    }else if(d.finished&&d.minutes!=null){
+      pw.style.display="";$("drainProg").style.width="100%";
+      $("drainProgNote").textContent=`last run finished in ${d.minutes.toFixed(1)} min`
+        +(d.mode?` (${d.mode.toLowerCase()})`:"");
+    }else{pw.style.display="none";$("drainProgNote").textContent="";}
+
+    /* ready vs blocked from the last run */
+    $("drainStats").innerHTML=
+       `<div class="ds"><b>${n(d.created)}</b><span>created</span></div>`
+      +`<div class="ds${d.blocked?" warn":""}"><b>${n(d.blocked)}</b><span>still blocked</span></div>`
+      +`<div class="ds"><b>${n(d.skipped_existing)}</b><span>already synced</span></div>`
+      +`<div class="ds${d.errors?" bad":""}"><b>${n(d.errors)}</b><span>errors</span></div>`;
+
+    /* blockers = the catalog approval list */
+    const b=d.blockers||[];
+    $("drainBlockerCount").textContent=b.length?`${b.length} shown`:"—";
+    $("drainMatrixAge").textContent=d.matrix_mtime
+      ? " · "+new Date(d.matrix_mtime*1000).toLocaleString():"";
+    $("drainNoMatrix").style.display=b.length?"none":"";
+    const mx=Math.max(...b.map(x=>x.orders),1);
+    $("drainBlockers").innerHTML=b.map(x=>
+       `<tr><td title="${esc(x.action)}">${esc(x.name||x.product_id||"(unnamed)")}</td>`
+      +`<td class="co-bar"><i style="width:${Math.max(2,x.orders/mx*100)}%"></i></td>`
+      +`<td class="co-val">${n(x.orders)}</td></tr>`).join("");
+
+    /* guards */
+    const w=$("drainWarnBox");
+    if(d.backfill_running)
+      w.innerHTML='<div class="drainwarn g">⚠ Backfill is running. A live drain is blocked '
+        +'while it is: they share the HubSpot search budget and the same Queue Log.</div>';
+    else if(d.stop_file&&d.running)
+      w.innerHTML='<div class="drainwarn g">■ Stop requested. Orders in flight finish, '
+        +'the rest stay Queued.</div>';
+    else w.innerHTML="";
+
+    $("dBtnLive").disabled=d.running||d.backfill_running;
+    $("dBtnScan").disabled=d.running;
+    $("dBtnVerify").disabled=d.running;
+    $("dBtnStop").disabled=!d.running;
+    $("drainLast").textContent=d.last||"";
+  }catch(e){/* panel is best-effort; never break the shell */}
+}
+async function drainRun(mode){
+  if(drainBusy)return; drainBusy=true;
+  try{
+    const body={mode:mode};
+    if(mode==="live"){
+      body.max_orders=$("drainMax").value||null;
+      body.confirm=($("drainConfirm")||{value:""}).value.trim();
+    }
+    const r=await api("/api/drain/run",body);
+    $("drainStatus").innerHTML=r.ok
+      ?`<span class="ok">✓ ${esc(mode)} started${mode==="live"&&body.max_orders?` (capped at ${esc(body.max_orders)} orders)`:""}</span>`
+      :`<span class="bad">✗ ${esc(r.error)}</span>`;
+    if(r.ok&&mode==="live")$("drainConfirm").value="";
+  }finally{drainBusy=false;}
+  loadDrain();
+}
+async function drainStop(){
+  const r=await api("/api/drain/stop",{});
+  $("drainStatus").innerHTML=`<span class="warn">${esc(r.note)}</span>`;
+  loadDrain();
+}
+
 /* ================= credits card ================= */
 /* one bar, scaled against the largest window so today/week/month are
    visually comparable rather than each filling their own 100% */
@@ -1949,6 +2108,7 @@ setInterval(loadLedger,15000);
 setInterval(()=>{if(route==="audit")loadEvents();},7000);
 setInterval(loadRuns,30000);
 loadCredits();setInterval(loadCredits,60000);
+loadDrain();setInterval(loadDrain,5000);
 
 initStreams();refreshState();loadRuns();loadLedger();pollCursor();routeFromHash();buildPresets();
 </script>
