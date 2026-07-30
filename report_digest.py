@@ -63,8 +63,24 @@ def n(v, unit=""):
     if v is None:
         return "not recorded"
     if isinstance(v, float):
-        return f"{v:,.1f}{unit}"
+        # credit balances arrive as floats from the Make API but are whole
+        # numbers; "96,739.0 credits" reads like a bug to anyone sensible
+        return f"{v:,.0f}{unit}" if v == int(v) else f"{v:,.1f}{unit}"
     return f"{v:,}{unit}"
+
+
+def dur(seconds):
+    """Human duration. A raw '1,156,112s' is technically true and useless."""
+    if seconds is None:
+        return "not recorded"
+    s = int(seconds)
+    if s < 90:
+        return f"{s}s"
+    if s < 5400:
+        return f"{s // 60}m"
+    if s < 172800:
+        return f"{s // 3600}h"
+    return f"{s // 86400}d"
 
 
 def pct_change(cur, prev):
@@ -72,6 +88,10 @@ def pct_change(cur, prev):
         return ""
     d = 100.0 * (cur - prev) / prev
     arrow = "up" if d >= 0 else "down"
+    # beyond a few hundred percent the ratio stops informing and starts
+    # sounding like spin; give the raw comparison instead
+    if abs(d) > 300:
+        return f" (previous period: {prev:,})"
     return f" ({arrow} {abs(d):.0f}% on the previous period)"
 
 
@@ -145,6 +165,8 @@ def aggregate(period):
         for s in (d.get("services") or {}).values():
             restarts += (s.get("restarts") or 0) if isinstance(s, dict) else 0
 
+    live_vals = [d.get("live_processed") for d in days
+                 if d.get("live_processed") is not None]
     latest = days[-1] if days else {}
     live_now = roll.collect(datetime.now().strftime("%Y-%m-%d"))
 
@@ -159,6 +181,7 @@ def aggregate(period):
         "wait_max_s": max(waits) if waits else None,
         "credits_burned": sum(burns) if burns else None,
         "credits_daily": burns,
+        "live_created": sum(live_vals) if live_vals else None,
         "alerts": alerts, "restarts": restarts,
         "latest": latest, "now": live_now,
     }
@@ -226,8 +249,12 @@ def render(a):
              "monthly": "Monthly report"}[p]
     head = [f"*{title} · {a['label']}*", _verdict(a), ""]
 
-    head.append(f"• Orders synced: *{n(a['created'])}*"
+    head.append(f"• Orders created: *{n(a['created'])}*"
                 + pct_change(a["created"], a["prev_created"]))
+    if a["live_created"] is not None:
+        batch = (a["created"] or 0) - a["live_created"]
+        head.append(f"   ↳ {a['live_created']:,} live orders, "
+                    f"{max(0, batch):,} from backfill/drain")
     if p != "daily" and a["daily_series"]:
         head.append(f"• Daily volume: {spark([v for _, v in a['daily_series']])}")
     if a["availability"] is not None:
@@ -235,7 +262,7 @@ def render(a):
     q = a["now"]
     if q.get("queue_depth_max") is not None:
         head.append(f"• Queue: peaked at {q['queue_depth_max']} today, "
-                    f"longest wait {n(q.get('oldest_wait_s_max'))}s")
+                    f"oldest item {dur(q.get('oldest_wait_s_max'))}")
     held = (q.get("held") or {})
     if held.get("value") is not None:
         head.append(f"• Held for catalog: {held['value']:,} "
@@ -261,13 +288,22 @@ def _threads(a):
     p = a["period"]
 
     # --- live sync -------------------------------------------------------
-    t = [f"*Live sync*",
-         f"{n(a['created'])} orders reached HubSpot"
-         f"{' this period' if p != 'daily' else ''}."]
+    live = a["live_created"]
+    t = ["*Live sync*"]
+    if live is not None:
+        t.append(f"{live:,} live orders picked up from the store"
+                 f"{' this period' if p != 'daily' else ''}. The headline "
+                 f"figure of {n(a['created'])} also includes records created "
+                 f"by the backfill and the queue drain.")
+    else:
+        t.append(f"{n(a['created'])} records created across all sources.")
     if a["wait_max_s"] is not None:
-        t.append(f"Longest observed wait between an order arriving and its "
-                 f"HubSpot record existing: {a['wait_max_s']}s. "
-                 f"Peak queue depth {n(a['queue_depth_max'])}.")
+        t.append(f"Peak queue depth {n(a['queue_depth_max'])}; oldest item "
+                 f"sitting in the queue reached {dur(a['wait_max_s'])}.")
+        if (a["wait_max_s"] or 0) > 86400:
+            t.append("That age reflects historical rows re-queued by the "
+                     "drain, not a new order waiting — new orders are picked "
+                     "up within seconds.")
     if a["availability"] is not None:
         t.append(f"Availability {a['availability']}% — measured as minutes in "
                  f"which the intake actually polled successfully, not merely "

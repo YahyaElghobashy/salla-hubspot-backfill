@@ -56,7 +56,8 @@ log = logging.getLogger("rollup")
 
 # "2026-07-29 20:12:54,429 INFO [main] QUEUE depth=2 oldest_age=17s processed_today=1204 lanes=0/2"
 R_QUEUE = re.compile(
-    r"^(\d{4}-\d\d-\d\d) (\d\d):(\d\d):\d\d.*QUEUE depth=(\d+) oldest_age=(\d+)s")
+    r"^(\d{4}-\d\d-\d\d) (\d\d):(\d\d):\d\d.*QUEUE depth=(\d+) oldest_age=(\d+)s"
+    r"(?: processed_today=(\d+))?")
 R_HELD = re.compile(r"^(\d{4}-\d\d-\d\d).*HELD order")
 R_ALERT = re.compile(r"^(\d{4}-\d\d-\d\d) (\d\d:\d\d):\d\d.*(ALERT|RESOLVED): (.{0,80})")
 # "DRAIN SUMMARY" block: "created=4124 blocked(still queued)=6434 ..."
@@ -98,10 +99,12 @@ def _log_day(path, date):
     """
     out = {"queue_depth_max": None, "queue_depth_avg": None,
            "oldest_wait_s_max": None, "poll_minutes_ok": None,
-           "availability_pct": None, "held_new": None, "alerts": []}
+           "availability_pct": None, "held_new": None, "alerts": [],
+           "live_processed": None}
     if not path.exists():
         return out
     depths, waits, minutes, held, alerts = [], [], set(), 0, []
+    live_processed = None
     try:
         with open(path, encoding="utf-8", errors="replace") as f:
             for line in f:
@@ -112,6 +115,10 @@ def _log_day(path, date):
                     depths.append(int(m.group(4)))
                     waits.append(int(m.group(5)))
                     minutes.add(f"{m.group(2)}:{m.group(3)}")
+                    if m.group(6):
+                        # counter resets at midnight, so the last value of the
+                        # day is the day's live total
+                        live_processed = int(m.group(6))
                     continue
                 if R_HELD.match(line):
                     held += 1
@@ -130,6 +137,7 @@ def _log_day(path, date):
     out["oldest_wait_s_max"] = max(waits)
     out["held_new"] = held
     out["alerts"] = alerts
+    out["live_processed"] = live_processed
     # Availability measured as "minutes in which the intake actually polled",
     # NOT "minutes the service was up". The 2026-07-23 outage had a perfectly
     # healthy systemd unit sitting on a dead relay for 68.9h; uptime would have
