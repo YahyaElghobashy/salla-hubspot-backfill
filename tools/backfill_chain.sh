@@ -8,7 +8,8 @@
 # as designed); this script only decides which window comes next. If the
 # current cursor already sits inside the first window it resumes rather than
 # resets — dedup makes any overlap free, but resuming skips even the re-scan.
-# A window is complete when the cursor reports done/done_overflow. Crashes are
+# A window is complete when the cursor reports done/done_overflow; running and
+# overflow are both mid-sweep states that mean "keep going". Crashes are
 # retried after 60s (credit outages surface here: relay_health alerts, the
 # engine exits, we retry later without hammering).
 set -uo pipefail
@@ -49,7 +50,8 @@ for W in "$@"; do
     wait_for_drain
     rm -f STOP
     echo "[chain] $W: engine run $((++tries)) starting ($(date '+%F %T'))"
-    ./venv/bin/python3 backfill.py --live --yes || true
+    # backfill.py has no --yes; live mode reads the literal string RUN from stdin
+    printf 'RUN\n' | ./venv/bin/python3 backfill.py --live || true
     CS=$(cursor_field status)
     [ "$CS" = "done" ] || [ "$CS" = "done_overflow" ] && break
     if [ -e STOP ]; then echo "[chain] STOP present — chain paused; exiting"; exit 0; fi
