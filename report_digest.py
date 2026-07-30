@@ -200,6 +200,8 @@ def _verdict(a):
         bad.append(f"availability {a['availability']}%")
     if a["alerts"]:
         bad.append(f"{len(a['alerts'])} alert(s)")
+    if not a["created"]:
+        return "No sync activity recorded in this period."
     if not bad:
         return "Healthy. No incidents, no data loss, no manual intervention."
     return "Needs a look: " + ", ".join(bad) + "."
@@ -213,7 +215,7 @@ def _credit_lines(a):
     if rem is None:
         return ["• Make credits: not recorded"]
     burn_day = a["credits_burned"]
-    line = f"• Make credits: *{rem:,}* left"
+    line = f"• Make credits: *{n(rem)}* left"
     if burn_day and a["days_recorded"]:
         per_h = burn_day / max(1, a["days_recorded"] * 24)
         line += f", burning ~{per_h:,.0f}/hour"
@@ -260,9 +262,14 @@ def render(a):
     if a["availability"] is not None:
         head.append(f"• Availability: *{a['availability']}%*")
     q = a["now"]
-    if q.get("queue_depth_max") is not None:
-        head.append(f"• Queue: peaked at {q['queue_depth_max']} today, "
-                    f"oldest item {dur(q.get('oldest_wait_s_max'))}")
+    # A weekly report must not quote today's queue as if it described the week.
+    if p == "daily":
+        if q.get("queue_depth_max") is not None:
+            head.append(f"• Queue: peaked at {q['queue_depth_max']}, "
+                        f"oldest item {dur(q.get('oldest_wait_s_max'))}")
+    elif a["queue_depth_max"] is not None:
+        head.append(f"• Queue: peak depth {a['queue_depth_max']} over the period"
+                    f" (now {q.get('queue_depth_max', 0)})")
     held = (q.get("held") or {})
     if held.get("value") is not None:
         head.append(f"• Held for catalog: {held['value']:,} "
