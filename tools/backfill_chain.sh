@@ -16,7 +16,10 @@ cd "$(dirname "$0")/.."
 set -a; . ./.env; set +a
 
 wait_for_drain() {
-  while pgrep -f "queue_drain.py" >/dev/null 2>&1; do
+  # Anchor on the interpreter path: a bare `pgrep -f queue_drain.py` also matches
+  # this script's own tmux/bash wrapper (its command line contains the string),
+  # which deadlocks the chain forever after the drain actually exits.
+  while pgrep -f "^[^ ]*python3 queue_drain\.py" >/dev/null 2>&1; do
     echo "[chain] queue drain still running — waiting 120s"
     sleep 120
   done
