@@ -21,6 +21,7 @@ Usage:
 import argparse
 import collections
 import io
+import json
 import random
 import sys
 import zipfile
@@ -74,11 +75,51 @@ def sample_phones(zip_path, per_file, seed=20260810):
     return out
 
 
+def sample_from_months(months_dir, total, seed=20260810):
+    """Sample from the NORMALISED months rather than the raw workbooks.
+
+    Better than sampling the export: these are exactly the orders that will be
+    imported, already junk-filtered, overlap-deduped and phone-normalised, so
+    the hit rate measured here is the hit rate the import will actually see.
+    """
+    import glob
+    import gzip
+
+    rnd = random.Random(seed)
+    files = sorted(glob.glob(str(Path(months_dir) / "*.jsonl.gz")))
+    if not files:
+        raise SystemExit(f"no normalised months in {months_dir}")
+    per_file = max(10, total // len(files))
+    out = []
+    for fp in files:
+        month = Path(fp).name.split(".")[0]
+        res, n = [], 0
+        with gzip.open(fp, "rt", encoding="utf-8") as f:
+            for line in f:
+                o = json.loads(line)
+                c = o.get("customer") or {}
+                raw = f"{c.get('mobile_code','')}{c.get('mobile','')}"
+                if not raw.strip():
+                    continue
+                n += 1
+                rec = (month[:4], month, raw)
+                if len(res) < per_file:
+                    res.append(rec)
+                else:
+                    j = rnd.randrange(n)
+                    if j < per_file:
+                        res[j] = rec
+        out += res
+    return out
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--zip", required=True)
+    ap.add_argument("--zip", help="sample raw workbooks")
+    ap.add_argument("--months", default="mirror/zed",
+                    help="sample the normalised months instead (preferred)")
     ap.add_argument("--sample", type=int, default=5000,
-                    help="total sample size, split across the workbooks")
+                    help="total sample size, split across the sources")
     ap.add_argument("--threshold", type=float, default=60.0,
                     help="percent below which the premise is judged broken")
     args = ap.parse_args()
@@ -86,8 +127,11 @@ def main():
     idx = ContactIndex()
     print(f"contact snapshot: {idx.count():,} contacts indexed\n")
 
-    per_file = max(50, args.sample // 7)
-    rows = sample_phones(args.zip, per_file)
+    if args.zip:
+        rows = sample_phones(args.zip, max(50, args.sample // 7))
+    else:
+        rows = sample_from_months(args.months, args.sample)
+        print(f"sampled from normalised months in {args.months}")
     print(f"\ntotal sampled: {len(rows):,}\n")
 
     hit = miss = unusable = 0
