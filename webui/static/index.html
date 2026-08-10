@@ -19,6 +19,7 @@
   --amber:#d97706; --amber-tint:#fdf0e0;
   --red:#f55157; --red-tint:#fdeaea;
   --rose:#d789ad;
+  --iris:#6d6ad4; --iris-tint:#ecebfa;
   --chip:#f5f2f4;
   --shadow:0 1px 2px rgba(0,0,0,.04), 0 8px 24px rgba(0,0,0,.05);
 }
@@ -32,6 +33,7 @@
     --amber:#f59e0b; --amber-tint:#2e2210;
     --red:#ff6b70; --red-tint:#2e1618;
     --rose:#e39fc0;
+    --iris:#9a97ec; --iris-tint:#1f1e33;
     --chip:#232529;
     --shadow:0 1px 2px rgba(0,0,0,.4), 0 8px 24px rgba(0,0,0,.25);
   }
@@ -45,6 +47,7 @@
   --amber:#f59e0b; --amber-tint:#2e2210;
   --red:#ff6b70; --red-tint:#2e1618;
   --rose:#e39fc0;
+  --iris:#9a97ec; --iris-tint:#1f1e33;
   --chip:#232529;
   --shadow:0 1px 2px rgba(0,0,0,.4), 0 8px 24px rgba(0,0,0,.25);
 }
@@ -89,6 +92,7 @@ code{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:.92em}
 .rail-item.active{background:var(--chip)}
 .rail-item .rdot{width:8px;height:8px;border-radius:99px;background:var(--line);flex-shrink:0}
 .rail-item .rdot.live{background:var(--ocean)} .rail-item .rdot.back{background:var(--sage)}
+.rail-item .rdot.rt{background:var(--iris)}
 .rail-item .rmeta{margin-left:auto;font-size:11px;color:var(--muted);font-weight:500}
 .rail-label{font-size:10.5px;font-weight:700;letter-spacing:.09em;text-transform:uppercase;color:var(--muted);
   margin:16px 0 6px;padding:0 12px}
@@ -145,6 +149,7 @@ pre{background:var(--bg);border:1px solid var(--line);border-radius:12px;padding
 .tile .t-pill .pdot{width:7px;height:7px;border-radius:99px}
 .tile.live .t-pill{background:var(--ocean-tint);color:var(--ocean)} .tile.live .pdot{background:var(--ocean)}
 .tile.back .t-pill{background:var(--sage-tint);color:var(--sage)} .tile.back .pdot{background:var(--sage)}
+.tile.rt .t-pill{background:var(--iris-tint);color:var(--iris)} .tile.rt .pdot{background:var(--iris)}
 .tile .t-hero{font-size:21px;font-weight:650;font-variant-numeric:tabular-nums;letter-spacing:-.01em}
 .tile .t-sub{font-size:12px;color:var(--muted);font-variant-numeric:tabular-nums}
 .tile .t-chips{position:absolute;top:14px;right:14px;display:flex;gap:6px}
@@ -496,6 +501,8 @@ li.open .raw{display:block}
     <span class="rdot live"></span>Orders · Live<span class="rmeta" id="railLiveMeta">—</span></button>
   <button class="rail-item" data-route="stream-back" onclick="go('stream-back')">
     <span class="rdot back"></span>Orders · Backfill<span class="rmeta" id="railBackMeta">—</span></button>
+  <button class="rail-item" data-route="realtime" onclick="go('realtime')">
+    <span class="rdot rt"></span>Status &amp; Customers<span class="rmeta" id="railRtMeta">—</span></button>
   <div class="rail-label">System</div>
   <button class="rail-item" data-route="ledger" onclick="go('ledger')">Ledger<span class="rail-badge" id="ledgerBadge">0</span></button>
   <button class="rail-item" data-route="audit" onclick="go('audit')">Audit</button>
@@ -530,6 +537,20 @@ li.open .raw{display:block}
       <div class="t-hero tnum" id="tileBackHero">—</div>
       <div class="t-sub" id="tileBackSub"></div>
       <svg id="sparkBack" viewBox="0 0 200 30" preserveAspectRatio="none"></svg>
+    </div>
+    <div class="tile rt" id="tileStatus" onclick="go('realtime')">
+      <div class="t-chips" id="tileStatusChips"></div>
+      <div class="t-name">Delivery status</div>
+      <div class="t-pill" id="tileStatusPill"><span class="pdot"></span><span>connecting…</span></div>
+      <div class="t-hero tnum" id="tileStatusHero">—</div>
+      <div class="t-sub" id="tileStatusSub"></div>
+    </div>
+    <div class="tile rt" id="tileCust" onclick="go('realtime')">
+      <div class="t-chips" id="tileCustChips"></div>
+      <div class="t-name">Customer sync</div>
+      <div class="t-pill" id="tileCustPill"><span class="pdot"></span><span>connecting…</span></div>
+      <div class="t-hero tnum" id="tileCustHero">—</div>
+      <div class="t-sub" id="tileCustSub"></div>
     </div>
   </div>
 
@@ -771,6 +792,25 @@ li.open .raw{display:block}
     <div class="card"><p class="eyebrow">Its lanes</p><div id="backLanes"></div></div>
   </div>
   <div class="card"><p class="eyebrow">Recent completions</p><div id="backFeed"></div></div>
+</section>
+
+<!-- ================= REALTIME (v2.7) ================= -->
+<section class="surface" id="surface-realtime">
+  <p class="eyebrow">Realtime streams · webhook-driven, highest precedence after live orders</p>
+  <div class="card">
+    <h2>How these two differ from the order engines</h2>
+    <p class="hint">Make captures each Salla event into a queue tab and stops there. These consumers
+      own the rest: retries, idempotency, alerting and the audit trail. They poll every few seconds
+      and the backfill yields its HubSpot budget to them the moment either has work, so a status
+      change or a new customer never waits behind a historical sweep.</p>
+  </div>
+
+  <div id="rtCards" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:14px;margin-top:14px"></div>
+
+  <div class="card" style="margin-top:14px">
+    <p class="eyebrow">Side effects worth watching</p>
+    <div id="rtExtras" class="hint">—</div>
+  </div>
 </section>
 
 <!-- ================= LEDGER ================= -->
@@ -1017,7 +1057,7 @@ function cycleTheme(){theme=THEMES[(THEMES.indexOf(theme)+1)%3];localStorage.set
 applyTheme();
 
 /* ================= router ================= */
-const ROUTES=["fleet","stream-live","stream-back","ledger","audit","setup"];
+const ROUTES=["fleet","stream-live","stream-back","realtime","ledger","audit","setup"];
 let route="fleet";
 function go(r){route=r;
   document.querySelectorAll(".surface").forEach(s=>s.classList.toggle("active",s.id==="surface-"+r));
@@ -1027,6 +1067,7 @@ function go(r){route=r;
   if(r==="ledger")loadLedger();
   if(r==="setup")refreshState();
   if(r==="fleet")loadRuns();
+  if(r==="realtime")loadRealtime();
 }
 window.addEventListener("hashchange",routeFromHash);
 function routeFromHash(){
@@ -2109,6 +2150,80 @@ setInterval(()=>{if(route==="audit")loadEvents();},7000);
 setInterval(loadRuns,30000);
 loadCredits();setInterval(loadCredits,60000);
 loadDrain();setInterval(loadDrain,5000);
+
+/* ================= REALTIME STREAMS (v2.7) =================
+   Delivery-status relay + customer sync. Everything the endpoint returns is
+   read from local files on the box, so this polls cheaply and keeps working
+   with the engines stopped. One renderer drives both the Fleet tiles and the
+   Realtime surface: the two views must never disagree about a stream. */
+let rtData=null;
+function rtVerdict(s){
+  if(s.paused)   return {word:"paused",  cls:"off"};
+  if(!s.running) return {word:"stopped", cls:"off"};
+  if(s.active)   return {word:"working", cls:"on"};
+  return {word:"watching", cls:"on"};
+}
+function rtTile(prefix,s){
+  const pill=document.getElementById(prefix+"Pill");
+  const hero=document.getElementById(prefix+"Hero");
+  const sub=document.getElementById(prefix+"Sub");
+  const chips=document.getElementById(prefix+"Chips");
+  if(!pill)return;
+  const v=rtVerdict(s);
+  pill.innerHTML='<span class="pdot"></span><span>'+v.word+'</span>';
+  pill.style.opacity=(v.cls==="off")?.55:1;
+  hero.textContent=(s.applied_today||0).toLocaleString();
+  sub.textContent=(s.applied_total||0).toLocaleString()+" all-time"+
+    (s.queue_depth!=null?" · queue "+s.queue_depth:"");
+  chips.innerHTML=(s.queue_depth>0)?'<span class="heldchip">'+s.queue_depth+' waiting</span>':"";
+}
+function loadRealtime(){
+  fetch("/api/realtime").then(r=>r.json()).then(d=>{
+    rtData=d;
+    rtTile("tileStatus",d.status||{});
+    rtTile("tileCust",d.customers||{});
+    const meta=document.getElementById("railRtMeta");
+    if(meta){
+      const a=(d.status&&d.status.applied_today)||0, b=(d.customers&&d.customers.applied_today)||0;
+      meta.textContent=(a+b)+" today";
+    }
+    const box=document.getElementById("rtCards");
+    if(box){
+      box.innerHTML=["status","customers"].map(k=>{
+        const s=d[k]||{}, v=rtVerdict(s);
+        const rows=[
+          ["Applied today", (s.applied_today||0).toLocaleString()],
+          ["All-time", (s.applied_total||0).toLocaleString()],
+          ["Queue right now", s.queue_depth==null?"—":s.queue_depth],
+          ["Signal age", s.signal_age_s==null?"—":s.signal_age_s+"s"],
+        ].map(r=>'<div style="display:flex;justify-content:space-between;padding:4px 0;'+
+          'border-bottom:1px solid var(--line-soft)"><span class="muted" style="font-size:12px">'+
+          r[0]+'</span><span class="tnum" style="font-size:13px;font-weight:600">'+r[1]+
+          '</span></div>').join("");
+        const recent=(s.recent||[]).slice(-5).map(l=>
+          '<div style="font-size:11px;color:var(--muted);font-family:ui-monospace,Menlo,monospace;'+
+          'white-space:nowrap;overflow:hidden;text-overflow:ellipsis">'+esc(l)+'</div>').join("")
+          || '<div class="hint">no activity recorded yet</div>';
+        return '<div class="card"><p class="eyebrow">'+esc(s.label||k)+'</p>'+
+          '<div class="t-pill" style="background:var(--iris-tint);color:var(--iris);'+
+          'display:inline-flex;align-items:center;gap:6px;border-radius:99px;padding:2px 10px;'+
+          'font-size:12px;font-weight:650;margin:0 0 10px;opacity:'+(v.cls==="off"?.55:1)+'">'+
+          '<span class="pdot" style="width:7px;height:7px;border-radius:99px;background:var(--iris)">'+
+          '</span><span>'+v.word+'</span></div>'+rows+
+          '<p class="eyebrow" style="margin-top:12px">Recent</p>'+recent+'</div>';
+      }).join("");
+    }
+    const ex=document.getElementById("rtExtras");
+    if(ex&&d.extras){
+      ex.innerHTML="Contact merges performed: <b>"+d.extras.contact_merges+"</b> "+
+        "(<code>mirror/contact_merges.csv</code>) &nbsp;·&nbsp; "+
+        "Legacy catalog records: <b>"+d.extras.legacy_records+"</b> "+
+        "(<code>mirror/legacy_created.csv</code>). HubSpot merges cannot be undone, "+
+        "so a wrong pairing is worth catching the same day.";
+    }
+  }).catch(()=>{});
+}
+loadRealtime();setInterval(loadRealtime,5000);
 
 initStreams();refreshState();loadRuns();loadLedger();pollCursor();routeFromHash();buildPresets();
 </script>

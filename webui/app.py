@@ -41,6 +41,31 @@ LIVEPID = ROOT / "live.pid"
 DRAINLOG = ROOT / "drain.log"        # v2.3 queue drain
 DRAINSTOP = ROOT / "STOP.drain"
 MATRIX = ROOT / "mirror" / "blocker_matrix.csv"
+# v2.7 realtime streams: one log, one STOP file, one activity signal and one
+# append-only ledger each. Everything the UI shows for them comes from these
+# local files, so the panel costs no API calls and works with the engines off.
+STREAMS = {
+    "status": {
+        "label": "Delivery status",
+        "log": ROOT / "status_relay.log",
+        "stop": ROOT / "STOP.status",
+        "signal": ROOT / "mirror" / "live_active_status.json",
+        "ledger": ROOT / "mirror" / "status_applied.csv",
+        "proc": r"status_relay\.py",
+        "unit": "salla-status-relay",
+    },
+    "customers": {
+        "label": "Customer sync",
+        "log": ROOT / "customer_sync.log",
+        "stop": ROOT / "STOP.customers",
+        "signal": ROOT / "mirror" / "live_active_customers.json",
+        "ledger": ROOT / "mirror" / "customers.csv",
+        "proc": r"customer_sync\.py",
+        "unit": "salla-customer-sync",
+    },
+}
+MERGES = ROOT / "mirror" / "contact_merges.csv"
+LEGACY_CREATED = ROOT / "mirror" / "legacy_created.csv"
 
 
 def _env():
@@ -988,6 +1013,73 @@ def create_app():
             "naive_credits": naive,
             "saved_usd": max(0.0, (naive - engine_credits) / 1000.0),
         })
+
+    # ---- realtime streams (v2.7) -------------------------------------------
+    # Delivery-status relay and customer sync. Both are queue-tab consumers
+    # with the same operational shape, so one endpoint serves both and the UI
+    # renders them from the same template.
+
+    @app.get("/api/realtime")
+    def realtime_state():
+        out = {}
+        for key, s in STREAMS.items():
+            sig, depth, active, sig_age = {}, None, False, None
+            try:
+                sig = json.loads(s["signal"].read_text())
+                depth = sig.get("depth")
+                sig_age = max(0, int(time.time() - float(sig.get("ts", 0))))
+                active = bool(sig.get("active")) and sig_age < 60
+            except (OSError, json.JSONDecodeError, ValueError, TypeError):
+                pass
+            rows_today, rows_total = 0, 0
+            today = datetime.now().strftime("%Y-%m-%d")
+            try:
+                with open(s["ledger"], newline="", encoding="utf-8",
+                          errors="replace") as f:
+                    for row in csv.DictReader(f):
+                        rows_total += 1
+                        if (row.get("ts") or "")[:10] == today:
+                            rows_today += 1
+            except OSError:
+                pass
+            recent = []
+            try:
+                with open(s["log"], "rb") as f:
+                    f.seek(0, 2)
+                    f.seek(max(0, f.tell() - 16384))
+                    for line in f.read().decode("utf-8", "replace").splitlines():
+                        if any(t in line for t in ("STATUS applied",
+                                                   "CUSTOMER created",
+                                                   "CUSTOMER updated",
+                                                   "QUEUE depth")):
+                            recent.append(line[:160])
+                recent = recent[-8:]
+            except OSError:
+                pass
+            out[key] = {
+                "label": s["label"],
+                "running": bool(_procs_matching(s["proc"])),
+                "paused": s["stop"].exists(),
+                "active": active,
+                "queue_depth": depth,
+                "signal_age_s": sig_age,
+                "applied_today": rows_today,
+                "applied_total": rows_total,
+                "log_present": s["log"].exists(),
+                "last": _tail_line(s["log"]) if s["log"].exists() else "",
+                "recent": recent,
+            }
+        # cross-stream extras worth surfacing next to them
+        def _count(p):
+            try:
+                with open(p, newline="", encoding="utf-8",
+                          errors="replace") as f:
+                    return max(0, sum(1 for _ in f) - 1)
+            except OSError:
+                return 0
+        out["extras"] = {"contact_merges": _count(MERGES),
+                         "legacy_records": _count(LEGACY_CREATED)}
+        return jsonify(out)
 
     # ---- queue drain (v2.3) ------------------------------------------------
     # The drain releases catalog-held orders from the Queue Log. Everything
