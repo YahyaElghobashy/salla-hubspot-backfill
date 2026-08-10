@@ -258,6 +258,32 @@ class TestCustomerSync(unittest.TestCase):
                          1)
 
 
+class TestTwinCollapse(unittest.TestCase):
+    """Regression: a second row for the same ORDER is a different status
+    event and must be applied, not collapsed. A second row for the same
+    CUSTOMER is a replayed webhook and must be collapsed."""
+
+    def test_status_relay_does_not_collapse(self):
+        import status_relay
+        self.assertFalse(status_relay.StatusRelay.collapse_twins)
+
+    def test_customer_sync_collapses(self):
+        import customer_sync
+        self.assertTrue(customer_sync.CustomerSync.collapse_twins)
+
+    def test_two_status_events_one_order_both_apply(self):
+        _chdir_tmp(self)
+        import status_relay
+        hs = FakeHS()
+        hs.orders["101"] = {"id": "H1", "stage": "st-OLD"}
+        r = status_relay.StatusRelay(_cfg(), hs, FakeGIO(), live=True)
+        s1, _ = r.handle_row(_row(event="status:shipped@2026-08-10T10:00:00"))
+        s2, _ = r.handle_row(_row(event="status:delivered@2026-08-10T11:00:00"))
+        self.assertEqual((s1, s2), ("done", "done"))
+        self.assertEqual([p[1]["hs_pipeline_stage"] for p in hs.patches],
+                         ["st-SHP", "st-DEL"])
+
+
 class TestYieldGlob(unittest.TestCase):
     def test_backfill_yields_to_any_realtime_signal(self):
         tmp = tempfile.TemporaryDirectory()

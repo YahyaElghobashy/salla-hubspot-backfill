@@ -62,6 +62,13 @@ class RealtimeConsumer:
     name = "base"
     #: terminal states a row can rest in (never re-claimed)
     terminal = ("done", "gone", "superseded", "error-final")
+    #: Collapse repeat rows for the same entity id within one cycle?
+    #: TRUE where a second row means a duplicate delivery of the SAME event
+    #: (customer.created replayed by the webhook). FALSE where several rows
+    #: for one id are genuinely DIFFERENT events that must each be applied in
+    #: order (an order moving under_review -> completed). Getting this wrong
+    #: silently discards real events, so subclasses declare it explicitly.
+    collapse_twins = True
 
     def __init__(self, cfg, hs, gio, tab, live=True):
         self.cfg, self.hs, self.gio = cfg, hs, gio
@@ -200,9 +207,14 @@ class RealtimeConsumer:
                 if claim:
                     log.info("%s QUEUE depth=%d", self.name.upper(), len(claim))
                 # duplicate ids inside one cycle: first row wins, twins inherit
+                # -- but only for streams where a repeat id means a repeat of
+                # the same event (see collapse_twins).
                 seen, primaries, twins = set(), [], []
                 for r in claim:
-                    (twins if r["order_id"] in seen else primaries).append(r)
+                    if self.collapse_twins and r["order_id"] in seen:
+                        twins.append(r)
+                    else:
+                        primaries.append(r)
                     seen.add(r["order_id"])
                 outcome = {}
                 for r in primaries:

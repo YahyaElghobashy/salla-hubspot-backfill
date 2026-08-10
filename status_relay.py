@@ -82,6 +82,10 @@ class StatusLedger:
 
 class StatusRelay(RealtimeConsumer):
     name = "status"
+    # An order legitimately produces several status events (under_review ->
+    # completed). Collapsing them would apply only the first and silently
+    # discard the rest; the ledger's event-ts guard already handles ordering.
+    collapse_twins = False
 
     def __init__(self, cfg, hs, gio, live=True):
         super().__init__(cfg, hs, gio, tab=cfg.status_queue_tab, live=live)
@@ -129,16 +133,19 @@ class StatusRelay(RealtimeConsumer):
         except Exception as e:
             log.warning("status alert failed: %s", e)
 
-    def _exception_row(self, row, slug, why, action):
+    def _exception_row(self, row, slug, why, action, hs_order_id=""):
         """Client-visible surface stays identical to the Make design: one row
         in the Delivery Status Exceptions tab of the audit workbook."""
         if not self.live:
             return
         try:
+            # column order matches the tab the Make design established:
+            # ts | salla order | reference | slug | status name | type |
+            # action | hubspot order id (blank when we never found one)
             self.gio.queue_append_rows(
                 self.cfg.spreadsheet_id,
                 [[now_str(), row["order_id"], row["reference_id"], slug,
-                  row.get("note", ""), why, action, "engine"]],
+                  row.get("note", ""), why, action, hs_order_id or ""]],
                 tab=EXCEPTIONS_TAB)
         except Exception as e:
             log.warning("exceptions tab append failed: %s", e)
@@ -160,6 +167,8 @@ class StatusRelay(RealtimeConsumer):
                         f"Delivery Status Exceptions tab; the stage was NOT "
                         f"changed. Add the mapping and the next event will "
                         f"apply cleanly.")
+            log.error("STATUS unmapped slug %r on order %s -- logged to the "
+                      "exceptions tab, stage unchanged", slug, oid)
             return "error-final", f"unmapped status {slug}"
 
         if not self.ledger.newer_than_applied(oid, event_ts):
@@ -171,7 +180,8 @@ class StatusRelay(RealtimeConsumer):
             if attempts >= len(self.ladder):
                 self._exception_row(row, slug, "Order not in HubSpot after "
                                     f"{attempts} retries over ~8h",
-                                    "Check whether the order is held/failed")
+                                    "Check whether the order is held/failed",
+                                    hs_order_id="")
                 self._alert("order-missing",
                             "🟠 Status events arriving for orders HubSpot "
                             "does not have",
@@ -182,6 +192,8 @@ class StatusRelay(RealtimeConsumer):
                             f"tab and will apply automatically if the order "
                             f"appears later via drain/backfill (stage is "
                             f"baked in at creation).")
+                log.error("STATUS order %s absent from HubSpot after %d "
+                          "retries -- giving up on %r", oid, attempts, slug)
                 return "error-final", f"order absent after {attempts} tries"
             nb = time.time() + self.ladder[min(attempts, len(self.ladder) - 1)]
             return "deferred", f"order not in HS yet nb={int(nb)} ({slug})"
