@@ -314,7 +314,8 @@ class QueueDrainEngine(Engine):
                 with self._gate_lock:
                     ok = self._gate_cache.get(key)
                 if ok is None:
-                    ok = bool(sku) and self.hs.gate_search_product_by_sku(sku) > 0
+                    ok = bool(sku) and self.hs.gate_search_product_by_sku(
+                        [sku, self._legacy_sku(sku)]) > 0
                     with self._gate_lock:
                         self._gate_cache[key] = ok
                 if not ok:
@@ -322,7 +323,8 @@ class QueueDrainEngine(Engine):
                         "id": item.get("id"), "pid": "",
                         "name": item.get("name", ""),
                         "why": ("product deleted in Salla -- create+approve a "
-                                "legacy record with hs_sku=" + (sku or "?"))})
+                                "legacy record with hs_sku="
+                                + (self._legacy_sku(sku) if sku else "?"))})
                 continue
             pid = str(pid_raw)
             with self._gate_lock:

@@ -451,6 +451,14 @@ class Config:
     credit_alert_thresholds: tuple = (50000, 10000, 1000)
     # ---- v2.4 slack reporter --------------------------------------------
     report_interval_minutes: float = 30.0
+    # ---- v2.6 legacy auto-resolver (deleted-in-Salla products) ----------
+    # The prefix namespaces every record the resolver creates: live Salla
+    # listings will never mint an "LGCY-" SKU, so auto-created records can
+    # never collide with any SKU the store defines later.
+    legacy_sku_prefix: str = "LGCY-"
+    legacy_auto_enabled: bool = True
+    legacy_auto_threshold: int = 300
+    legacy_auto_min_consistency: float = 0.9
 
     @staticmethod
     def load(path):
@@ -787,21 +795,25 @@ class HubSpot:
             "properties": ["hs_object_id"], "limit": 1}, "gate product")
         return int(data.get("total", 0))
 
-    def gate_search_product_by_sku(self, sku):
-        """[M211S] Legacy resolution: products with hs_sku = sku AND approved.
+    def gate_search_product_by_sku(self, skus):
+        """[M211S] Legacy resolution: approved product whose hs_sku is any of
+        `skus` (a string or a list -- typically [bare sku, namespaced sku]).
 
         Consulted only when the payload's product object is null -- Salla
         deleted the product from its catalog, so item.product.id is gone and
         the id-based gate would search for "0" and hold the order forever.
-        The line item still carries the SKU, and a legacy catalog record
-        (hs_sku set, salla_product_id deliberately EMPTY) represents it in
-        HubSpot. The empty salla_product_id keeps legacy records invisible to
-        every id-based path, so a future re-created Salla product with a fresh
-        id can never collide with them.
+        The line item still carries the SKU. Two kinds of record can answer:
+        the store's own product that happens to carry the bare SKU (their
+        catalog knowledge, preferred), or a legacy record we created in the
+        LGCY namespace (hs_sku prefixed, salla_product_id deliberately EMPTY
+        so no id-based path can ever collide with a future Salla product).
         """
+        if isinstance(skus, str):
+            skus = [skus]
         data = self.search("/crm/v3/objects/products/search", {
             "filterGroups": [{"filters": [
-                {"propertyName": "hs_sku", "operator": "EQ", "value": str(sku)},
+                {"propertyName": "hs_sku", "operator": "IN",
+                 "values": [str(x) for x in skus]},
                 {"propertyName": "catalog_approval_status", "operator": "EQ",
                  "value": "approved"}]}],
             "properties": ["hs_object_id"], "limit": 1}, "gate product by sku")
@@ -831,15 +843,20 @@ class HubSpot:
             "limit": 1}, "item product")
         return data
 
-    def item_search_product_by_sku(self, sku):
-        """[M101S] Full legacy product record by hs_sku, for line-item build."""
+    def item_search_product_by_sku(self, skus):
+        """[M101S] Full record for line-item build, by hs_sku IN candidates.
+        Returns up to 2 so the caller can prefer the store's own bare-SKU
+        record over a namespaced legacy one when both exist."""
+        if isinstance(skus, str):
+            skus = [skus]
         data = self.search("/crm/v3/objects/products/search", {
             "filterGroups": [{"filters": [
-                {"propertyName": "hs_sku", "operator": "EQ", "value": str(sku)},
+                {"propertyName": "hs_sku", "operator": "IN",
+                 "values": [str(x) for x in skus]},
                 {"propertyName": "catalog_approval_status", "operator": "EQ",
                  "value": "approved"}]}],
             "properties": ["hs_object_id", "hs_sku", "name", "salla_product_id"],
-            "limit": 1}, "item product by sku")
+            "limit": 2}, "item product by sku")
         return data
 
     def item_search_template(self, salla_product_id, eligible_only):
@@ -986,6 +1003,15 @@ class HubSpot:
     def patch_order(self, order_id, props, what):
         return self._write("PATCH", f"/crm/v3/objects/orders/{order_id}",
                            {"properties": props}, what)
+
+    def create_product(self, props, what):
+        """[M400] Create a product record (v2.6 legacy auto-resolver)."""
+        status, data = self._write("POST", "/crm/v3/objects/products",
+                                   {"properties": props}, what)
+        if status not in (200, 201):
+            log.error("%s failed (%s): %s", what, status, json.dumps(data)[:300])
+            return None
+        return data.get("id")
 
     def create_line_item(self, props, what):
         status, data = self._write("POST", "/crm/v3/objects/line_items",
@@ -1458,6 +1484,9 @@ class Engine:
         # to False so real-time orders are stamped "No". (self.live is the
         # dry-run flag -- true for both modes -- so it can't drive this.)
         self.is_live_sync = False
+        # v2.6 auto-resolver for deleted-in-Salla blockers. Attached by main()
+        # for backfill runs only; None leaves every path exactly as before.
+        self.legacy = None
         # v2.2 outage detection. Attached by main()/LiveEngine when the
         # optional relay_health + notify modules import cleanly; None means
         # the engine behaves exactly as before, just without alerting.
@@ -1565,6 +1594,13 @@ class Engine:
             return True
         return False
 
+    def _legacy_sku(self, sku):
+        """Item SKU -> legacy-record hs_sku. One namespace rule for the gate,
+        line items, the drain and the auto-resolver. The prefix guarantees a
+        record created today can never collide with a SKU the store mints on
+        a real Salla listing later."""
+        return f"{getattr(self.cfg, 'legacy_sku_prefix', 'LGCY-')}{sku}"
+
     # -- verification gate [M209..M215] ---------------------------------------
 
     def gate_unverified_items(self, order):
@@ -1581,9 +1617,10 @@ class Engine:
                 # Salla deleted this product: the id searches below would run
                 # against "0" and hold the order forever. The SKU is the only
                 # identity the payload still carries -- resolve it against the
-                # approved legacy records instead. [M211S]
+                # approved legacy records, in the legacy namespace. [M211S]
                 sku = str(item.get("sku") or "").strip()
-                if sku and self.hs.gate_search_product_by_sku(sku) > 0:
+                if sku and self.hs.gate_search_product_by_sku(
+                        [sku, self._legacy_sku(sku)]) > 0:
                     continue
                 unverified.append({"id": item.get("id"),
                                    "name": item.get("name", "")})
@@ -1599,6 +1636,21 @@ class Engine:
 
     def route_held(self, order, audit_row, unverified):
         self._bump("held")
+        # v2.6: feed the auto-resolver -- backfill only, null-product items
+        # only. Items with a real product id are genuine catalog-approval
+        # decisions and stay with humans.
+        if self.legacy is not None and not self.is_live_sync:
+            for item in order.get("items", []) or []:
+                if str(item.get("product_type", "")).lower() == "group_products":
+                    continue
+                if dig(item, "product.id"):
+                    continue
+                item = dict(item)
+                item["_legacy_price"] = dig(item, "amounts.original_price.amount")
+                try:
+                    self.legacy.observe(str(order.get("id")), item)
+                except Exception as exc:
+                    log.warning("legacy observe failed: %s", exc)
         upd = {11: "Held for Review", 12: "Items not yet approved in catalog",
                13: "FALSE", 19: "N/A", 20: "N/A", 21: "N/A", 22: "N/A", 23: "N/A",
                24: "Queued", 25: now_str()}
@@ -1761,8 +1813,12 @@ class Engine:
             # sent as nulls; salla_product_id is omitted so nothing id-based
             # ever matches a legacy line.
             sku = str(item.get("sku") or "").strip()
-            ps = self.hs.item_search_product_by_sku(sku) if sku else {}
-            ps_first = (ps.get("results") or [{}])[0]
+            ps = (self.hs.item_search_product_by_sku(
+                      [sku, self._legacy_sku(sku)]) if sku else {})
+            results = ps.get("results") or []
+            # the store's own bare-SKU record wins over our legacy namespace
+            results.sort(key=lambda r: dig(r, "properties.hs_sku", "") != sku)
+            ps_first = (results or [{}])[0]
             if int(ps.get("total", 0) or 0) > 0:
                 price = str(dig(item, "amounts.price_without_tax.amount"))
                 props = {
