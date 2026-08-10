@@ -203,12 +203,16 @@ class CustomerSync(RealtimeConsumer):
             if status not in (200, 201):
                 return "error", f"create failed HTTP {status}"
             contact_id = str(data.get("id"))
-            self.ledger.record(cid, contact_id, "created")
+            if self.live:
+                self.ledger.record(cid, contact_id, "created")
             log.info("CUSTOMER created %s -> contact %s", cid, contact_id)
             return "done", f"created contact {contact_id}"
 
         if len(hits) >= 2:
-            if self.auto_merge:
+            if not self.live:
+                log.info("DRY RUN would merge %s <- %s (customer %s)",
+                         hits[0].get("id"), hits[1].get("id"), cid)
+            elif self.auto_merge:
                 if not self._merge(hits[0], hits[1], cid):
                     return "error", "merge failed"
             else:
@@ -228,7 +232,8 @@ class CustomerSync(RealtimeConsumer):
             {"properties": props}, "contact update")
         if status not in (200, 201):
             return "error", f"update failed HTTP {status}"
-        self.ledger.record(cid, target, "updated")
+        if self.live:
+            self.ledger.record(cid, target, "updated")
         log.info("CUSTOMER updated %s -> contact %s", cid, target)
         return "done", f"updated contact {target}"
 

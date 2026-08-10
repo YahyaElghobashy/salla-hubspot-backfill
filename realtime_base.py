@@ -202,23 +202,31 @@ class RealtimeConsumer:
                 for r in primaries:
                     if self._should_stop():
                         break
-                    if not self.live:
-                        log.info("DRY RUN %s: would handle row %s id %s (%s)",
-                                 self.name, r["row"], r["order_id"], r["event"])
-                        continue
                     try:
+                        # Dry-run still runs the real decision: the HubSpot
+                        # client skips writes but performs every search, and
+                        # the subclasses skip their ledger appends. That makes
+                        # a dry pass a genuine rehearsal against live data,
+                        # which is what the parallel-validation window needs --
+                        # a run that only logged "would handle row" would prove
+                        # nothing about the logic.
                         state, note = self.handle_row(r)
                     except Exception as e:
                         log.exception("%s row %s failed: %s",
                                       self.name, r["row"], e)
                         state, note = "error", f"{type(e).__name__}: {e}"[:180]
                     outcome[r["order_id"]] = (state, note)
+                    if not self.live:
+                        log.info("DRY RUN %s row %s id %s (%s) -> %s | %s",
+                                 self.name, r["row"], r["order_id"],
+                                 r["event"][:40], state, note[:90])
+                        continue
                     self.gio.queue_mark(self.qsid, r["row"], r["order_id"],
                                         state, r["attempts"] + 1, note,
                                         tab=self.tab)
                 for r in twins:
                     st, note = outcome.get(r["order_id"], (None, None))
-                    if st:
+                    if st and self.live:
                         self.gio.queue_mark(self.qsid, r["row"], r["order_id"],
                                             st, r["attempts"], f"twin: {note}",
                                             tab=self.tab)

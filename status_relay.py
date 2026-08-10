@@ -190,14 +190,16 @@ class StatusRelay(RealtimeConsumer):
                     or hs_order.get("id"))
         current = str(dig(hs_order, "properties.hs_pipeline_stage") or "")
         if current == stage:
-            self.ledger.record(oid, slug, stage, hs_id, event_ts)
+            if self.live:
+                self.ledger.record(oid, slug, stage, hs_id, event_ts)
             return "superseded", f"stage already {slug} (creation baked it in)"
 
         status, _ = self.hs.update_order(hs_id, {"hs_pipeline_stage": stage},
                                          f"status {slug} -> order {hs_id}")
         if status not in (200, 201):
             return "error", f"PATCH failed HTTP {status}"
-        self.ledger.record(oid, slug, stage, hs_id, event_ts)
+        if self.live:
+            self.ledger.record(oid, slug, stage, hs_id, event_ts)
         log.info("STATUS applied %s -> %s (HS %s, stage %s)",
                  oid, slug, hs_id, stage[:12])
         return "done", f"{slug} applied"
