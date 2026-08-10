@@ -101,6 +101,12 @@ class RealtimeConsumer:
     # -- single-instance heartbeat (per tab) -------------------------------------
 
     def _heartbeat_ok(self):
+        # A dry rehearsal must never claim the tab: it neither reads the guard
+        # nor writes one. Writing it would lock the real consumer out for the
+        # full stale window (300s) after every rehearsal, which is exactly the
+        # kind of self-inflicted outage this guard exists to prevent.
+        if not self.live:
+            return True
         now = time.monotonic()
         if now - self._last_hb < 60:
             return True
