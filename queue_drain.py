@@ -305,7 +305,26 @@ class QueueDrainEngine(Engine):
         for item in order.get("items", []) or []:
             if str(item.get("product_type", "")).lower() == "group_products":
                 continue
-            pid = str(dig(item, "product.id"))
+            pid_raw = dig(item, "product.id")
+            if not pid_raw:
+                # Product deleted in Salla: id-based gate would hold forever.
+                # Resolve by SKU against approved legacy records. [M211S]
+                sku = str(item.get("sku") or "").strip()
+                key = "sku:" + (sku or "-")
+                with self._gate_lock:
+                    ok = self._gate_cache.get(key)
+                if ok is None:
+                    ok = bool(sku) and self.hs.gate_search_product_by_sku(sku) > 0
+                    with self._gate_lock:
+                        self._gate_cache[key] = ok
+                if not ok:
+                    unverified.append({
+                        "id": item.get("id"), "pid": "",
+                        "name": item.get("name", ""),
+                        "why": ("product deleted in Salla -- create+approve a "
+                                "legacy record with hs_sku=" + (sku or "?"))})
+                continue
+            pid = str(pid_raw)
             with self._gate_lock:
                 res = self._gate_cache.get(pid)
             if res is None:

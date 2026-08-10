@@ -787,6 +787,26 @@ class HubSpot:
             "properties": ["hs_object_id"], "limit": 1}, "gate product")
         return int(data.get("total", 0))
 
+    def gate_search_product_by_sku(self, sku):
+        """[M211S] Legacy resolution: products with hs_sku = sku AND approved.
+
+        Consulted only when the payload's product object is null -- Salla
+        deleted the product from its catalog, so item.product.id is gone and
+        the id-based gate would search for "0" and hold the order forever.
+        The line item still carries the SKU, and a legacy catalog record
+        (hs_sku set, salla_product_id deliberately EMPTY) represents it in
+        HubSpot. The empty salla_product_id keeps legacy records invisible to
+        every id-based path, so a future re-created Salla product with a fresh
+        id can never collide with them.
+        """
+        data = self.search("/crm/v3/objects/products/search", {
+            "filterGroups": [{"filters": [
+                {"propertyName": "hs_sku", "operator": "EQ", "value": str(sku)},
+                {"propertyName": "catalog_approval_status", "operator": "EQ",
+                 "value": "approved"}]}],
+            "properties": ["hs_object_id"], "limit": 1}, "gate product by sku")
+        return int(data.get("total", 0))
+
     def gate_search_template(self, salla_product_id, eligible_only):
         """[M213]/[M214] bundle template search on the template custom object."""
         if not OBJ_BUNDLE_TEMPLATE:
@@ -809,6 +829,17 @@ class HubSpot:
                                            "value": str(salla_product_id)}]}],
             "properties": ["hs_object_id", "hs_sku", "name", "salla_product_id"],
             "limit": 1}, "item product")
+        return data
+
+    def item_search_product_by_sku(self, sku):
+        """[M101S] Full legacy product record by hs_sku, for line-item build."""
+        data = self.search("/crm/v3/objects/products/search", {
+            "filterGroups": [{"filters": [
+                {"propertyName": "hs_sku", "operator": "EQ", "value": str(sku)},
+                {"propertyName": "catalog_approval_status", "operator": "EQ",
+                 "value": "approved"}]}],
+            "properties": ["hs_object_id", "hs_sku", "name", "salla_product_id"],
+            "limit": 1}, "item product by sku")
         return data
 
     def item_search_template(self, salla_product_id, eligible_only):
@@ -1546,6 +1577,17 @@ class Engine:
             if ptype.lower() == "group_products":
                 continue
             pid = dig(item, "product.id")
+            if not pid:
+                # Salla deleted this product: the id searches below would run
+                # against "0" and hold the order forever. The SKU is the only
+                # identity the payload still carries -- resolve it against the
+                # approved legacy records instead. [M211S]
+                sku = str(item.get("sku") or "").strip()
+                if sku and self.hs.gate_search_product_by_sku(sku) > 0:
+                    continue
+                unverified.append({"id": item.get("id"),
+                                   "name": item.get("name", "")})
+                continue
             p = self.hs.gate_search_product_approved(pid)      # [M211]
             te = self.hs.gate_search_template(pid, True)       # [M213]
             ta = self.hs.gate_search_template(pid, False)      # [M214]
@@ -1711,6 +1753,44 @@ class Engine:
         oid = str(order.get("id"))
         pid = dig(item, "product.id")
         ptype = str(item.get("product_type", ""))
+        if not pid and ptype != "group_products":
+            # Route 30.4: legacy standalone [M110S] -- the product was deleted
+            # in Salla (product=null in the payload), so the item is resolved
+            # by SKU against an approved legacy catalog record. hs_url/images
+            # are unknowable for a deleted product and are omitted rather than
+            # sent as nulls; salla_product_id is omitted so nothing id-based
+            # ever matches a legacy line.
+            sku = str(item.get("sku") or "").strip()
+            ps = self.hs.item_search_product_by_sku(sku) if sku else {}
+            ps_first = (ps.get("results") or [{}])[0]
+            if int(ps.get("total", 0) or 0) > 0:
+                price = str(dig(item, "amounts.price_without_tax.amount"))
+                props = {
+                    "hs_sku": item.get("sku", ""),
+                    "salla_sku": item.get("sku", ""),
+                    "quantity": str(item.get("quantity", "")),
+                    "salla_order_id": oid,
+                    "salla_order_item_id": str(item.get("id", "")),
+                    "hs_line_item_currency_code": item.get("currency", ""),
+                    "name": dig(ps_first, "properties.name", item.get("name", "")),
+                    "price": price, "sale_context": "standalone_product",
+                    "salla_currency": item.get("currency", ""),
+                    "reporting_product_key": item.get("sku", ""),
+                    "revenue_attribution_method": "standalone_revenue",
+                }
+                li = self.hs.create_line_item(props, "LI legacy sku")
+                if not li:
+                    self.flag_partial(order_id, "Module 110S: Create LI legacy",
+                                      "create failed")
+                    return
+                self._bump("li_standalone")
+                self.hs.patch_line_item(li, {"hs_product_id": ps_first.get("id", "")},
+                                        "stamp product on LI")        # [M232]
+                self.hs.associate("order", "line_items", order_id, li,
+                                  ASSOC_ORDER_LI, "HUBSPOT_DEFINED",
+                                  "assoc order LI")                   # [M111]
+                return
+            # unresolved null-product item: fall through, [M140] needs_review
         # [M101/M102/M103/M104]
         p = self.hs.item_search_product(pid)
         p_total = int(p.get("total", 0))

@@ -620,3 +620,93 @@ class TestNotifySafety(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+class TestLegacySkuGate(unittest.TestCase):
+    """v2.5: items whose Salla product was deleted (product=null in the
+    payload) resolve by SKU against approved legacy records instead of holding
+    forever on a search for id "0". Discovered on 46k held orders where every
+    top blocker was a deleted product."""
+
+    class FakeHS:
+        def __init__(self, sku_hits=(), pid_approved=(), tmpl=()):
+            self.sku_hits = set(sku_hits)
+            self.pid_approved = set(pid_approved)
+            self.tmpl = set(tmpl)
+            self.sku_queries = []
+
+        def gate_search_product_by_sku(self, sku):
+            self.sku_queries.append(sku)
+            return 1 if str(sku) in self.sku_hits else 0
+
+        def gate_search_product_approved(self, pid):
+            return 1 if str(pid) in self.pid_approved else 0
+
+        def gate_search_template(self, pid, eligible_only):
+            return 1 if str(pid) in self.tmpl else 0
+
+    @staticmethod
+    def _gate(hs, order):
+        import backfill
+        pl = backfill.Engine.__new__(backfill.Engine)
+        pl.hs = hs
+        return backfill.Engine.gate_unverified_items(pl, order)
+
+    @staticmethod
+    def _item(pid=None, sku="C41", name="Multi Styler", ptype="product"):
+        product = {"id": pid} if pid is not None else None
+        return {"id": 7, "name": name, "sku": sku, "product_type": ptype,
+                "product": product}
+
+    def test_null_product_with_matching_legacy_sku_passes(self):
+        hs = self.FakeHS(sku_hits={"C41"})
+        out = self._gate(hs, {"items": [self._item()]})
+        self.assertEqual(out, [])
+        self.assertEqual(hs.sku_queries, ["C41"])
+
+    def test_null_product_without_legacy_record_still_holds(self):
+        hs = self.FakeHS(sku_hits=set())
+        out = self._gate(hs, {"items": [self._item()]})
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0]["name"], "Multi Styler")
+
+    def test_null_product_and_empty_sku_holds_without_searching(self):
+        hs = self.FakeHS(sku_hits={"C41"})
+        out = self._gate(hs, {"items": [self._item(sku="")]})
+        self.assertEqual(len(out), 1)
+        self.assertEqual(hs.sku_queries, [])
+
+    def test_present_pid_never_touches_the_sku_path(self):
+        hs = self.FakeHS(sku_hits={"C41"}, pid_approved={"123"})
+        out = self._gate(hs, {"items": [self._item(pid=123)]})
+        self.assertEqual(out, [])
+        self.assertEqual(hs.sku_queries, [])
+
+    def test_group_products_items_stay_exempt(self):
+        hs = self.FakeHS()
+        out = self._gate(hs, {"items": [self._item(ptype="group_products")]})
+        self.assertEqual(out, [])
+
+    def test_drain_gate_same_fallback_with_cache(self):
+        import queue_drain
+        hs = self.FakeHS(sku_hits={"C41"})
+        dr = queue_drain.QueueDrainEngine.__new__(queue_drain.QueueDrainEngine)
+        dr.hs = hs
+        import threading as _t
+        dr._gate_cache, dr._gate_lock = {}, _t.Lock()
+        order = {"items": [self._item(), self._item()]}
+        out = queue_drain.QueueDrainEngine.gate_cached(dr, order)
+        self.assertEqual(out, [])
+        # second identical item answered from cache, not a second search
+        self.assertEqual(hs.sku_queries, ["C41"])
+
+    def test_drain_gate_unresolved_names_the_sku_in_why(self):
+        import queue_drain
+        hs = self.FakeHS()
+        dr = queue_drain.QueueDrainEngine.__new__(queue_drain.QueueDrainEngine)
+        dr.hs = hs
+        import threading as _t
+        dr._gate_cache, dr._gate_lock = {}, _t.Lock()
+        out = queue_drain.QueueDrainEngine.gate_cached(dr, {"items": [self._item(sku="C18")]})
+        self.assertEqual(len(out), 1)
+        self.assertIn("hs_sku=C18", out[0]["why"])
+
