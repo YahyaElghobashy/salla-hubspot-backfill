@@ -44,7 +44,9 @@ echo
 echo "${B}SERVICES${R}"
 printf '  %-22s %b\n' "live sync"      "$(svc salla-live-sync)"
 printf '  %-22s %b\n' "credit watcher" "$(svc salla-credit-watch)"
-for f in STOP.live STOP.credits STOP STOP.drain; do
+printf '  %-22s %b\n' "status relay"   "$(svc salla-status-relay)"
+printf '  %-22s %b\n' "customer sync"  "$(svc salla-customer-sync)"
+for f in STOP.live STOP.credits STOP STOP.drain STOP.status STOP.customers; do
   [ -e "$f" ] && printf '  %-22s %b\n' "$f" "${YEL}present — holds the matching engine${R}"
 done
 echo
@@ -117,8 +119,14 @@ echo "${B}RECENT ACTIVITY${R}  ${DIM}(newest last)${R}"
     esac
   done; } || true
 echo
+echo "${B}REALTIME STREAMS${R}"
+for led in mirror/status_applied.csv mirror/customers.csv mirror/contact_merges.csv; do
+  [ -f "$led" ] && printf '  %-26s %s rows\n' "$(basename "$led")" \
+    "$(($(wc -l < "$led") - 1))"
+done
+echo
 echo "${B}LOG FILES${R}"
-for lf in live.log credit_watch.log slack_reporter.log backfill.log drain.log; do
+for lf in live.log credit_watch.log slack_reporter.log backfill.log drain.log status_relay.log customer_sync.log; do
   [ -f "$lf" ] && printf '  %-22s %8s   %slast: %s%s\n' "$lf" "$(du -h "$lf" | cut -f1)" "$DIM" "$(tail -c 4096 "$lf" | grep -E "^20" | tail -1 | cut -c1-19)" "$R"
 done
 echo

@@ -50,7 +50,8 @@ STATE_FILE = Path("mirror/slack_report.json")
 LOCK_FILE = Path("slack_reporter.lock")
 STOP_FILE = Path("STOP.reporter")
 
-SERVICES = ("salla-live-sync", "salla-credit-watch", "salla-slack-reporter")
+SERVICES = ("salla-live-sync", "salla-credit-watch", "salla-slack-reporter",
+            "salla-status-relay", "salla-customer-sync")
 
 
 # ---------------------------------------------------------------- fleet facts

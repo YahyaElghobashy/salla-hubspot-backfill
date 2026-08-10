@@ -50,7 +50,8 @@ CURSOR = ROOT / "cursor.json"
 LIVELOG = ROOT / "live.log"
 DRAINLOG = ROOT / "drain.log"
 
-SERVICES = ("salla-live-sync", "salla-credit-watch", "salla-slack-reporter")
+SERVICES = ("salla-live-sync", "salla-credit-watch", "salla-slack-reporter",
+            "salla-status-relay", "salla-customer-sync")
 
 log = logging.getLogger("rollup")
 

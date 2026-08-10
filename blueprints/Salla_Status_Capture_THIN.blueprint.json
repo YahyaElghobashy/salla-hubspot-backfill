@@ -1,0 +1,55 @@
+{
+    "name": "Salla | Status Capture (thin)",
+    "flow": [
+        {
+            "id": 1,
+            "module": "salla:WhenOrderUpdated",
+            "version": 1,
+            "metadata": {
+                "designer": { "name": "Watch Order Updated", "x": 0, "y": 0 },
+                "notes": "Capture-only replacement for 'Salla | Order Delivery Status Update'. All logic (search, stage mapping, retries, exceptions) lives in status_relay.py on the VM. This scenario must stay one module deep: webhook -> addRow."
+            }
+        },
+        {
+            "id": 2,
+            "module": "google-sheets:addRow",
+            "version": 2,
+            "metadata": {
+                "designer": { "name": "Append to Status Queue", "x": 300, "y": 0 },
+                "notes": "Row contract A:H shared with the engine queues. D packs slug+event timestamp: status:<slug>@<updated_at>. E=queued, F=0 attempts, G=webhook, H=human-readable status name."
+            },
+            "mapper": {
+                "insertDataOption": "INSERT_ROWS",
+                "valueInputOption": "RAW",
+                "sheetId": "Status Queue",
+                "spreadsheetId": "/REPLACE_WITH_QUEUE_SPREADSHEET_ID",
+                "includesHeaders": true,
+                "values": {
+                    "0": "{{formatDate(now; \"YYYY-MM-DD HH:mm:ss\")}}",
+                    "1": "{{1.data.id}}",
+                    "2": "{{1.data.reference_id}}",
+                    "3": "status:{{lower(1.data.status.slug)}}@{{1.data.updated_at.date}}",
+                    "4": "queued",
+                    "5": "0",
+                    "6": "webhook",
+                    "7": "{{1.data.status.name}}"
+                }
+            }
+        }
+    ],
+    "metadata": {
+        "instant": true,
+        "version": 1,
+        "scenario": {
+            "roundtrips": 1,
+            "maxErrors": 3,
+            "autoCommit": true,
+            "sequential": false,
+            "confidential": false,
+            "dataloss": false,
+            "dlq": false,
+            "freshVariables": false
+        },
+        "designer": { "orphans": [] }
+    }
+}

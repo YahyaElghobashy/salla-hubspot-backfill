@@ -451,6 +451,17 @@ class Config:
     credit_alert_thresholds: tuple = (50000, 10000, 1000)
     # ---- v2.4 slack reporter --------------------------------------------
     report_interval_minutes: float = 30.0
+    # ---- v2.7 realtime extensions (status relay + customer sync) --------
+    # Each stream has its own queue tab in the queue workbook, its own STOP
+    # file and heartbeat, and publishes a live_active_*.json signal that the
+    # backfill/drain yield to. Kill-switches default ON; flipping one to
+    # false idles that consumer without touching the others.
+    status_relay_enabled: bool = True
+    status_queue_tab: str = "Status Queue"
+    status_retry_ladder: tuple = (30, 120, 600, 3600, 21600)
+    customer_sync_enabled: bool = True
+    customer_queue_tab: str = "Customer Queue"
+    customer_auto_merge: bool = True
     # ---- v2.6 legacy auto-resolver (deleted-in-Salla products) ----------
     # The prefix namespaces every record the resolver creates: live Salla
     # listings will never mint an "LGCY-" SKU, so auto-created records can
@@ -1004,6 +1015,11 @@ class HubSpot:
         return self._write("PATCH", f"/crm/v3/objects/orders/{order_id}",
                            {"properties": props}, what)
 
+    def update_order(self, order_id, props, what):
+        """[M500] PATCH an existing order (v2.7 delivery-status relay)."""
+        return self._write("PATCH", f"/crm/v3/objects/orders/{order_id}",
+                           {"properties": props}, what)
+
     def create_product(self, props, what):
         """[M400] Create a product record (v2.6 legacy auto-resolver)."""
         status, data = self._write("POST", "/crm/v3/objects/products",
@@ -1277,12 +1293,15 @@ class GoogleIO:
             return str(int(v))
         return str(v).strip()
 
-    def queue_read(self, qsid, start_row=2):
+    def queue_read(self, qsid, start_row=2, tab=None):
         """All queue rows from start_row down. Returns list of dicts with
-        1-based sheet row numbers. UNFORMATTED_VALUE dodges display mangling."""
+        1-based sheet row numbers. UNFORMATTED_VALUE dodges display mangling.
+        v2.7: `tab` widens the same 8-column contract to the Status Queue and
+        Customer Queue tabs; default stays the live orders tab."""
+        tab = tab or self.cfg.live_queue_tab
         resp = self._gexec(self.sheets.values().get(
             spreadsheetId=qsid,
-            range=f"'{self.cfg.live_queue_tab}'!A{start_row}:H",
+            range=f"'{tab}'!A{start_row}:H",
             valueRenderOption="UNFORMATTED_VALUE"),
             "queue read", self.sheets_rl)
         out = []
@@ -1301,12 +1320,14 @@ class GoogleIO:
             })
         return out
 
-    def queue_mark(self, qsid, row, expect_order_id, status, attempts, note):
+    def queue_mark(self, qsid, row, expect_order_id, status, attempts, note,
+                   tab=None):
         """Verify-then-write: re-read the row's order_id immediately before
         writing so a human sort/insert can never retarget a status update.
         Returns True when the write landed on the intended row."""
+        tab = tab or self.cfg.live_queue_tab
         resp = self._gexec(self.sheets.values().get(
-            spreadsheetId=qsid, range=f"'{self.cfg.live_queue_tab}'!B{row}",
+            spreadsheetId=qsid, range=f"'{tab}'!B{row}",
             valueRenderOption="UNFORMATTED_VALUE"),
             "queue verify", self.sheets_rl)
         got = self._norm_id(((resp.get("values") or [[""]])[0] or [""])[0])
@@ -1316,19 +1337,20 @@ class GoogleIO:
                       row, expect_order_id, got)
             return False
         self._gexec(self.sheets.values().update(
-            spreadsheetId=qsid, range=f"'{self.cfg.live_queue_tab}'!E{row}:H{row}",
+            spreadsheetId=qsid, range=f"'{tab}'!E{row}:H{row}",
             valueInputOption="RAW",
             body={"values": [[status, attempts, None, note]]}),
             f"queue mark {status}", self.sheets_rl)
         return True
 
-    def queue_mark_batch(self, qsid, marks):
+    def queue_mark_batch(self, qsid, marks, tab=None):
         """Bulk verify-then-write for pre-existing resolutions: `marks` is a
         list of (row, expect_order_id, status, attempts, note). One batchGet
         + one batchUpdate instead of 2 calls per row. Returns rows written."""
         if not marks:
             return 0
-        ranges = [f"'{self.cfg.live_queue_tab}'!B{m[0]}" for m in marks]
+        tab = tab or self.cfg.live_queue_tab
+        ranges = [f"'{tab}'!B{m[0]}" for m in marks]
         resp = self._gexec(self.sheets.values().batchGet(
             spreadsheetId=qsid, ranges=ranges,
             valueRenderOption="UNFORMATTED_VALUE"),
@@ -1341,7 +1363,7 @@ class GoogleIO:
                 log.error("QUEUE row %s moved (expected order %s, found %s) -- "
                           "batch write skips it", row, expect, have)
                 continue
-            data.append({"range": f"'{self.cfg.live_queue_tab}'!E{row}:H{row}",
+            data.append({"range": f"'{tab}'!E{row}:H{row}",
                          "values": [[status, attempts, None, note]]})
             ok += 1
         if data:
@@ -1351,25 +1373,30 @@ class GoogleIO:
                 "queue mark batch", self.sheets_rl)
         return ok
 
-    def queue_append_rows(self, qsid, rows):
+    def queue_append_rows(self, qsid, rows, tab=None):
         """Sweep producer: append [received_at, order_id, ref, event, status,
         attempts, source, note] rows. RAW so ids stay verbatim."""
+        tab = tab or self.cfg.live_queue_tab
         self._gexec(self.sheets.values().append(
-            spreadsheetId=qsid, range=f"'{self.cfg.live_queue_tab}'!A:H",
+            spreadsheetId=qsid, range=f"'{tab}'!A:H",
             valueInputOption="RAW", insertDataOption="INSERT_ROWS",
             body={"values": rows}), "queue sweep append", self.sheets_rl)
 
-    def queue_read_heartbeat(self, qsid):
-        """Return the current heartbeat cell content (owner|epoch) or ''."""
+    def queue_read_heartbeat(self, qsid, tab=None):
+        """Return the current heartbeat cell content (owner|epoch) or ''.
+        Each queue tab carries its own J1 heartbeat, so every realtime
+        consumer gets the same single-instance guard the live engine has."""
+        tab = tab or self.cfg.live_queue_tab
         resp = self._gexec(self.sheets.values().get(
-            spreadsheetId=qsid, range=f"'{self.cfg.live_queue_tab}'!J1",
+            spreadsheetId=qsid, range=f"'{tab}'!J1",
             valueRenderOption="UNFORMATTED_VALUE"),
             "queue heartbeat read", self.sheets_rl)
         return str((((resp.get("values") or [[""]])[0]) or [""])[0])
 
-    def queue_write_heartbeat(self, qsid, instance_id):
+    def queue_write_heartbeat(self, qsid, instance_id, tab=None):
+        tab = tab or self.cfg.live_queue_tab
         self._gexec(self.sheets.values().update(
-            spreadsheetId=qsid, range=f"'{self.cfg.live_queue_tab}'!J1",
+            spreadsheetId=qsid, range=f"'{tab}'!J1",
             valueInputOption="RAW",
             body={"values": [[f"{instance_id}|{int(time.time())}"]]}),
             "queue heartbeat write", self.sheets_rl)
@@ -1531,20 +1558,28 @@ class Engine:
         return lock
 
     def _yield_to_live(self):
-        """v1.7: read the live engine's activity signal (mirror/live_active.json,
-        written each poll by live.py) and hand the shared HubSpot account budget
-        to live when it has orders. When live is busy the backfill search/general
-        ceilings drop to their yield floors; when live is idle (or its signal is
-        stale) they return to full. Cursor logic is untouched -- this only paces,
-        never skips a page."""
+        """v1.7: read the realtime activity signals and hand the shared HubSpot
+        account budget to them when any has work. v2.7 widens this from the
+        single live.json to every mirror/live_active*.json -- the status relay
+        and customer sync publish sibling signals, so the backfill and drain
+        yield to ALL realtime streams, not only order creation. When every
+        signal is idle (or stale) the full budget returns. Cursor logic is
+        untouched -- this only paces, never skips a page."""
         if not getattr(self.cfg, "live_yield_enabled", True):
             return
         active = False
         try:
-            sig = json.loads((Path(self.mirror.dir) / "live_active.json").read_text())
-            active = bool(sig.get("active")) and (time.time() - float(sig.get("ts", 0))) < 60
+            for sig_path in Path(self.mirror.dir).glob("live_active*.json"):
+                try:
+                    sig = json.loads(sig_path.read_text())
+                except (OSError, json.JSONDecodeError):
+                    continue
+                if (bool(sig.get("active"))
+                        and (time.time() - float(sig.get("ts", 0))) < 60):
+                    active = True
+                    break
         except Exception:
-            active = False  # no live engine / unreadable -> take the full budget
+            active = False  # unreadable mirror dir -> take the full budget
         if active == getattr(self, "_yielding", None):
             return  # no change since last page
         self._yielding = active
@@ -2307,13 +2342,14 @@ class Engine:
 # Entry point
 # ----------------------------------------------------------------------------
 
-def setup_logging(verbose):
+def setup_logging(verbose, logfile="backfill.log"):
     # v1.5: the [threadName] token identifies the worker lane; the dashboards
     # and web UI attribute per-order phases by it (old logs without the token
-    # still parse).
+    # still parse). v2.7: logfile parameter so each realtime consumer gets its
+    # own file (status_relay.log, customer_sync.log) with the same format.
     fmt = "%(asctime)s %(levelname)-7s [%(threadName)s] %(message)s"
     logging.basicConfig(level=logging.DEBUG, format=fmt,
-                        handlers=[logging.FileHandler("backfill.log", encoding="utf-8")])
+                        handlers=[logging.FileHandler(logfile, encoding="utf-8")])
     console = logging.StreamHandler(sys.stdout)
     console.setLevel(logging.DEBUG if verbose else logging.INFO)
     console.setFormatter(logging.Formatter(fmt))
