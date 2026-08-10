@@ -429,3 +429,165 @@ def mapper_for(ix):
     if "id" in ix:
         return LegacyMapper()
     raise ValueError("unrecognised sheet: neither order_id nor id present")
+
+
+# ---------------------------------------------------------------------------
+# driver
+# ---------------------------------------------------------------------------
+
+
+def _sheet(z, member):
+    import openpyxl
+    wb = openpyxl.load_workbook(io.BytesIO(z.read(member)), read_only=True,
+                               data_only=True)
+    ws = wb[wb.sheetnames[0]]
+    it = ws.iter_rows(values_only=True)
+    hdr = [h for h in next(it)]
+    return wb, it, {h: i for i, h in enumerate(hdr) if h is not None}
+
+
+def dominant_names(z, members):
+    """SKU -> most common product name across the whole corpus.
+
+    Column-swapped rows lose their product name (the SKU was sitting in it),
+    so the name has to come from the rest of the corpus rather than the row.
+    """
+    names = defaultdict(Counter)
+    for m in members:
+        wb, it, ix = _sheet(z, m)
+        sku_c = ix.get("sku", ix.get("product_sku"))
+        nm_c = ix.get("product name", ix.get("product_name"))
+        if sku_c is None or nm_c is None:
+            wb.close()
+            continue
+        for r in it:
+            s, n = r[sku_c], r[nm_c]
+            if s and n:
+                s2, n2, _, _ = repair_column_swap(s, n)
+                if s2 and n2:
+                    names[s2][n2.strip()[:80]] += 1
+        wb.close()
+    return {s: c.most_common(1)[0][0] for s, c in names.items()}
+
+
+def normalize(zip_path, outdir="mirror/zed", repairs_log="mirror/zed_repairs.csv",
+              dropped_log="mirror/zed_dropped.csv"):
+    """Stream every workbook into one gzipped JSONL per calendar month.
+
+    The rich file wins wherever it covers a date (operator decision): its ids
+    are collected first, and any legacy row whose order id is already claimed
+    is skipped rather than merged, so the 173,756-order Jul-Dec 2025 overlap
+    cannot double.
+    """
+    import openpyxl  # noqa: F401  (imported for the error if it's missing)
+    out = Path(outdir)
+    out.mkdir(parents=True, exist_ok=True)
+    z = zipfile.ZipFile(zip_path)
+    members = sorted(n for n in z.namelist()
+                     if n.endswith(".xlsx") and "__MACOSX" not in n)
+    # rich first so its ids claim the overlap
+    members.sort(key=lambda m: 0 if "2026" in m else 1)
+
+    names_by_sku = dominant_names(z, members)
+    claimed = set()
+    by_month = defaultdict(list)
+    stats = {"source_rows": 0, "junk_rows": 0, "repaired_rows": 0,
+             "overlap_skipped_orders": 0, "orders": 0, "items": 0,
+             "orders_dropped_no_items": 0, "unmapped_status": Counter()}
+    repairs, dropped = [], []
+
+    for m in members:
+        label = m.split("/")[-1].replace(".xlsx", "")
+        wb, it, ix = _sheet(z, m)
+        mapper = mapper_for(ix)
+        oid_getter = (lambda r: r[ix["order_id"]]) if mapper.format == "rich" \
+            else (lambda r: r[ix["id"]])
+        st_c = ix.get("order_status_name", ix.get("order_status"))
+        mob_c = ix.get("customer_telephone", ix.get("customer_mobile"))
+        dt_c = ix.get("order_date", ix.get("added_at (Asia/Riyadh)"))
+
+        groups = defaultdict(list)
+        for r in it:
+            if oid_getter(r) is None and (dt_c is None or r[dt_c] is None):
+                continue                      # trailing blank padding
+            stats["source_rows"] += 1
+            if is_junk_row(r[st_c] if st_c is not None else None,
+                           r[mob_c] if mob_c is not None else None):
+                stats["junk_rows"] += 1
+                dropped.append((label, str(oid_getter(r) or ""), "junk row"))
+                continue
+            oid = str(oid_getter(r) or "")
+            if not oid:
+                continue
+            groups[oid].append(r)
+        wb.close()
+
+        for oid, rows in groups.items():
+            if oid in claimed:
+                stats["overlap_skipped_orders"] += 1
+                continue
+            try:
+                order = mapper.build(oid, rows, ix, names_by_sku)
+            except UnmappedStatus as e:
+                stats["unmapped_status"][str(e)] += 1
+                dropped.append((label, oid, f"unmapped status {e}"))
+                continue
+            if order is None:
+                stats["orders_dropped_no_items"] += 1
+                dropped.append((label, oid, "no usable items"))
+                continue
+            claimed.add(oid)
+            for i in order["items"]:
+                if i.get("_zed", {}).get("repaired_swap"):
+                    stats["repaired_rows"] += 1
+                    repairs.append((label, oid, i["sku"], i["quantity"]))
+            month = (order["date"]["date"] or "0000-00")[:7]
+            by_month[month].append(order)
+            stats["orders"] += 1
+            stats["items"] += len(order["items"])
+        print(f"  {label}: {stats['orders']:,} orders so far", flush=True)
+
+    for month, orders in sorted(by_month.items()):
+        with gzip.open(out / f"{month}.jsonl.gz", "wt", encoding="utf-8") as f:
+            for o in orders:
+                f.write(json.dumps(o, ensure_ascii=False) + "\n")
+
+    Path(repairs_log).parent.mkdir(parents=True, exist_ok=True)
+    with open(repairs_log, "w", encoding="utf-8") as f:
+        f.write("file,order_id,repaired_sku,quantity\n")
+        for row in repairs:
+            f.write(",".join(str(x) for x in row) + "\n")
+    with open(dropped_log, "w", encoding="utf-8") as f:
+        f.write("file,order_id,reason\n")
+        for row in dropped:
+            f.write(",".join(str(x).replace(",", " ") for x in row) + "\n")
+
+    stats["unmapped_status"] = dict(stats["unmapped_status"])
+    stats["months"] = {m: len(v) for m, v in sorted(by_month.items())}
+    return stats
+
+
+def main():
+    import argparse
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--zip", required=True)
+    ap.add_argument("--out", default="mirror/zed")
+    args = ap.parse_args()
+    s = normalize(args.zip, args.out)
+    print("\n=========== NORMALISE ===========")
+    print(f"source rows          {s['source_rows']:,}")
+    print(f"  junk dropped       {s['junk_rows']:,}")
+    print(f"  column-swaps fixed {s['repaired_rows']:,}")
+    print(f"overlap skipped      {s['overlap_skipped_orders']:,} orders "
+          f"(already claimed by the rich file)")
+    print(f"orders written       {s['orders']:,}")
+    print(f"items written        {s['items']:,}")
+    print(f"dropped, no items    {s['orders_dropped_no_items']:,}")
+    if s["unmapped_status"]:
+        print(f"UNMAPPED STATUSES    {s['unmapped_status']}")
+    print(f"months               {len(s['months'])}")
+    print(f"-> {args.out}")
+
+
+if __name__ == "__main__":
+    main()
