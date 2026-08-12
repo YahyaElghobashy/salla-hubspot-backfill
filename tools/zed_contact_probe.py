@@ -29,14 +29,19 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-import openpyxl
-
 import zed_normalize as zn
 from zed_snapshot import ContactIndex
 
 
 def sample_phones(zip_path, per_file, seed=20260810):
-    """Reservoir-sample raw phone values from every workbook."""
+    """Reservoir-sample raw phone values from every workbook.
+
+    openpyxl is imported here rather than at module scope: the default path
+    samples the normalised months, which needs no Excel reader, and the VM has
+    no reason to carry that dependency.
+    """
+    import openpyxl
+
     z = zipfile.ZipFile(zip_path)
     members = sorted(n for n in z.namelist()
                      if n.endswith(".xlsx") and "__MACOSX" not in n)
