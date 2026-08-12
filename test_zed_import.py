@@ -6,8 +6,11 @@ a barcode being mistaken for a bundle, a naive timestamp shifting every order
 by three hours, and an unmapped status defaulting instead of stopping.
 """
 import unittest
+from unittest import mock
 
+import backfill
 import zed_normalize as zn
+import zed_plan as zp
 
 
 LEGACY_HDR = ["id", "order_status", "source", "customer_note", "customer_name",
@@ -248,6 +251,62 @@ class TestCanonicalShape(unittest.TestCase):
     def test_mapper_autodetect(self):
         self.assertIsInstance(zn.mapper_for(RICH_IX), zn.RichMapper)
         self.assertIsInstance(zn.mapper_for(LEGACY_IX), zn.LegacyMapper)
+
+
+class TestPlannerIsSealed(unittest.TestCase):
+    """The planner must reach nothing outside this process.
+
+    Regression for a real incident. `PlanRecorder` intercepts `HubSpot._write`,
+    so the plan is inert as far as HubSpot is concerned -- but `route_held`
+    also fires a raw `http_request` POST at `cfg.held_notify_url`, gated only
+    on `self.live`, and the planner must run with live=True for `_write` to
+    record anything. The first canary (2023-10) therefore pushed 779 held
+    notifications at the production Make webhook: 562 were accepted into its
+    queue and 217 came back "Queue is full."
+
+    Interception at the HubSpot client is the wrong altitude to catch that.
+    This test works at the right one: it makes `backfill.http_request` itself
+    explode, so ANY future outbound call from planner code fails loudly here
+    instead of quietly in production.
+    """
+
+    def _engine(self, notify_url):
+        # no apply_portal_config: it demands a fully-provisioned portal
+        # (default_pipeline_stage and friends) and route_held reads none of it
+        cfg = backfill.Config()
+        cfg.held_notify_url = notify_url
+        hs = object.__new__(zp.PlanHubSpot)
+        hs.cfg, hs.plan, hs._sym = cfg, [], 0
+        gio = backfill.GoogleIO(cfg, enabled=False)
+        return cfg, zp.ZedPlanEngine(cfg, hs, gio, _NullMirror())
+
+    def test_notify_url_is_blanked_on_a_copy(self):
+        cfg, eng = self._engine("https://hook.eu1.make.com/REAL")
+        self.assertEqual(eng.cfg.held_notify_url, "")
+        # the caller's config must survive: the equivalence test builds a live
+        # HubSpot from the same object in the same process
+        self.assertEqual(cfg.held_notify_url, "https://hook.eu1.make.com/REAL")
+
+    def test_route_held_makes_no_outbound_call(self):
+        _, eng = self._engine("https://hook.eu1.make.com/REAL")
+        order = {"id": "28170986", "reference_id": "R1",
+                 "customer": {"created_at": {"date": "2023-10-01"}}}
+        with mock.patch.object(backfill, "http_request",
+                               side_effect=AssertionError(
+                                   "planner made an outbound HTTP call")):
+            eng.route_held(order, -1, [{"name": "جهاز تمويج الشعر"}])
+        self.assertEqual(eng._outcome["28170986"][0], "held")
+
+
+class _NullMirror:
+    """LocalMirror with every write removed: the planner's mirror writes are
+    irrelevant to what this file asserts, and a temp dir per test is noise."""
+
+    def audit_event(self, *a, **kw):
+        pass
+
+    def queue_event(self, *a, **kw):
+        pass
 
 
 if __name__ == "__main__":

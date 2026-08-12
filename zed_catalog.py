@@ -139,6 +139,16 @@ def write_sheet(month, by_sku, singles, stats):
         for i, (sku, rec) in enumerate(rows, 1):
             name, name_share = dominant(rec["names"])
             price, _ = dominant(rec["prices"])
+            # Zid stores ex-VAT prices, so the dominant value arrives as
+            # 327.82608695652 (== 377.00 / 1.15). Eleven decimal places in a
+            # column a human has to eyeball reads as a bug and invites the
+            # client to query the number instead of the approval. Round for
+            # display only; --apply re-reads this same column, and 2dp is
+            # already finer than the currency.
+            try:
+                price = f"{float(price):.2f}"
+            except (TypeError, ValueError):
+                pass
             kind, toks = zn.classify_sku(sku)
             resolvable = kind == "composite" and all(
                 t in singles for t in toks)

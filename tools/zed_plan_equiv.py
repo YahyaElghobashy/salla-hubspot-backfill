@@ -34,6 +34,7 @@ import logging
 import os
 import random
 import sys
+from datetime import datetime
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -58,20 +59,65 @@ IGNORE = {
 
 
 def sample_created(n, seed=20260810):
-    """(salla_order_id, hs_order_id, archive_path) for n random creations."""
+    """(salla_order_id, hs_order_id, archive_path) for n random creations.
+
+    The archive is indexed ONCE by salla id. Globbing per ledger row is
+    O(rows x files) -- 46k x 60k -- which never finishes.
+    """
+    by_sid = {}
+    for fp in glob.glob("archive/order_*.json"):
+        # order_RID{ref}_{salla_id}_{payment}_{date}.json
+        parts = Path(fp).name.split("_")
+        if len(parts) >= 3:
+            by_sid.setdefault(parts[2], fp)
+    log.info("archive indexed: %d orders", len(by_sid))
+
     rows = []
     with open("mirror/created.csv", newline="", encoding="utf-8") as f:
         for row in csv.DictReader(f):
-            rows.append((row["salla_order_id"], row["hubspot_order_id"]))
+            sid = row["salla_order_id"]
+            if sid in by_sid:
+                rows.append((sid, row["hubspot_order_id"], by_sid[sid]))
+    log.info("ledger rows with a local archive: %d", len(rows))
     random.Random(seed).shuffle(rows)
-    out = []
-    for sid, hid in rows:
-        hits = glob.glob(f"archive/order_RID*_{sid}_*.json")
-        if hits:
-            out.append((sid, hid, hits[0]))
-        if len(out) >= n:
-            break
-    return out
+    return rows[:n]
+
+
+def equivalent(sent, returned):
+    """Is what we SEND the same value HubSpot ECHOES BACK?
+
+    Three representations differ by protocol, not by content, and comparing
+    them raw produces false failures that would mask real ones:
+      * datetimes: we send epoch milliseconds, HubSpot returns ISO-8601 Z
+      * booleans:  Python str(True) is "True", HubSpot returns "true"
+      * numbers:   "897.25" vs "897.250"
+    """
+    if sent == returned:
+        return True
+    # numeric
+    try:
+        if float(sent) == float(returned):
+            return True
+    except (TypeError, ValueError):
+        pass
+    # boolean
+    if sent.strip().lower() in ("true", "false") and \
+            sent.strip().lower() == returned.strip().lower():
+        return True
+    # epoch-ms sent vs ISO returned (or the reverse)
+    def as_epoch_ms(x):
+        x = x.strip()
+        if x.isdigit() and len(x) >= 12:
+            return int(x)
+        try:
+            iso = x.replace("Z", "+00:00")
+            return int(datetime.fromisoformat(iso).timestamp() * 1000)
+        except (ValueError, AttributeError):
+            return None
+    e1, e2 = as_epoch_ms(sent), as_epoch_ms(returned)
+    if e1 is not None and e2 is not None and e1 == e2:
+        return True
+    return False
 
 
 def batch_read(hs, ids, properties):
@@ -155,14 +201,9 @@ def main():
             checked += 1
             a = "" if have.get(k) is None else str(have.get(k))
             w = "" if v is None else str(v)
-            # numeric equivalence: "897.25" == "897.250"
-            try:
-                if float(a) == float(w):
-                    continue
-            except (TypeError, ValueError):
-                pass
-            if a != w:
-                mismatch.append((sid, hid, k, w[:60], a[:60]))
+            if equivalent(w, a):
+                continue
+            mismatch.append((sid, hid, k, w[:60], a[:60]))
 
     print(f"\n================ PLAN EQUIVALENCE ================")
     print(f"orders compared      {len(planned):,}")

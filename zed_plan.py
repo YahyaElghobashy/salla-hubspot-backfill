@@ -30,6 +30,7 @@ Usage:
 """
 
 import argparse
+import copy
 import gzip
 import json
 import logging
@@ -87,7 +88,34 @@ class _NoCursor:
 
 
 class ZedPlanEngine(backfill.Engine):
+    """The engine, unmodified, except that every escape hatch to the outside
+    world is sealed.
+
+    `PlanRecorder` intercepts `HubSpot._write`, which covers every HubSpot
+    object. It does NOT cover side effects that bypass the HubSpot client, and
+    `route_held` has one: a raw `http_request` POST to `cfg.held_notify_url`,
+    gated only on `self.live`. The planner must set live=True (otherwise
+    `_write` short-circuits and records nothing), which silently switched that
+    webhook on -- 779 real POSTs into the production held-order queue on the
+    first canary run, for orders from 2023.
+
+    Blanking the URL on a COPY of the config is the fix: `route_held` checks
+    `if self.cfg.held_notify_url` before posting, so an empty value makes the
+    branch unreachable. The copy matters because the equivalence test builds a
+    live HubSpot from the same cfg object in the same process.
+
+    That is the complete set of write escapes, established by auditing every
+    `http_request` call site rather than by assumption:
+      * relay POST      -> `self.relay` is a stub here; unreachable
+      * HubSpot `_req`  -> writes intercepted by PlanRecorder, reads answered
+                           by SnapshotHubSpot
+      * held notify     -> this one, sealed below
+    Sheets and Drive are already sealed by `GoogleIO(enabled=False)`.
+    """
+
     def __init__(self, cfg, hs, gio, mirror):
+        cfg = copy.copy(cfg)
+        cfg.held_notify_url = ""
         # relay is never touched below process_order (verified: the only
         # self.relay uses are in run() and a _rates_report log line), but the
         # constructor stores it, so a stub with the one attribute
@@ -97,6 +125,7 @@ class ZedPlanEngine(backfill.Engine):
                 rate = 1.0
         super().__init__(cfg, _NoCursor(), _RelayStub(), hs, gio, mirror,
                          live=True, workers=1)
+        assert not self.cfg.held_notify_url, "planner must never notify"
         self.is_live_sync = False
         self.legacy = None
         self.health = None
