@@ -36,7 +36,10 @@
     "completed": "REPLACE_STAGE_ID",
     "canceled": "REPLACE_STAGE_ID",
     "restored": "REPLACE_STAGE_ID",
-    "restoring": "REPLACE_STAGE_ID"
+    "restoring": "REPLACE_STAGE_ID",
+    "under_review": "<under-review-stage-id>",
+    "in_progress": "<processed-stage-id>",
+    "preparing": "<processed-stage-id>"
   },
   "object_type_ids": {
     "bundle_template": "",

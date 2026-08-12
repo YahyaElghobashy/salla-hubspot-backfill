@@ -290,9 +290,66 @@ def render(a):
     return "\n".join(head), _threads(a)
 
 
+def _stuck_in_review(hours=48):
+    """Orders sitting in the Under Review stage longer than `hours`.
+
+    The stage exists so reviews are VISIBLE; this is the guardrail that stops
+    it becoming a silent parking lot. Best-effort by design: it needs one
+    HubSpot search, and the digest must still post during an outage, so any
+    failure renders as unavailable rather than breaking the report.
+    """
+    try:
+        from backfill import Config
+        import urllib.request
+        stage = (Config.load("config.json").status_stage_map or {}).get(
+            "under_review")
+        if not stage:
+            return None
+        tok = (os.environ.get("HUBSPOT_ACCESS_TOKEN") or "").strip()
+        if not tok:
+            return None
+        cutoff = int((datetime.now().timestamp() - hours * 3600) * 1000)
+        body = {"filterGroups": [{"filters": [
+            {"propertyName": "hs_pipeline_stage", "operator": "EQ",
+             "value": stage},
+            {"propertyName": "hs_lastmodifieddate", "operator": "LT",
+             "value": str(cutoff)}]}],
+            "properties": ["salla_order_id"], "limit": 10}
+        req = urllib.request.Request(
+            "https://api.hubapi.com/crm/v3/objects/orders/search",
+            data=json.dumps(body).encode(),
+            headers={"Authorization": f"Bearer {tok}",
+                     "Content-Type": "application/json"}, method="POST")
+        d = json.loads(urllib.request.urlopen(req, timeout=20).read())
+        total = int(d.get("total", 0))
+        ids = [r["properties"].get("salla_order_id", "?")
+               for r in d.get("results", [])[:5]]
+        return {"total": total, "sample": ids, "hours": hours}
+    except Exception:
+        return {"total": None, "sample": [], "hours": hours}
+
+
 def _threads(a):
     q, out = a["now"], []
     p = a["period"]
+
+    # --- under review watchdog -------------------------------------------
+    # Rendered only when there is something to say: a quiet stage needs no
+    # section, and an unavailable check must not read as "zero stuck".
+    ur = _stuck_in_review()
+    if ur and ur["total"]:
+        out.append("\n".join([
+            "*Orders stuck under review*",
+            f"{ur['total']:,} order(s) have sat in the Under Review stage "
+            f"for more than {ur['hours']} hours"
+            + (f" (e.g. {', '.join(ur['sample'])})" if ur["sample"] else "")
+            + ". A review that old usually means it was forgotten, not that "
+              "it is still being reviewed — worth a pass in Salla admin. "
+              "Once the store moves the order on, the stage follows "
+              "automatically within seconds."]))
+    elif ur and ur["total"] is None:
+        out.append("*Orders stuck under review*\ncheck unavailable this run "
+                   "(HubSpot unreachable); not zero, unknown.")
 
     # --- live sync -------------------------------------------------------
     live = a["live_created"]
