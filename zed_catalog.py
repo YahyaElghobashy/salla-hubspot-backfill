@@ -230,6 +230,52 @@ def report(month, hs, singles):
     return n, path, stats
 
 
+def verify_sheet(hs, months, singles, sheet=APPROVALS / "ALL_catalog.csv"):
+    """Prove the sheet is SUFFICIENT: approve every row, re-run the real gate,
+    and require that nothing is left held.
+
+    Writing the sheet proves each row is needed. It does not prove the set is
+    complete, and those are different claims. If one SKU is missing, the
+    client approves 156 items, we import, and orders still hold -- discovered
+    only after a second round-trip through their review.
+
+    So: inject every sheet row into the snapshot as an approved product and
+    re-run `gate_unverified_items` over all 974k orders. Residual holds are
+    SKUs the sheet failed to ask for. Costs one more sweep (~6s) and turns
+    "we listed what we found" into "approving this list unblocks everything".
+
+    Injection mirrors what --apply creates: the engine's candidate list is
+    [bare_sku, LGCY-bare_sku], so an entry under the bare key is what the gate
+    will match once the record exists.
+    """
+    if not sheet.exists():
+        raise SystemExit(f"no sheet at {sheet}; run --report-all first")
+    rows = list(csv.DictReader(open(sheet, newline="", encoding="utf-8-sig")))
+    for r in rows:
+        sku = zn.canon_sku(r["original_zid_sku"])
+        rec = {"id": f"SIMULATED-{sku}",
+               "properties": {"hs_sku": f"LGCY-{sku}",
+                              "catalog_approval_status": "approved",
+                              "name": r["product_name"]}}
+        hs.by_sku.setdefault(sku, []).append((True, rec))
+
+    log.info("simulating approval of %d sheet rows, re-running the gate over "
+             "every month", len(rows))
+    by_sku, per_month = sweep(months, hs, singles)
+    held = sum(s["held_orders"] for s in per_month.values())
+    orders = sum(s["orders"] for s in per_month.values())
+    if by_sku:
+        log.error("SHEET INCOMPLETE: %d order(s) still held by %d SKU(s) the "
+                  "sheet does not list", held, len(by_sku))
+        for sku, rec in sorted(by_sku.items(),
+                               key=lambda kv: -kv[1]["orders"])[:20]:
+            log.error("  missing %-28s %7d orders", sku, rec["orders"])
+        return 1
+    log.info("SHEET COMPLETE: all %d orders pass the gate once these %d SKUs "
+             "are approved; 0 left held", orders, len(rows))
+    return 0
+
+
 def apply_approvals(month, hs, live):
     """Create the approved LGCY- records. Idempotent: existing SKUs skip."""
     path = APPROVALS / f"{month}_catalog.csv"
@@ -278,6 +324,9 @@ def main():
     ap.add_argument("--config", default="config.json")
     ap.add_argument("--report")
     ap.add_argument("--report-all", action="store_true")
+    ap.add_argument("--verify-sheet", action="store_true",
+                    help="approve every sheet row in a simulation and prove "
+                         "nothing is left held")
     ap.add_argument("--apply")
     ap.add_argument("--live", action="store_true")
     ap.add_argument("--verbose", action="store_true")
@@ -308,6 +357,9 @@ def main():
         return 0
 
     months = sorted(p.name.split(".")[0] for p in NORM.glob("*.jsonl.gz"))
+    if args.verify_sheet:
+        return verify_sheet(hs, months, singles)
+
     log.info("sweeping %d months, oldest first", len(months))
     by_sku, per_month = sweep(months, hs, singles)
     if not by_sku:
