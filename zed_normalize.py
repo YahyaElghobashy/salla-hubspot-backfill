@@ -110,6 +110,26 @@ def classify_sku(raw):
     return "malformed", []
 
 
+def canon_sku(raw):
+    """Case-fold the SKU. This is a correctness fix, not tidying.
+
+    Zid's own data carries both "C3" and "c3" for the same product, and the
+    same for C1, C2, C7C3C2 and C7C3C1 -- together 315,249 orders, a third of
+    the corpus. Left alone, each variant becomes its own approval row and its
+    own LGCY- product in HubSpot, so one real product ends up as two records
+    with the orders split arbitrarily between them.
+
+    Folding here rather than in the approval sheet matters, because the engine
+    builds its legacy-SKU lookup from the item's own sku field: fix it in the
+    sheet only and the sheet says LGCY-C3 while the order still asks for
+    LGCY-c3, which holds forever if HubSpot's search is case-sensitive.
+
+    Uppercase is safe for every class classify_sku recognises: barcodes are
+    digits and malformed values are typically Arabic, both unaffected.
+    """
+    return str(raw or "").strip().upper()
+
+
 def is_composite(raw, singles=None):
     """True when the SKU is two or more tokens AND (when a corpus-wide set of
     single-token SKUs is supplied) every token exists on its own. The extra
@@ -233,20 +253,30 @@ def is_junk_row(status, mobile):
     return (status is None or str(status).strip() == "") and not str(mobile or "").strip()
 
 
-def repair_column_swap(sku, name):
+def repair_column_swap(sku, name, vocab=None):
     """Legacy 2025 defect: `sku` holds a small integer (really the quantity)
     and `product name` holds the SKU. Returns (sku, name, qty_hint, repaired).
 
-    Left unrepaired this writes line items with hs_sku="1", which is why any
-    post-repair SKU that still fails shape validation fails the whole month.
+    Left unrepaired this writes line items with hs_sku="1".
+
+    `vocab` is the set of values actually seen in the SKU column across the
+    whole corpus, and it is the reliable test. Shape-matching alone missed
+    1,656 items: the displaced values included "CH91011C45C46" (five digits in
+    a run, where SKU_SHAPE_RE allows at most three) and "brushes" (no digits
+    at all, and a real approved SKU in HubSpot). Guessing at a shape will keep
+    missing variants; asking whether the value is a SKU *somewhere else in
+    this same corpus* does not.
+
+    Shape and barcode checks stay as a fallback for values that appear only in
+    swapped rows, so they never reach the vocabulary.
     """
     s, n = str(sku or "").strip(), str(name or "").strip()
-    if s.isdigit() and len(s) <= 3 and (SKU_SHAPE_RE.match(n)
-                                        or BARCODE_RE.match(n)):
-        # Two variants, both real in the 2025 file: the displaced value is a
-        # C-format SKU ("C18") or a barcode ("6287032431307"). The barcode
-        # variant accounts for ~10,900 rows on its own; missing it would write
-        # line items with hs_sku="1".
+    if s.isdigit() and len(s) <= 3 and (
+            SKU_SHAPE_RE.match(n) or BARCODE_RE.match(n)
+            or (vocab is not None and n.upper() in vocab)):
+        # Variants seen in the real files: a C-format SKU ("C18"), a barcode
+        # ("6287032431307", ~10,900 rows), a long-digit composite
+        # ("CH91011C45C46") and an alphabetic SKU ("brushes").
         return n, "", s, True
     return s, n, "", False
 
@@ -260,6 +290,10 @@ class Mapper:
     """Shared assembly of the canonical order dict from grouped line rows."""
 
     format = "base"
+    # corpus-wide set of values seen in the SKU column; normalize() sets it.
+    # Left None the swap repair falls back to shape matching, which is what
+    # the unit tests exercise.
+    vocab = None
 
     def order_key(self, row, ix):
         raise NotImplementedError
@@ -294,7 +328,8 @@ class LegacyMapper(Mapper):
 
     def row_to_item(self, row, ix, seq, oid, names_by_sku):
         sku, name, qty_hint, repaired = repair_column_swap(
-            row[ix["sku"]], row[ix["product name"]])
+            row[ix["sku"]], row[ix["product name"]], self.vocab)
+        sku = canon_sku(sku)
         if not sku:
             return None
         if not name:
@@ -362,7 +397,7 @@ class RichMapper(Mapper):
         return str(v) if v is not None else ""
 
     def row_to_item(self, row, ix, seq, oid, names_by_sku):
-        sku = str(row[ix["product_sku"]] or "").strip()
+        sku = canon_sku(row[ix["product_sku"]])
         if not sku:
             return None
         qcol = ix.get("Quantity")
@@ -446,13 +481,21 @@ def _sheet(z, member):
     return wb, it, {h: i for i, h in enumerate(hdr) if h is not None}
 
 
-def dominant_names(z, members):
-    """SKU -> most common product name across the whole corpus.
+def scan_corpus(z, members):
+    """One pass over every workbook. Returns (names_by_sku, sku_vocab).
+
+    Both outputs come from the same scan because they are mutually dependent:
+    the swap repair needs the vocabulary to recognise a displaced SKU, and the
+    dominant name needs the repair to have happened. The scan therefore
+    collects raw (sku, name) pairs first -- a bounded set, a couple of hundred
+    SKUs by a handful of names each, not 1.3M rows -- then derives the
+    vocabulary from the values that appear in the SKU column, then replays the
+    pairs through the repair to pick each SKU's dominant name.
 
     Column-swapped rows lose their product name (the SKU was sitting in it),
     so the name has to come from the rest of the corpus rather than the row.
     """
-    names = defaultdict(Counter)
+    pairs = Counter()
     for m in members:
         wb, it, ix = _sheet(z, m)
         sku_c = ix.get("sku", ix.get("product_sku"))
@@ -463,11 +506,19 @@ def dominant_names(z, members):
         for r in it:
             s, n = r[sku_c], r[nm_c]
             if s and n:
-                s2, n2, _, _ = repair_column_swap(s, n)
-                if s2 and n2:
-                    names[s2][n2.strip()[:80]] += 1
+                pairs[(str(s).strip(), str(n).strip()[:80])] += 1
         wb.close()
-    return {s: c.most_common(1)[0][0] for s, c in names.items()}
+
+    # a digit-only value in the SKU column is the defect itself, never a SKU
+    vocab = {s.upper() for s, _ in pairs
+             if s and not (s.isdigit() and len(s) <= 3)}
+
+    names = defaultdict(Counter)
+    for (s, n), c in pairs.items():
+        s2, n2, _, _ = repair_column_swap(s, n, vocab)
+        if s2 and n2:
+            names[canon_sku(s2)][n2] += c
+    return ({s: c.most_common(1)[0][0] for s, c in names.items()}, vocab)
 
 
 def normalize(zip_path, outdir="mirror/zed", repairs_log="mirror/zed_repairs.csv",
@@ -488,7 +539,9 @@ def normalize(zip_path, outdir="mirror/zed", repairs_log="mirror/zed_repairs.csv
     # rich first so its ids claim the overlap
     members.sort(key=lambda m: 0 if "2026" in m else 1)
 
-    names_by_sku = dominant_names(z, members)
+    names_by_sku, sku_vocab = scan_corpus(z, members)
+    print(f"  SKU vocabulary: {len(sku_vocab):,} distinct values in the "
+          f"SKU column", flush=True)
     claimed = set()
     by_month = defaultdict(list)
     stats = {"source_rows": 0, "junk_rows": 0, "repaired_rows": 0,
@@ -500,6 +553,7 @@ def normalize(zip_path, outdir="mirror/zed", repairs_log="mirror/zed_repairs.csv
         label = m.split("/")[-1].replace(".xlsx", "")
         wb, it, ix = _sheet(z, m)
         mapper = mapper_for(ix)
+        mapper.vocab = sku_vocab
         oid_getter = (lambda r: r[ix["order_id"]]) if mapper.format == "rich" \
             else (lambda r: r[ix["id"]])
         st_c = ix.get("order_status_name", ix.get("order_status"))

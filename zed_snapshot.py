@@ -200,13 +200,22 @@ class SnapshotHubSpot(HubSpot):
         self.orders_idx = json.loads((snap_dir / "orders.json").read_text())
         self.contacts = ContactIndex(snap_dir / "contacts.sqlite")
 
-        # products, indexed the two ways the gate asks for them
+        # products, indexed the two ways the gate asks for them.
+        #
+        # The SKU index is case-folded because HubSpot's hs_sku EQ search is
+        # case-insensitive: searching "BRUSHES" returns the product stored as
+        # "brushes" (measured against the live portal, not assumed). An exact
+        # dict lookup here would be STRICTER than production and report holds
+        # that would not really hold -- the one failure mode this snapshot
+        # must not have, since the entire import trusts it to answer exactly
+        # as HubSpot would. The live catalog really does carry mixed-case
+        # SKUs (brushes, C1cc, ccC18), so this is not hypothetical.
         self.by_salla_pid, self.by_sku = {}, {}
         for p in cat["products"]:
             pr = p.get("properties") or {}
             rec = {"id": p["id"], "properties": pr}
             sid = str(pr.get("salla_product_id") or "").strip()
-            sku = str(pr.get("hs_sku") or "").strip()
+            sku = str(pr.get("hs_sku") or "").strip().upper()
             approved = (pr.get("catalog_approval_status") or "") == "approved"
             if sid:
                 self.by_salla_pid.setdefault(sid, []).append((approved, rec))
@@ -267,7 +276,9 @@ class SnapshotHubSpot(HubSpot):
             skus = [skus]
         n = 0
         for s in skus:
-            n += sum(1 for ok, _ in self.by_sku.get(str(s), []) if ok)
+            # .upper() to match the case-folded index above
+            n += sum(1 for ok, _ in
+                     self.by_sku.get(str(s).strip().upper(), []) if ok)
         return n
 
     def gate_search_template(self, salla_product_id, eligible_only):
@@ -296,7 +307,8 @@ class SnapshotHubSpot(HubSpot):
             skus = [skus]
         rows = []
         for s in skus:
-            rows += [r for ok, r in self.by_sku.get(str(s), []) if ok]
+            rows += [r for ok, r in
+                     self.by_sku.get(str(s).strip().upper(), []) if ok]
         return self._body(rows[:2])
 
     def item_search_template(self, salla_product_id, eligible_only):

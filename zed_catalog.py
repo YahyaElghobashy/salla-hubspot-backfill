@@ -7,19 +7,33 @@ that are NOT in HubSpot and would therefore hold that month's orders, and no
 month imports until those are approved. Crucially the sheets must not be
 redundant -- a SKU approved in March must not reappear in April.
 
-How the "unique per month" requirement is met without a second gate
-implementation: `--report` runs the REAL `Engine.gate_unverified_items`
-against the current catalog snapshot. A SKU approved last month is in the
-snapshot, so it simply does not come back unverified. The non-redundancy is a
-property of the data, not a filter someone has to maintain.
+"Not redundant" turns out to mean two different things, and only one of them
+is free:
 
-Sheet shape is deliberately identical to the one the client already signed off
-(legacy_approval_2026-08-10.csv), plus a component_proposal column for
-composite SKUs, so nothing about the review process has to be relearned.
+  * ACROSS APPROVAL CYCLES it costs nothing. `--report` runs the REAL
+    `Engine.gate_unverified_items` against the current catalog snapshot, so a
+    SKU approved in March is in the snapshot by April and simply does not come
+    back unverified. No filter for anyone to maintain.
+  * WITHIN ONE SWEEP it is not free. Generating all 69 sheets today, before
+    any approval exists, the snapshot is identical for every month -- so C1,
+    which holds orders in 2020 and again in 2023, lands on both sheets. That
+    is exactly the redundancy the client asked us to avoid. `--report-all`
+    therefore carries a `seen` set forward and assigns each SKU to the FIRST
+    month it appears in.
 
-    python3 zed_catalog.py --report 2023-10        # writes the CSV, exit 1 if pending
+Once a SKU is assigned to one month, its impact figure has to be corpus-wide:
+approving C1 on the 2020-06 sheet releases every held order carrying C1 across
+all six years, so a row claiming "releases 3" when the true figure is in the
+thousands would get the decision badly wrong.
+
+Sheet shape is the one the client already signed off
+(legacy_approval_2026-08-10.csv), plus component_proposal for composites and
+first_month/months_affected so a six-year figure is not mistaken for a
+one-month one.
+
+    python3 zed_catalog.py --report 2023-10        # one month, exit 1 if pending
+    python3 zed_catalog.py --report-all            # every month + ALL_catalog.csv
     python3 zed_catalog.py --apply  2023-10        # creates approved records
-    python3 zed_catalog.py --report-all            # every month, oldest first
 """
 
 import argparse
@@ -44,6 +58,7 @@ APPROVALS = Path("approvals")
 
 HEADER = ["#", "proposed_sku", "original_zid_sku", "product_name", "type",
           "last_known_price_sar", "held_orders_released_est",
+          "first_month", "months_affected",
           "orders_sampled_as_evidence", "name_consistency",
           "component_proposal", "proposed_action", "approval (Yes/No)",
           "client_notes"]
@@ -129,9 +144,36 @@ def dominant(counter):
     return top, (n / total if total else 0.0)
 
 
-def write_sheet(month, by_sku, singles, stats):
+def sweep(months, hs, singles):
+    """Chronological corpus scan. Returns (by_sku, per_month_stats).
+
+    Months arrive sorted, so the first month a SKU is seen in is simply the
+    month it is first inserted. Counters merge across months, which is what
+    makes the impact figure corpus-wide.
+    """
+    by_sku, per_month = {}, {}
+    for m in months:
+        stats, month_by_sku = gather(m, hs, singles)
+        per_month[m] = stats
+        for sku, rec in month_by_sku.items():
+            g = by_sku.get(sku)
+            if g is None:
+                g = by_sku[sku] = {"orders": 0, "names": Counter(),
+                                   "prices": Counter(), "months": Counter(),
+                                   "first_month": m}
+            g["orders"] += rec["orders"]
+            g["names"] += rec["names"]
+            g["prices"] += rec["prices"]
+            g["months"][m] += rec["orders"]
+        log.info("  %s: %d orders, %d held, %d SKU(s) (%d new)", m,
+                 stats["orders"], stats["held_orders"], len(month_by_sku),
+                 sum(1 for s in month_by_sku if by_sku[s]["first_month"] == m))
+    return by_sku, per_month
+
+
+def write_sheet(label, by_sku, singles, stats):
     APPROVALS.mkdir(parents=True, exist_ok=True)
-    path = APPROVALS / f"{month}_catalog.csv"
+    path = APPROVALS / f"{label}_catalog.csv"
     rows = sorted(by_sku.items(), key=lambda kv: -kv[1]["orders"])
     with open(path, "w", newline="", encoding="utf-8-sig") as f:
         w = csv.writer(f)
@@ -163,9 +205,11 @@ def write_sheet(month, by_sku, singles, stats):
                 kind_label, comp = "Needs your mapping (SKU not recognised)", ""
             else:
                 kind_label, comp = "Single product", ""
+            months = rec.get("months") or {}
             w.writerow([
                 i, f"LGCY-{sku}", sku, name, kind_label, price,
-                rec["orders"], sum(rec["names"].values()),
+                rec["orders"], rec.get("first_month", ""), len(months) or 1,
+                sum(rec["names"].values()),
                 round(name_share, 3), comp,
                 "Create legacy record in HubSpot (approved, LGCY namespace, "
                 "no Salla id) so these historical orders can sync",
@@ -255,19 +299,41 @@ def main():
     singles = single_token_universe()
     log.info("single-token SKU universe: %d", len(singles))
 
-    months = ([args.report] if args.report else
-              sorted(p.name.split(".")[0] for p in NORM.glob("*.jsonl.gz")))
-    total_pending = 0
+    if args.report:
+        n, path, stats = report(args.report, hs, singles)
+        if n:
+            log.warning("%d SKU(s) await approval. %s may not emit until its "
+                        "sheet comes back approved.", n, args.report)
+            return 1
+        return 0
+
+    months = sorted(p.name.split(".")[0] for p in NORM.glob("*.jsonl.gz"))
+    log.info("sweeping %d months, oldest first", len(months))
+    by_sku, per_month = sweep(months, hs, singles)
+    if not by_sku:
+        log.info("every month passes the catalog gate")
+        return 0
+
+    # per-month sheets carry only the SKUs that FIRST appear in that month
+    empty = 0
     for m in months:
-        n, path, stats = report(m, hs, singles)
-        total_pending += n
-    if total_pending:
-        log.warning("%d SKU(s) await approval across %d month(s). No month "
-                    "may emit until its sheet comes back approved.",
-                    total_pending, len(months))
-        return 1
-    log.info("every month passes the catalog gate")
-    return 0
+        mine = {s: r for s, r in by_sku.items() if r["first_month"] == m}
+        if not mine:
+            empty += 1
+            continue
+        write_sheet(m, mine, singles, per_month[m])
+
+    # the consolidated sheet is the one that actually goes to the client
+    master, n = write_sheet("ALL", by_sku, singles, {})
+    held_total = sum(s["held_orders"] for s in per_month.values())
+    order_total = sum(s["orders"] for s in per_month.values())
+    log.info("%d orders across %d months, %d held by %d distinct SKU(s)",
+             order_total, len(months), held_total, n)
+    log.info("%d month sheets written, %d months needed none",
+             len(months) - empty, empty)
+    log.info("consolidated sheet for the client -> %s", master)
+    log.warning("no month may emit until its sheet comes back approved.")
+    return 1
 
 
 if __name__ == "__main__":

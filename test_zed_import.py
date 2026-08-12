@@ -5,12 +5,16 @@ a Zid GUID reaching a Salla id field, a column-swapped row writing hs_sku="1",
 a barcode being mistaken for a bundle, a naive timestamp shifting every order
 by three hours, and an unmapped status defaulting instead of stopping.
 """
+import json
+import tempfile
 import unittest
+from pathlib import Path
 from unittest import mock
 
 import backfill
 import zed_normalize as zn
 import zed_plan as zp
+import zed_snapshot as zs
 
 
 LEGACY_HDR = ["id", "order_status", "source", "customer_note", "customer_name",
@@ -136,6 +140,27 @@ class TestColumnSwap(unittest.TestCase):
         sku, name, qty, fixed = zn.repair_column_swap("1", "6287032431307")
         self.assertEqual((sku, qty, fixed), ("6287032431307", "1", True))
 
+    def test_vocabulary_catches_what_shape_matching_missed(self):
+        """1,656 items shape-matching missed: a five-digit run (SKU_SHAPE_RE
+        allows three) and a purely alphabetic SKU that is real and approved."""
+        vocab = {"CH91011C45C46", "BRUSHES"}
+        for displaced in ("CH91011C45C46", "brushes"):
+            with self.subTest(displaced):
+                self.assertFalse(zn.repair_column_swap("1", displaced)[3],
+                                 "shape matching alone should miss this")
+                sku, _, qty, fixed = zn.repair_column_swap("1", displaced,
+                                                           vocab)
+                self.assertTrue(fixed)
+                self.assertEqual((sku, qty), (displaced, "1"))
+
+    def test_vocabulary_does_not_swallow_real_product_names(self):
+        """A one-word ASCII product name is exactly what a loosened shape rule
+        would misread as a SKU; membership keeps it a name."""
+        sku, name, _, fixed = zn.repair_column_swap("1", "AirGlow",
+                                                    {"C18", "BRUSHES"})
+        self.assertFalse(fixed)
+        self.assertEqual((sku, name), ("1", "AirGlow"))
+
     def test_leaves_good_rows_alone(self):
         sku, name, qty, fixed = zn.repair_column_swap("C18", "Multi Styler")
         self.assertEqual((sku, name, fixed), ("C18", "Multi Styler", False))
@@ -251,6 +276,86 @@ class TestCanonicalShape(unittest.TestCase):
     def test_mapper_autodetect(self):
         self.assertIsInstance(zn.mapper_for(RICH_IX), zn.RichMapper)
         self.assertIsInstance(zn.mapper_for(LEGACY_IX), zn.LegacyMapper)
+
+
+class TestSkuCaseFolding(unittest.TestCase):
+    """Zid writes both "C3" and "c3" for one product, across 315,249 orders
+    once C1/C2/C7C3C2/C7C3C1 are counted too. Unfolded, each variant earns its
+    own approval row and its own LGCY- product, splitting one product's orders
+    across two records."""
+
+    def test_both_mappers_fold_case(self):
+        a = zn.LegacyMapper().build("1", [legacy_row(sku="c3")], LEGACY_IX, {})
+        b = zn.LegacyMapper().build("2", [legacy_row(sku="C3")], LEGACY_IX, {})
+        self.assertEqual(a["items"][0]["sku"], b["items"][0]["sku"], "C3")
+        r = zn.RichMapper().build("3", [rich_row(product_sku="c18ch11")],
+                                  RICH_IX, {})
+        self.assertEqual(r["items"][0]["sku"], "C18CH11")
+
+    def test_folding_survives_the_column_swap_repair(self):
+        """The swap repair runs first and hands back the displaced value; the
+        fold has to come after it, not instead of it."""
+        o = zn.LegacyMapper().build(
+            "4", [legacy_row(sku=1, **{"product name": "c18"})],
+            LEGACY_IX, {})
+        self.assertEqual(o["items"][0]["sku"], "C18")
+
+    def test_barcodes_and_classification_unaffected(self):
+        self.assertEqual(zn.canon_sku("6287032431307"), "6287032431307")
+        self.assertEqual(zn.classify_sku("c3"), zn.classify_sku("C3"))
+
+
+class TestSnapshotMatchesProductionSemantics(unittest.TestCase):
+    """The snapshot's job is to answer exactly as HubSpot would. Measured
+    against the live portal: hs_sku EQ search is case-INsensitive, so
+    searching "BRUSHES" finds the product stored as "brushes". The live
+    catalog genuinely carries mixed-case SKUs (brushes, C1cc, ccC18).
+
+    An exact-match index would be stricter than production and report holds
+    that would not really hold -- the one direction of error this design
+    cannot tolerate, since every offline verdict is trusted downstream.
+    """
+
+    def _snap(self, tmp, sku):
+        import sqlite3
+        p = Path(tmp)
+        (p / "catalog.json").write_text(json.dumps({
+            "products": [{"id": "1", "properties": {
+                "hs_sku": sku, "catalog_approval_status": "approved"}}],
+            "templates": [], "components": []}))
+        (p / "orders.json").write_text("{}")
+        db = sqlite3.connect(p / "contacts.sqlite")
+        db.executescript("CREATE TABLE contact(id TEXT PRIMARY KEY,"
+                         " createdate TEXT, salla_customer_id TEXT);"
+                         "CREATE TABLE phone(key TEXT, id TEXT,"
+                         " createdate TEXT);")
+        db.commit()
+        db.close()
+        cfg = backfill.Config()
+        return zs.SnapshotHubSpot(cfg, "t", live=False, snap_dir=p)
+
+    def test_sku_lookup_ignores_case_in_both_directions(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            hs = self._snap(tmp, "brushes")       # as stored in HubSpot
+            for q in ("brushes", "BRUSHES", "Brushes"):
+                self.assertEqual(hs.gate_search_product_by_sku([q]), 1,
+                                 f"{q!r} must match the stored 'brushes'")
+
+    def test_stored_uppercase_matches_lowercase_query(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            hs = self._snap(tmp, "C1CC")
+            self.assertEqual(hs.gate_search_product_by_sku(["C1cc"]), 1)
+            # returns a response BODY, not a list: the engine reads
+            # ["results"] and .get("total") off it
+            body = hs.item_search_product_by_sku(["c1cc"])
+            self.assertEqual(len(body["results"]), 1)
+            self.assertEqual(body["results"][0]["properties"]["hs_sku"],
+                             "C1CC")
+
+    def test_a_genuinely_absent_sku_still_misses(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            hs = self._snap(tmp, "brushes")
+            self.assertEqual(hs.gate_search_product_by_sku(["C99"]), 0)
 
 
 class TestPlannerIsSealed(unittest.TestCase):
