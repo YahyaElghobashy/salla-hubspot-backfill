@@ -278,6 +278,53 @@ class TestCanonicalShape(unittest.TestCase):
         self.assertIsInstance(zn.mapper_for(LEGACY_IX), zn.LegacyMapper)
 
 
+class TestRowShift(unittest.TestCase):
+    """Legacy rows with no coupon_name lose the CELL, sliding every later
+    column one left. 56,993 orders (5.9%). The row stays plausible, which is
+    what makes it dangerous: total becomes the currency string, sku becomes
+    the quantity, and added_at becomes last_update -- so the order is filed
+    under the wrong month."""
+
+    def _row(self, shifted):
+        r = legacy_row(**{"coupon_code": "-", "sub_totals": 528.85, "vat": 0,
+                          "shipping": 48.97, "cod": 0, "discount": 0,
+                          "total": 577.81, "currency": "AED",
+                          "product name": "المجفف", "sku": "C18CH8",
+                          "quantity": 1})
+        if not shifted:
+            return r
+        at = LEGACY_IX["coupon_name"]
+        return tuple(list(r[:at]) + list(r[at + 1:]) + [None])
+
+    def test_aligned_rows_are_left_alone(self):
+        row = self._row(shifted=False)
+        out, shift = zn.repair_row_shift(row, LEGACY_IX)
+        self.assertEqual(shift, 0)
+        self.assertEqual(out[LEGACY_IX["total"]], 577.81)
+
+    def test_shifted_row_is_realigned(self):
+        out, shift = zn.repair_row_shift(self._row(shifted=True), LEGACY_IX)
+        self.assertEqual(shift, 1)
+        self.assertEqual(out[LEGACY_IX["total"]], 577.81)
+        self.assertEqual(out[LEGACY_IX["currency"]], "AED")
+        self.assertEqual(out[LEGACY_IX["sku"]], "C18CH8")
+        self.assertEqual(out[LEGACY_IX["sub_totals"]], 528.85)
+
+    def test_the_date_is_what_makes_this_urgent(self):
+        """A shifted row reads last_update as added_at, so the order lands in
+        the wrong monthly file."""
+        ix = LEGACY_IX
+        dt = "added_at (Asia/Riyadh)"
+        row = self._row(shifted=True)
+        self.assertNotEqual(row[ix[dt]], self._row(shifted=False)[ix[dt]])
+        out, _ = zn.repair_row_shift(row, ix)
+        self.assertEqual(out[ix[dt]], self._row(shifted=False)[ix[dt]])
+
+    def test_total_is_never_left_as_a_currency_code(self):
+        out, _ = zn.repair_row_shift(self._row(shifted=True), LEGACY_IX)
+        self.assertNotIn(str(out[LEGACY_IX["total"]]).upper(), zn.CURRENCIES)
+
+
 class TestSkuCaseFolding(unittest.TestCase):
     """Zid writes both "C3" and "c3" for one product, across 315,249 orders
     once C1/C2/C7C3C2/C7C3C1 are counted too. Unfolded, each variant earns its

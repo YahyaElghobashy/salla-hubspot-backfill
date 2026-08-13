@@ -253,6 +253,49 @@ def is_junk_row(status, mobile):
     return (status is None or str(status).strip() == "") and not str(mobile or "").strip()
 
 
+CURRENCIES = {"SAR", "AED", "KWD", "QAR", "BHD", "OMR", "USD", "EGP", "JOD"}
+
+
+def repair_row_shift(row, ix):
+    """Legacy rows that carry no coupon_name lose that CELL, not just its
+    value, so every column after it slides one position left.
+
+    Returns (row, shift). 56,993 orders -- 5.9% of the corpus -- are affected,
+    and the damage is much worse than it looks, because the row stays
+    perfectly plausible:
+
+        discount <- total          money silently wrong
+        total    <- currency       hs_total_price becomes the string "SAR"
+        sku      <- quantity       SKU becomes "1"
+        added_at <- last_update    order lands in the WRONG MONTH
+
+    The last one is the reason this cannot be left to the item-level swap
+    repair, which only ever saw the sku/name symptom and "fixed" it into the
+    right answer by accident. Dates decide which monthly file an order is
+    written to, so a shifted row is filed under the wrong month entirely.
+
+    Detection uses the currency column as an anchor: it must hold a currency
+    code, and when it does not, the code is found a few columns to the left
+    and the gap is reopened at coupon_name. Anchoring on a closed vocabulary
+    beats a heuristic here -- a row is either aligned or it is not.
+
+    The arithmetic proves the alignment: for the row this was found on,
+    sub_total 528.85 + shipping 48.97 = 577.82, which is the 577.81 sitting in
+    the discount slot.
+    """
+    cur_i = ix.get("currency")
+    if cur_i is None or str(row[cur_i] or "").strip().upper() in CURRENCIES:
+        return row, 0
+    for j in range(max(0, cur_i - 3), cur_i):
+        if str(row[j] or "").strip().upper() in CURRENCIES:
+            k = cur_i - j
+            at = ix.get("coupon_name", j)
+            # not truncated back to header length: columns are read by name,
+            # so the k trailing cells simply go unread
+            return tuple(list(row[:at]) + [None] * k + list(row[at:])), k
+    return row, 0
+
+
 def repair_column_swap(sku, name, vocab=None):
     """Legacy 2025 defect: `sku` holds a small integer (really the quantity)
     and `product name` holds the SKU. Returns (sku, name, qty_hint, repaired).
@@ -504,6 +547,9 @@ def scan_corpus(z, members):
             wb.close()
             continue
         for r in it:
+            # the sku and name columns both sit past the shift point, so an
+            # unrepaired row would teach the vocabulary a quantity as a SKU
+            r, _ = repair_row_shift(r, ix)
             s, n = r[sku_c], r[nm_c]
             if s and n:
                 pairs[(str(s).strip(), str(n).strip()[:80])] += 1
@@ -545,6 +591,7 @@ def normalize(zip_path, outdir="mirror/zed", repairs_log="mirror/zed_repairs.csv
     claimed = set()
     by_month = defaultdict(list)
     stats = {"source_rows": 0, "junk_rows": 0, "repaired_rows": 0,
+             "shifted_rows": 0,
              "overlap_skipped_orders": 0, "orders": 0, "items": 0,
              "orders_dropped_no_items": 0, "unmapped_status": Counter()}
     repairs, dropped = [], []
@@ -565,6 +612,11 @@ def normalize(zip_path, outdir="mirror/zed", repairs_log="mirror/zed_repairs.csv
             if oid_getter(r) is None and (dt_c is None or r[dt_c] is None):
                 continue                      # trailing blank padding
             stats["source_rows"] += 1
+            # realign BEFORE anything reads a column past coupon_name --
+            # including the date, which decides the month file
+            r, shift = repair_row_shift(r, ix)
+            if shift:
+                stats["shifted_rows"] += 1
             if is_junk_row(r[st_c] if st_c is not None else None,
                            r[mob_c] if mob_c is not None else None):
                 stats["junk_rows"] += 1
@@ -632,6 +684,7 @@ def main():
     print(f"source rows          {s['source_rows']:,}")
     print(f"  junk dropped       {s['junk_rows']:,}")
     print(f"  column-swaps fixed {s['repaired_rows']:,}")
+    print(f"  shifted rows fixed {s['shifted_rows']:,}")
     print(f"overlap skipped      {s['overlap_skipped_orders']:,} orders "
           f"(already claimed by the rich file)")
     print(f"orders written       {s['orders']:,}")
