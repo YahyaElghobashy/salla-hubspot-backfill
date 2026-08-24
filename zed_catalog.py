@@ -287,9 +287,16 @@ def verify_sheet(hs, months, singles, sheet=APPROVALS / "ALL_catalog.csv"):
     return 0
 
 
-def apply_approvals(month, hs, live):
-    """Create the approved LGCY- records. Idempotent: existing SKUs skip."""
-    path = APPROVALS / f"{month}_catalog.csv"
+def apply_approvals(month, hs, live, sheet=None):
+    """Create the approved LGCY- records. Idempotent: existing SKUs skip.
+
+    `sheet` overrides the per-month file so a single reviewed sheet covering
+    the whole corpus can be applied in one pass. The idempotency check is what
+    makes that safe to re-run: 21 of the approved SKUs already exist as
+    approved LGCY- records created after the sheet went out, and they must be
+    skipped rather than duplicated.
+    """
+    path = Path(sheet) if sheet else APPROVALS / f"{month}_catalog.csv"
     if not path.exists():
         raise SystemExit(f"no sheet at {path}; run --report first")
     made = skipped = pending = 0
@@ -353,7 +360,8 @@ def main():
 
     if args.apply:
         hs = HubSpot(cfg, token, live=args.live)
-        pending = apply_approvals(args.apply, hs, args.live)
+        pending = apply_approvals(args.apply, hs, args.live,
+                                  sheet=args.sheet)
         return 1 if pending else 0
 
     hs = SnapshotHubSpot(cfg, token, live=False)

@@ -87,8 +87,45 @@ def _month(v):
     return s[:7]
 
 
+def sheet_proposals(path=OUT / "warranty_input.csv"):
+    """SKU -> the class the client already proposed on the reviewed sheet.
+
+    The reviewed sheet only ever covered SKUs that were MISSING from HubSpot,
+    so it answers the warranty question for the legacy Zid catalogue and says
+    nothing about the products that were already there. Merging it in here is
+    what separates "Clara still has to decide this" from "Clara already did".
+    """
+    out = {}
+    if not path.exists():
+        return out
+    with open(path, newline="", encoding="utf-8-sig") as f:
+        for r in csv.DictReader(f):
+            sku = zn.canon_sku(r.get("sku"))
+            if sku:
+                out[sku] = {
+                    "product_class": (r.get("product_class") or "").strip(),
+                    "devices": (r.get("device_line_items") or "").strip(),
+                    "consumables": (r.get("consumable_line_items") or "").strip(),
+                }
+    return out
+
+
+def n_devices(desc):
+    """How many distinct devices the client says are inside.
+
+    Matters because the warranty object is one record PER DEVICE. A bundle
+    holding two devices must yield two warranties, so a bundle imported as a
+    single flat line item under-counts the customer's cover.
+    """
+    d = (desc or "").strip()
+    if not d or d == "-":
+        return 0
+    return len([x for x in d.split(" + ") if x.strip()])
+
+
 def report():
     prods = json.loads((SNAP / "products_full.json").read_text())
+    proposals = sheet_proposals()
     catalogue = {}
     for p in prods:
         pr = p["properties"]
@@ -150,13 +187,16 @@ def report():
         w.writerow(["sku", "product_name", "hs_line_items", "zid_orders",
                     "first_month", "last_month", "sold_recently",
                     "catalogue_record", "product_class", "warranty_months",
-                    "status"])
+                    "client_proposed_class", "devices_inside",
+                    "device_count", "status", "action_needed"])
         for sku, r in sorted(sold.items(),
                              key=lambda kv: -(kv[1]["hs_lines"]
                                               + kv[1]["zid_orders"])):
             cat = catalogue.get(sku)
+            prop = proposals.get(sku, {})
             last = max(r["months"]) if r["months"] else ""
             recent = bool(last and last >= recent_from)
+            nd = n_devices(prop.get("devices"))
             if not cat:
                 status = "NO PRODUCT RECORD - cannot be classified"
             elif not cat["product_class"]:
@@ -165,16 +205,36 @@ def report():
                 status = "device with NO warranty_months"
             else:
                 status = "ready"
+            # what a human actually has to do about it
+            if not cat:
+                action = ("create the product record (the Zid import will) "
+                          "then classify")
+            elif prop.get("product_class"):
+                action = f"apply proposed class '{prop['product_class']}'"
+            else:
+                action = "CLARA MUST CLASSIFY - no proposal from any source"
+            if nd >= 2:
+                action += f" | contains {nd} devices: needs components or it "\
+                          f"yields 1 warranty not {nd}"
             stats[status] += 1
             if recent:
                 stats[f"[recent] {status}"] += 1
+            if "CLARA MUST CLASSIFY" in action:
+                stats["needs a decision from Clara"] += 1
+                if recent:
+                    stats["[recent] needs a decision from Clara"] += 1
+            if nd >= 2:
+                stats["multi-device: needs component expansion"] += 1
             w.writerow([sku, (r["name"] or (cat or {}).get("name") or "")[:60],
                         r["hs_lines"], r["zid_orders"],
                         min(r["months"]) if r["months"] else "", last,
                         "yes" if recent else "no",
                         (cat or {}).get("hs_sku", ""),
                         (cat or {}).get("product_class", ""),
-                        (cat or {}).get("warranty_months", ""), status])
+                        (cat or {}).get("warranty_months", ""),
+                        prop.get("product_class", ""),
+                        prop.get("devices", ""), nd or "",
+                        status, action])
 
     log.info("SKUs that have ever sold: %d   (recency cutoff %s)",
              len(sold), recent_from)
