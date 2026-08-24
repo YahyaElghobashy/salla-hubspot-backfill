@@ -63,6 +63,26 @@ TARGET_OVERRIDES = {
     "CH11": "6287032431307",        # Volumizing Mousse (barcode-as-SKU)
 }
 
+# SKUs the client's review could not have caught, because that review
+# deduplicated WITHIN the sheet and never had the live HubSpot catalogue in
+# scope. A blank duplicate_of_sku on these rows was therefore not a decision
+# that the SKU is distinct.
+#
+# Each pair was verified the same way: byte-identical product name, identical
+# modal ex-VAT price, date ranges that abut at a cutover, and ZERO orders
+# containing both SKUs. That combination is a SKU rename, not two products.
+#
+# These live here rather than being hand-edited into sku_aliases.json because
+# that file is regenerated from the sheet on every run -- an edit made only
+# there is silently discarded the next time anyone runs this tool.
+LIVE_DUPLICATES = {
+    "C6":   "BRUSHES",          # مجموعة فرش الشعر, 65.22, relisted 2024-08
+    "C011": "C11",              # مشد للعين والوجه, 33.91, cutover 2023-04-02
+    "C012": "C12",              # مشبك الشعر, 25.22, cutover 2023-04-02
+    "C021": "C21",              # مدلك لفروة الرأس, 21.74, cutover 2025-02-10
+    "CH14": "6287032432144",    # Hair Wax Stick, 94.78, cutover 2025-10-09
+}
+
 # device_or_consumable -> product_class. "Device + Consumable" is a mixed
 # bundle: HubSpot's product_class enum calls that 'bundle', and the component
 # columns carry what is actually inside.
@@ -113,6 +133,12 @@ def build(rows, hs):
                     f"note; {held} orders would hold forever")
             continue
         aliases[sku] = target
+
+    for sku, target in LIVE_DUPLICATES.items():
+        sku = zn.canon_sku(sku)
+        if sku in approved:
+            approved.discard(sku)      # do not mint a duplicate product
+        aliases[sku] = zn.canon_sku(target)
 
     # every alias target must be resolvable, or its orders still hold
     for sku, target in sorted(aliases.items()):
