@@ -320,7 +320,7 @@ class QueueDrainEngine(Engine):
                         self._gate_cache[key] = ok
                 if not ok:
                     unverified.append({
-                        "id": item.get("id"), "pid": "",
+                        "id": item.get("id"), "pid": "", "sku": sku,
                         "name": item.get("name", ""),
                         "why": ("product deleted in Salla -- create+approve a "
                                 "legacy record with hs_sku="
@@ -343,15 +343,27 @@ class QueueDrainEngine(Engine):
                        else "product missing or unapproved -- approve as "
                             "standalone or map as bundle")
                 unverified.append({"id": item.get("id"), "pid": pid,
+                                   "sku": str(item.get("sku") or "").strip(),
                                    "name": item.get("name", ""), "why": why})
         return unverified
 
     def note_blocked(self, order, unverified):
+        """Tally blockers so the matrix names one fix per row.
+
+        Keyed on the product id when there is one, and on the SKU when there is
+        not. A deleted Salla product has NO id -- every one of them arrives here
+        with pid "" -- so keying on pid alone collapsed every distinct legacy
+        SKU into a single bucket that reported the whole count under whichever
+        item name happened to land first. That produced a matrix claiming ~631
+        orders were held by one product when they were held by dozens, which is
+        exactly the number a catalog owner would have been asked to approve.
+        """
         with self._blocked_lock:
             for u in unverified:
-                b = self._blocked.setdefault(u["pid"], {
+                key = u["pid"] or f"sku:{u.get('sku') or '-'}"
+                b = self._blocked.setdefault(key, {
                     "name": u["name"], "why": u["why"], "count": 0,
-                    "samples": []})
+                    "sku": u.get("sku", ""), "pid": u["pid"], "samples": []})
                 b["count"] += 1
                 if len(b["samples"]) < 5:
                     b["samples"].append(str(order.get("id")))
@@ -470,16 +482,17 @@ class QueueDrainEngine(Engine):
         rows = sorted(self._blocked.items(), key=lambda kv: -kv[1]["count"])
         with open(MATRIX_FILE, "w", newline="", encoding="utf-8") as f:
             w = csv.writer(f)
-            w.writerow(["salla_product_id", "item_name", "blocked_orders",
+            w.writerow(["salla_product_id", "sku", "item_name", "blocked_orders",
                         "suggested_action", "sample_order_ids", "checked_at",
                         "note"])
-            for pid, b in rows:
-                w.writerow([pid, b["name"], b["count"], b["why"],
-                            " ".join(b["samples"]), now_str(), extra_note])
+            for key, b in rows:
+                w.writerow([b.get("pid", ""), b.get("sku", ""), b["name"],
+                            b["count"], b["why"], " ".join(b["samples"]),
+                            now_str(), extra_note])
         log.info("BLOCKER MATRIX -> %s (%d blocker(s))", MATRIX_FILE, len(rows))
-        for pid, b in rows[:20]:
-            log.info("BLOCKER %-12s x%-5d %s  [%s]", pid, b["count"],
-                     b["name"][:70], b["why"][:60])
+        for key, b in rows[:20]:
+            log.info("BLOCKER %-12s %-20s x%-5d %s", b.get("pid") or "-",
+                     b.get("sku") or "-", b["count"], b["name"][:52])
 
     # -- main -------------------------------------------------------------------
 

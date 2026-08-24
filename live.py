@@ -253,8 +253,13 @@ class LiveEngine(Engine):
         search but NOT in our ledger is either a crash-partial or one created
         outside this engine (old Make / cutover): it is verified by comparing
         its HubSpot line-item count against the source order's item count
-        before being trusted, so a partial is repaired rather than silently
-        accepted, and a complete pre-existing order is skipped."""
+        before being trusted: a complete pre-existing order is skipped, and a
+        short one is FLAGGED, not repaired. Repair is deliberately out of line
+        -- adding the missing items here cannot know which of them already
+        landed -- so it is `tools/recover_missing.py`, which re-runs the
+        engine's own item router against the existing order and ledgers it.
+        Until that runs the row keeps returning 'error', which is why the
+        caller must increment attempts and let the breaker stop it."""
         oid = row["order_id"]
         hs_id = self.created_ledger.get(oid)
         if hs_id:
@@ -530,8 +535,22 @@ class LiveEngine(Engine):
                     for r in primaries:
                         res = self._resolve_preexisting(r)
                         if res:
+                            # An 'error' outcome here is a flagged partial, and
+                            # it MUST advance the attempt counter: _claimable
+                            # re-picks error rows while attempts <
+                            # live_max_attempts, so writing the count back
+                            # unchanged means the breaker never trips and the
+                            # row is re-verified (2 searches + a relay fetch)
+                            # every poll forever. Three orders did exactly that
+                            # from 2026-08-05, ~550 log lines a day each.
+                            # This is the "attempts+1 ... then loud ledger"
+                            # contract in the module docstring; the create path
+                            # already honours it. done/held/gone are terminal,
+                            # so their count is irrelevant.
+                            att = (r["attempts"] + 1 if res[0] == "error"
+                                   else r["attempts"])
                             marks.append((r["row"], r["order_id"],
-                                          res[0], r["attempts"], res[1]))
+                                          res[0], att, res[1]))
                         else:
                             to_fetch.append(r)
                     self.gio.queue_mark_batch(self.qsid, marks)

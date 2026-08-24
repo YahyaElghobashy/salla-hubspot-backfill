@@ -338,6 +338,23 @@ class Mapper:
     # the unit tests exercise.
     vocab = None
 
+    # From the client's reviewed approval sheet, via zed_review.py.
+    # A rejected-as-duplicate SKU is NOT a SKU to skip: 870 orders carry one,
+    # and with no product record and no alias they hold forever. Redirecting
+    # here rather than creating alias products is what the client asked for
+    # ("map its 27 orders onto LGCY-C13"), and it leaves one canonical product
+    # owning the history instead of two records splitting it.
+    aliases = {}
+    excluded = frozenset()
+
+    def canon(self, raw):
+        """Canonical SKU: case-folded, then aliased. Returns "" to drop."""
+        sku = canon_sku(raw)
+        if not sku:
+            return ""
+        sku = self.aliases.get(sku, sku)
+        return "" if sku in self.excluded else sku
+
     def order_key(self, row, ix):
         raise NotImplementedError
 
@@ -372,7 +389,7 @@ class LegacyMapper(Mapper):
     def row_to_item(self, row, ix, seq, oid, names_by_sku):
         sku, name, qty_hint, repaired = repair_column_swap(
             row[ix["sku"]], row[ix["product name"]], self.vocab)
-        sku = canon_sku(sku)
+        sku = self.canon(sku)
         if not sku:
             return None
         if not name:
@@ -440,7 +457,7 @@ class RichMapper(Mapper):
         return str(v) if v is not None else ""
 
     def row_to_item(self, row, ix, seq, oid, names_by_sku):
-        sku = canon_sku(row[ix["product_sku"]])
+        sku = self.canon(row[ix["product_sku"]])
         if not sku:
             return None
         qcol = ix.get("Quantity")
@@ -567,6 +584,24 @@ def scan_corpus(z, members):
     return ({s: c.most_common(1)[0][0] for s, c in names.items()}, vocab)
 
 
+def load_review_decisions(dirname="approvals"):
+    """(aliases, excluded) from the client's reviewed sheet, if ingested.
+
+    Absent files are not an error: the corpus normalises fine before any
+    review exists, and that is the state every run before today was in.
+    """
+    d = Path(dirname)
+    aliases, excluded = {}, set()
+    ap = d / "sku_aliases.json"
+    ep = d / "sku_excluded.json"
+    if ap.exists():
+        aliases = {canon_sku(k): canon_sku(v)
+                   for k, v in json.loads(ap.read_text()).items()}
+    if ep.exists():
+        excluded = {canon_sku(x) for x in json.loads(ep.read_text())}
+    return aliases, excluded
+
+
 def normalize(zip_path, outdir="mirror/zed", repairs_log="mirror/zed_repairs.csv",
               dropped_log="mirror/zed_dropped.csv"):
     """Stream every workbook into one gzipped JSONL per calendar month.
@@ -585,6 +620,10 @@ def normalize(zip_path, outdir="mirror/zed", repairs_log="mirror/zed_repairs.csv
     # rich first so its ids claim the overlap
     members.sort(key=lambda m: 0 if "2026" in m else 1)
 
+    aliases, excluded = load_review_decisions()
+    if aliases or excluded:
+        print(f"  client review: {len(aliases)} SKU alias(es), "
+              f"{len(excluded)} excluded", flush=True)
     names_by_sku, sku_vocab = scan_corpus(z, members)
     print(f"  SKU vocabulary: {len(sku_vocab):,} distinct values in the "
           f"SKU column", flush=True)
@@ -601,6 +640,8 @@ def normalize(zip_path, outdir="mirror/zed", repairs_log="mirror/zed_repairs.csv
         wb, it, ix = _sheet(z, m)
         mapper = mapper_for(ix)
         mapper.vocab = sku_vocab
+        mapper.aliases = aliases
+        mapper.excluded = excluded
         oid_getter = (lambda r: r[ix["order_id"]]) if mapper.format == "rich" \
             else (lambda r: r[ix["id"]])
         st_c = ix.get("order_status_name", ix.get("order_status"))

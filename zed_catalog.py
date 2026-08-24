@@ -251,6 +251,17 @@ def verify_sheet(hs, months, singles, sheet=APPROVALS / "ALL_catalog.csv"):
     if not sheet.exists():
         raise SystemExit(f"no sheet at {sheet}; run --report-all first")
     rows = list(csv.DictReader(open(sheet, newline="", encoding="utf-8-sig")))
+    # A reviewed sheet carries the client's decision. Injecting every row would
+    # simulate approving things they rejected, which is exactly the question
+    # this is meant to answer, so honour the column when it is filled in.
+    if any((r.get("approval (Yes/No)") or "").strip() for r in rows):
+        before = len(rows)
+        rows = [r for r in rows
+                if (r.get("approval (Yes/No)") or "").strip().lower()
+                in ("yes", "y")]
+        log.info("reviewed sheet: simulating the %d APPROVED rows of %d "
+                 "(rejects are handled by the alias map, not by a record)",
+                 len(rows), before)
     for r in rows:
         sku = zn.canon_sku(r["original_zid_sku"])
         rec = {"id": f"SIMULATED-{sku}",
@@ -324,6 +335,7 @@ def main():
     ap.add_argument("--config", default="config.json")
     ap.add_argument("--report")
     ap.add_argument("--report-all", action="store_true")
+    ap.add_argument("--sheet", help="path to a reviewed approval sheet")
     ap.add_argument("--verify-sheet", action="store_true",
                     help="approve every sheet row in a simulation and prove "
                          "nothing is left held")
@@ -358,7 +370,9 @@ def main():
 
     months = sorted(p.name.split(".")[0] for p in NORM.glob("*.jsonl.gz"))
     if args.verify_sheet:
-        return verify_sheet(hs, months, singles)
+        return verify_sheet(hs, months, singles,
+                            sheet=Path(args.sheet) if args.sheet
+                            else APPROVALS / "ALL_catalog.csv")
 
     log.info("sweeping %d months, oldest first", len(months))
     by_sku, per_month = sweep(months, hs, singles)

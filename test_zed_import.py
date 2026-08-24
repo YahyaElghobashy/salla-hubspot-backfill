@@ -325,6 +325,40 @@ class TestRowShift(unittest.TestCase):
         self.assertNotIn(str(out[LEGACY_IX["total"]]).upper(), zn.CURRENCIES)
 
 
+class TestReviewAliases(unittest.TestCase):
+    """The client rejected 17 SKUs, but 16 of those were "no, this is really
+    that one" and carry 870 orders between them. A rejected row is not a row
+    to skip: with no product record and no alias those orders hold forever.
+    This is the regression for reading the client's answer correctly."""
+
+    def _mapper(self, aliases=None, excluded=frozenset()):
+        m = zn.LegacyMapper()
+        m.aliases = aliases or {}
+        m.excluded = excluded
+        return m
+
+    def test_alias_redirects_to_the_canonical_sku(self):
+        m = self._mapper({"C042": "C42"})
+        o = m.build("1", [legacy_row(sku="C042")], LEGACY_IX, {})
+        self.assertEqual(o["items"][0]["sku"], "C42")
+
+    def test_alias_applies_after_case_folding(self):
+        """Sheet says C042; an order may spell it c042."""
+        m = self._mapper({"C042": "C42"})
+        o = m.build("1", [legacy_row(sku="c042")], LEGACY_IX, {})
+        self.assertEqual(o["items"][0]["sku"], "C42")
+
+    def test_excluded_sku_drops_the_item(self):
+        m = self._mapper(excluded=frozenset({"Z.40352.15934464629227045"}))
+        o = m.build("1", [legacy_row(sku="Z.40352.15934464629227045")],
+                    LEGACY_IX, {})
+        self.assertIsNone(o, "an order of only excluded items must not survive")
+
+    def test_no_review_loaded_is_a_no_op(self):
+        o = self._mapper().build("1", [legacy_row(sku="C42")], LEGACY_IX, {})
+        self.assertEqual(o["items"][0]["sku"], "C42")
+
+
 class TestSkuCaseFolding(unittest.TestCase):
     """Zid writes both "C3" and "c3" for one product, across 315,249 orders
     once C1/C2/C7C3C2/C7C3C1 are counted too. Unfolded, each variant earns its
