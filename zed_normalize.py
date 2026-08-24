@@ -247,13 +247,30 @@ def split_name(full):
 
 
 def is_junk_row(status, mobile):
-    """A row with neither a status nor a phone carries nothing usable. Counted
-    and logged rather than silently skipped, because the reconciliation chain
-    (source -> kept -> orders -> planned -> held -> emitted) must sum."""
+    """True when a row carries neither status nor phone.
+
+    CAREFUL: this is a property of a ROW, not of an ORDER, and the legacy
+    export is one row per LINE ITEM with the order-level columns filled in on
+    the first row only. Every continuation row of a multi-item basket
+    therefore looks "junk" by this test while carrying a perfectly good SKU,
+    quantity and price.
+
+    Applying it before rows are grouped by order id deleted 58,096 real line
+    items from 48,986 orders: legacy came out with a 0.09% multi-item basket
+    rate against 16.25% for the same store in the rich file. Use it only to
+    decide whether an ENTIRE GROUP is empty, via group_is_junk().
+    """
     return (status is None or str(status).strip() == "") and not str(mobile or "").strip()
 
 
-CURRENCIES = {"SAR", "AED", "KWD", "QAR", "BHD", "OMR", "USD", "EGP", "JOD"}
+# Derived from the corpus, not guessed: these are the codes that actually
+# appear in the legacy currency column (SAR 583,893 / AED 42,429 / KWD 37,037
+# / QAR 12,115 / BHD 6,302 / OMR 3,522 / USD 283 / IQD 43). IQD was missing
+# and its 43 rows could not be anchored by repair_row_shift, so 83 orders
+# wrote the string "IQD" into hs_total_price. EGP and JOD are kept as
+# plausible neighbours; an unused code costs nothing, a missing one corrupts.
+CURRENCIES = {"SAR", "AED", "KWD", "QAR", "BHD", "OMR", "USD", "EGP", "JOD",
+              "IQD"}
 
 
 def repair_row_shift(row, ix):
@@ -346,6 +363,7 @@ class Mapper:
     # owning the history instead of two records splitting it.
     aliases = {}
     excluded = frozenset()
+    _head = None
 
     def canon(self, raw):
         """Canonical SKU: case-folded, then aliased. Returns "" to drop."""
@@ -358,6 +376,22 @@ class Mapper:
     def order_key(self, row, ix):
         raise NotImplementedError
 
+    def is_head_row(self, row, ix):
+        """Does this row carry the order-level columns (status, phone)?
+
+        Only the first row of each order does in the legacy export, so the
+        head must be picked rather than assumed to be rows[0].
+        """
+        st = ix.get("order_status_name", ix.get("order_status"))
+        mob = ix.get("customer_telephone", ix.get("customer_mobile"))
+        return not is_junk_row(row[st] if st is not None else None,
+                               row[mob] if mob is not None else None)
+
+    def group_is_junk(self, rows, ix):
+        """An ORDER is junk only when not one of its rows carries order-level
+        data. A single header row rescues the whole basket."""
+        return not any(self.is_head_row(r, ix) for r in rows)
+
     def row_to_item(self, row, ix, seq, oid, names_by_sku):
         raise NotImplementedError
 
@@ -367,6 +401,8 @@ class Mapper:
     def build(self, oid, rows, ix, names_by_sku):
         """Group line rows into one canonical order dict, or None when the
         order retains no usable item."""
+        head = next((r for r in rows if self.is_head_row(r, ix)), rows[0])
+        self._head = head          # continuation rows inherit order-level bits
         items = []
         for seq, r in enumerate(rows, 1):
             it = self.row_to_item(r, ix, seq, oid, names_by_sku)
@@ -374,7 +410,7 @@ class Mapper:
                 items.append(it)
         if not items:
             return None
-        order = self.order_head(rows[0], ix, oid, items)
+        order = self.order_head(head, ix, oid, items)
         order["items"] = items
         return order
 
@@ -401,7 +437,10 @@ class LegacyMapper(Mapper):
             "name": name,
             "sku": sku,
             "quantity": qty,
-            "currency": str(row[ix["currency"]] or "SAR"),
+            "currency": str(row[ix["currency"]]
+                            or (self._head[ix["currency"]]
+                                if self._head is not None else None)
+                            or "SAR"),
             "product_type": "",
             "product": None,          # forces the legacy-SKU path in the engine
             "amounts": {
@@ -447,6 +486,42 @@ class LegacyMapper(Mapper):
             },
             "_zed": {"source_file": "legacy", "phone_e164": e164},
         }
+
+
+def rich_sub_total(row, ix):
+    """The rich file has two subtotal columns and only one is right per order.
+
+    `sub_total_value` is 0 on 167,586 of 231,497 orders -- 72% of the rich set
+    -- while `taxable_amount_value` carries the real figure: for 167,567 of
+    those, taxable + vat == total to the cent. Where `sub_total_value` IS
+    populated it is sometimes VAT-INCLUSIVE (44,617 orders have it equal to
+    the total), so a straight column swap would be just as wrong in the other
+    direction.
+
+    So neither column is trusted by name. The identity decides: whichever
+    candidate satisfies subtotal + vat == total wins, and only if neither does
+    do we fall back to a populated value. Left alone this shipped 167,586
+    orders with hs_subtotal_price = 0 against a correct total -- invisible in
+    production because the total looks right, and expensive to unpick after a
+    million-record backfill.
+    """
+    def num(col):
+        v = _f(row[ix[col]]) if ix.get(col) is not None else ""
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return None
+
+    st, tx = num("sub_total_value"), num("taxable_amount_value")
+    vat, tot = num("vat_value"), num("total_value")
+    if vat is not None and tot is not None:
+        for cand in (st, tx):
+            if cand is not None and abs(cand + vat - tot) < 0.01:
+                return f"{cand:.2f}"
+    for cand in (st, tx):
+        if cand:                      # non-zero, non-None
+            return f"{cand:.2f}"
+    return _f(row[ix["sub_total_value"]])
 
 
 class RichMapper(Mapper):
@@ -505,7 +580,7 @@ class RichMapper(Mapper):
             },
             "amounts": {
                 "total": {"amount": _f(row[ix["total_value"]])},
-                "sub_total": {"amount": _f(row[ix["sub_total_value"]])},
+                "sub_total": {"amount": rich_sub_total(row, ix)},
                 "shipping_cost": {"amount": _f(row[ix["shipping_fees"]]),
                                   "currency": cur},
                 "tax": {"amount": {"amount": _f(row[ix["vat_value"]])}},
@@ -658,11 +733,9 @@ def normalize(zip_path, outdir="mirror/zed", repairs_log="mirror/zed_repairs.csv
             r, shift = repair_row_shift(r, ix)
             if shift:
                 stats["shifted_rows"] += 1
-            if is_junk_row(r[st_c] if st_c is not None else None,
-                           r[mob_c] if mob_c is not None else None):
-                stats["junk_rows"] += 1
-                dropped.append((label, str(oid_getter(r) or ""), "junk row"))
-                continue
+            # NO per-row junk test here. In a line-item-level export the
+            # order-level columns live on the first row only, so a row that
+            # looks junk in isolation is usually a continuation line.
             oid = str(oid_getter(r) or "")
             if not oid:
                 continue
@@ -672,6 +745,11 @@ def normalize(zip_path, outdir="mirror/zed", repairs_log="mirror/zed_repairs.csv
         for oid, rows in groups.items():
             if oid in claimed:
                 stats["overlap_skipped_orders"] += 1
+                continue
+            if mapper.group_is_junk(rows, ix):
+                stats["junk_rows"] += len(rows)
+                dropped.append((label, oid, "junk order (no row had status "
+                                            "or phone)"))
                 continue
             try:
                 order = mapper.build(oid, rows, ix, names_by_sku)

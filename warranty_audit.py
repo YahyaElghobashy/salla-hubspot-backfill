@@ -201,8 +201,15 @@ def report():
                 status = "NO PRODUCT RECORD - cannot be classified"
             elif not cat["product_class"]:
                 status = "product exists, class EMPTY"
-            elif cat["product_class"] == "device" and not cat["warranty_months"]:
-                status = "device with NO warranty_months"
+            elif (cat["product_class"] in ("device", "bundle")
+                  and nd >= 1 and not cat["warranty_months"]):
+                # A bundle is not exempt. Every mixed bundle in this catalogue
+                # names at least one device in the client's own
+                # device_line_items, and the warranty object is per device --
+                # so a bundle with no term produces no cover for the styler
+                # inside it. Exempting 'bundle' let 62 rows covering 59,215
+                # orders report "ready" while delivering nothing.
+                status = f"{cat['product_class']} with NO warranty_months"
             else:
                 status = "ready"
             # what a human actually has to do about it

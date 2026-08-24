@@ -139,6 +139,14 @@ def warranty_rows(rows, aliases):
             continue           # aliased SKUs inherit their target's class
         raw = (r.get("device_or_consumable") or "").strip().lower()
         cls = CLASS_MAP.get(raw, "")
+        # device_or_consumable alone cannot express a DEVICE + DEVICE set, so
+        # a two-styler pack answers "Device" and would collapse to a single
+        # device record -- one warranty for a customer who owns two. The
+        # sheet's own `type` column already says it is a set, and
+        # component_proposal carries the decomposition, so trust those.
+        is_set = (r.get("type") or "").strip().lower().startswith("set /")
+        if cls == "device" and is_set:
+            cls = "bundle"
         out.append({
             "sku": sku,
             "proposed_sku": r.get("proposed_sku", ""),
@@ -147,6 +155,8 @@ def warranty_rows(rows, aliases):
             "product_class": cls,
             "device_line_items": r.get("device_line_items", ""),
             "consumable_line_items": r.get("consumable_line_items", ""),
+            "component_proposal": (r.get("component_proposal") or "").strip(),
+            "type": (r.get("type") or "").strip(),
             "warranty_months": "",       # the client still owes us this
             "needs_decision": "" if cls else "UNMAPPED CLASS",
         })

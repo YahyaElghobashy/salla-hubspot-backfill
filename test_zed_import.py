@@ -325,6 +325,99 @@ class TestRowShift(unittest.TestCase):
         self.assertNotIn(str(out[LEGACY_IX["total"]]).upper(), zn.CURRENCIES)
 
 
+class TestContinuationRowsSurvive(unittest.TestCase):
+    """The legacy export is one row per LINE ITEM with the order-level columns
+    filled in on the first row only. Testing junk per ROW deleted every
+    continuation line of every multi-item basket: 58,096 items across 48,986
+    orders, showing up as a 0.09% multi-item rate for legacy against 16.25%
+    for the same store in the rich file."""
+
+    def _order(self, n_items):
+        rows = [legacy_row(sku="C1")]
+        for i in range(n_items - 1):
+            # a continuation row: real SKU, no order-level columns
+            r = list(legacy_row(sku="C2"))
+            for col in ("order_status", "customer_mobile"):
+                r[LEGACY_IX[col]] = None
+            rows.append(tuple(r))
+        return rows
+
+    def test_a_two_line_basket_keeps_both_lines(self):
+        m = zn.LegacyMapper()
+        o = m.build("2793503", self._order(2), LEGACY_IX, {})
+        self.assertEqual(len(o["items"]), 2)
+        self.assertEqual([i["sku"] for i in o["items"]], ["C1", "C2"])
+
+    def test_head_is_the_row_that_has_order_level_data(self):
+        """The head must be picked, not assumed to be rows[0]: a continuation
+        row would yield an empty status and no customer."""
+        m = zn.LegacyMapper()
+        rows = self._order(3)
+        rows = [rows[1], rows[0], rows[2]]        # header not first
+        o = m.build("1", rows, LEGACY_IX, {})
+        self.assertTrue(o["customer"]["mobile"], "customer lost")
+        self.assertEqual(len(o["items"]), 3)
+
+    def test_group_is_junk_only_when_no_row_has_order_data(self):
+        m = zn.LegacyMapper()
+        good = self._order(2)
+        self.assertFalse(m.group_is_junk(good, LEGACY_IX))
+        allbad = good[1:]
+        self.assertTrue(m.group_is_junk(allbad, LEGACY_IX))
+
+    def test_continuation_row_inherits_order_currency(self):
+        m = zn.LegacyMapper()
+        rows = self._order(2)
+        r = list(rows[1]); r[LEGACY_IX["currency"]] = None
+        o = m.build("1", [rows[0], tuple(r)], LEGACY_IX, {})
+        self.assertEqual(o["items"][1]["currency"],
+                         o["items"][0]["currency"])
+
+
+class TestRichSubTotal(unittest.TestCase):
+    """sub_total_value is 0 on 167,586 of 231,497 rich orders while
+    taxable_amount_value carries the real figure; where sub_total_value IS
+    populated it is sometimes VAT-inclusive. The identity decides, not the
+    column name."""
+
+    def _row(self, st, tx, vat, tot):
+        r = list(rich_row())
+        for col, v in (("sub_total_value", st), ("taxable_amount_value", tx),
+                       ("vat_value", vat), ("total_value", tot)):
+            r[RICH_IX[col]] = v
+        return tuple(r)
+
+    def test_uses_taxable_when_subtotal_is_zero(self):
+        v = zn.rich_sub_total(self._row(0, 780.22, 117.03, 897.25), RICH_IX)
+        self.assertEqual(float(v), 780.22)
+
+    def test_uses_subtotal_when_it_satisfies_the_identity(self):
+        v = zn.rich_sub_total(self._row(469.57, 0, 70.43, 540.0), RICH_IX)
+        self.assertEqual(float(v), 469.57)
+
+    def test_refuses_a_vat_inclusive_subtotal(self):
+        """st == total means the column is VAT-inclusive; taxable is right."""
+        v = zn.rich_sub_total(self._row(540.0, 469.57, 70.43, 540.0), RICH_IX)
+        self.assertEqual(float(v), 469.57)
+
+
+class TestCurrencyVocabulary(unittest.TestCase):
+    def test_iqd_is_present(self):
+        """43 legacy rows carry IQD; without it repair_row_shift cannot anchor
+        and 83 orders wrote the string "IQD" into hs_total_price."""
+        self.assertIn("IQD", zn.CURRENCIES)
+
+    def test_shift_repair_anchors_on_iqd(self):
+        r = legacy_row(**{"coupon_code": "-", "currency": "IQD",
+                          "total": 209843.281, "sub_totals": 192327.147})
+        at = LEGACY_IX["coupon_name"]
+        shifted = tuple(list(r[:at]) + list(r[at + 1:]) + [None])
+        out, k = zn.repair_row_shift(shifted, LEGACY_IX)
+        self.assertEqual(k, 1)
+        self.assertEqual(out[LEGACY_IX["currency"]], "IQD")
+        self.assertEqual(out[LEGACY_IX["total"]], 209843.281)
+
+
 class TestReviewAliases(unittest.TestCase):
     """The client rejected 17 SKUs, but 16 of those were "no, this is really
     that one" and carry 870 orders between them. A rejected row is not a row
