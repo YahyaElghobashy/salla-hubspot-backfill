@@ -300,6 +300,12 @@ def apply_approvals(month, hs, live, sheet=None):
     if not path.exists():
         raise SystemExit(f"no sheet at {path}; run --report first")
     made = skipped = pending = 0
+    ledger = APPROVALS / "created_products.csv"
+    if live and not ledger.exists():
+        ledger.parent.mkdir(parents=True, exist_ok=True)
+        with open(ledger, "w", newline="", encoding="utf-8") as lf:
+            csv.writer(lf).writerow(
+                ["ts", "hs_sku", "original_zid_sku", "hubspot_id", "name"])
     with open(path, newline="", encoding="utf-8-sig") as f:
         for row in csv.DictReader(f):
             ok = (row.get("approval (Yes/No)") or "").strip().lower()
@@ -332,6 +338,14 @@ def apply_approvals(month, hs, live, sheet=None):
             if hid:
                 made += 1
                 log.info("created %s -> %s", hs_sku, hid)
+                # append-only rollback ledger, written per record rather than
+                # at the end: a run interrupted halfway must still leave every
+                # id it created recoverable, and 118 orphaned products with no
+                # list of ids is not something you want to reconstruct by hand
+                with open(ledger, "a", newline="", encoding="utf-8") as lf:
+                    csv.writer(lf).writerow(
+                        [now_str(), hs_sku, row["original_zid_sku"], hid,
+                         (row.get("product_name") or "")[:60]])
     log.info("%s: %d created, %d already existed, %d still awaiting approval",
              month, made, skipped, pending)
     return pending
