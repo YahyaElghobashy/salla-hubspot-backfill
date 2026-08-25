@@ -325,6 +325,121 @@ class TestRowShift(unittest.TestCase):
         self.assertNotIn(str(out[LEGACY_IX["total"]]).upper(), zn.CURRENCIES)
 
 
+class TestProductStampedAtCreate(unittest.TestCase):
+    """HubSpot copies product_class and warranty_months onto a line item only
+    when hs_product_id is in the CREATE call. Stamping it afterwards by PATCH
+    associates the product but copies nothing, which is why 294,264 line items
+    carry no classification against a tagged catalogue.
+
+    These guard the shape of the payload, which is the thing that actually
+    decides whether the warranty system has anything to read."""
+
+    def test_id_goes_into_the_payload(self):
+        out = backfill.with_product({"name": "Curler"}, "419285918921")
+        self.assertEqual(out["hs_product_id"], "419285918921")
+        self.assertEqual(out["name"], "Curler")
+
+    def test_caller_props_are_not_mutated(self):
+        """The bundle paths reuse a shared props dict across components."""
+        src = {"name": "Curler"}
+        backfill.with_product(src, "1")
+        self.assertNotIn("hs_product_id", src)
+
+    def test_empty_id_is_omitted_not_sent_blank(self):
+        """Sending "" risks a 400 that would cost the whole line item, where
+        the PATCH it replaces was merely a no-op."""
+        for empty in ("", None, "   "):
+            out = backfill.with_product({"name": "X"}, empty)
+            self.assertNotIn("hs_product_id", out)
+
+    def test_no_hs_product_id_patch_remains_in_the_engine(self):
+        """If anyone reintroduces the PATCH, inheritance silently stops."""
+        src = Path(backfill.__file__).read_text()
+        self.assertNotIn("stamp product on LI", src)
+        self.assertNotIn("stamp parent LI", src)
+        self.assertNotIn("stamp component LI", src)
+
+    def test_all_five_create_sites_stamp_the_product(self):
+        src = Path(backfill.__file__).read_text()
+        self.assertEqual(src.count("with_product("), 6,  # 5 calls + 1 def
+                         "every create_line_item site must stamp the product")
+
+
+class TestNullCustomerBlock(unittest.TestCase):
+    """Salla sends "customer": null on real orders. dict.get(k, {}) does NOT
+    protect against that: the default only applies when the key is ABSENT, so
+    c became None and c.get("id") raised
+    'NoneType' object has no attribute 'get'. Orders 333560771 and 367920962
+    died this way in the 2026-08-25 drain, after surviving the earlier phone
+    fix, because the failure had simply moved one step down."""
+
+    def _hs(self):
+        hs = object.__new__(backfill.HubSpot)
+        hs.cfg = backfill.Config()
+        hs._write = lambda *a, **k: (201, {"id": "1"})
+        return hs
+
+    def test_null_customer_does_not_crash(self):
+        hs = self._hs()
+        self.assertEqual(hs.create_contact({"id": "1", "customer": None}), "1")
+
+    def test_absent_customer_does_not_crash(self):
+        self.assertEqual(self._hs().create_contact({"id": "1"}), "1")
+
+    def test_null_amounts_does_not_crash(self):
+        """Same shape of bug on the order side."""
+        hs = self._hs()
+        hs.cfg.salla_timezone_default = "Asia/Riyadh"
+        try:
+            hs.create_order({"id": "1", "customer": None, "amounts": None,
+                             "date": {"date": "2026-01-01 00:00:00"}},
+                            "123", "Asia/Riyadh")
+        except AttributeError as e:
+            self.fail(f"null amounts crashed: {e}")
+
+
+class TestContactPhoneMatching(unittest.TestCase):
+    """A contact could be invisible to the search and still reject the create
+    on a uniqueness violation, because the search covered only `phone` while
+    the UNIQUE property is `main_phone_number` storing the +E.164 form. The
+    order then failed with no contact and no explanation. Seen live on order
+    1611507997: "794345860327 already has that value"."""
+
+    def _hs(self):
+        hs = object.__new__(backfill.HubSpot)
+        hs.cfg = backfill.Config()
+        return hs
+
+    def test_groups_cover_both_properties_and_both_spellings(self):
+        g = self._hs()._phone_filter_groups("966", "504947749")
+        pairs = {(f["propertyName"], f["value"])
+                 for grp in g for f in grp["filters"]}
+        self.assertIn(("phone", "504947749"), pairs)
+        self.assertIn(("phone", "966504947749"), pairs)
+        self.assertIn(("main_phone_number", "+966504947749"), pairs)
+        self.assertIn(("main_phone_number", "966504947749"), pairs)
+
+    def test_stays_within_hubspots_five_group_ceiling(self):
+        """Retry adds salla_customer_id on top, so this must leave room."""
+        self.assertLessEqual(len(self._hs()._phone_filter_groups("966", "5")), 4)
+
+    def test_missing_phone_does_not_reach_hubspot(self):
+        """HubSpot rejects an empty EQ value, search() then returned None and
+        the caller dereferenced it: 'NoneType' object has no attribute 'get'.
+        30 orders in the Zid corpus have no phone at all."""
+        hs = self._hs()
+        called = []
+        hs.search = lambda *a, **k: called.append(1)
+        self.assertEqual(hs.search_contact_by_phone("966", ""), (None, 0))
+        self.assertEqual(hs.search_contact_by_phone("966", None), (None, 0))
+        self.assertFalse(called, "no phone must not produce a search call")
+
+    def test_a_failed_search_returns_cleanly_instead_of_crashing(self):
+        hs = self._hs()
+        hs.search = lambda *a, **k: None
+        self.assertEqual(hs.search_contact_by_phone("966", "504947749"), (None, 0))
+
+
 class TestContinuationRowsSurvive(unittest.TestCase):
     """The legacy export is one row per LINE ITEM with the order-level columns
     filled in on the first row only. Testing junk per ROW deleted every

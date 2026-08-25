@@ -334,6 +334,32 @@ def http_request(method, url, headers=None, body=None, timeout=90):
         return 0, {}, f"NETWORK_ERROR: {e}"
 
 
+def with_product(props, product_id):
+    """Put hs_product_id INTO the line-item create payload.
+
+    HubSpot copies a product's product_class and warranty_months onto a line
+    item only when hs_product_id is present in the CREATE call. Setting it
+    afterwards by PATCH associates the product but copies nothing, which is why
+    294,264 existing line items carry no classification even though the
+    catalogue is tagged. Proven on the live portal with throwaway records:
+    created-with inherits, created-then-patched does not.
+
+    It does not overwrite what we send. A line item created with price 12.34
+    against a catalogue price of 999.99 kept 12.34, along with its name,
+    quantity, hs_sku and sale_context. HubSpot fills gaps only.
+
+    An empty id is omitted rather than sent as "": the PATCH this replaces was
+    a no-op in that case, and a create that 400s would cost the whole line
+    item rather than just its product association.
+    """
+    pid = str(product_id or "").strip()
+    if not pid:
+        return props
+    out = dict(props)
+    out["hs_product_id"] = pid
+    return out
+
+
 def with_retries(fn, what, retries=5, retry_statuses=(429, 500, 502, 503, 504, 0),
                  feedback=None):
     """Retry wrapper with exponential backoff and jitter. Honors Retry-After.
@@ -753,7 +779,7 @@ class HubSpot:
             what="li count")
         if status != 200:
             return -1  # unknown; caller must not treat as healthy
-        return len(data.get("results", []))
+        return len((data or {}).get("results") or [])
 
     def dedup_order_exists(self, salla_order_id):
         """[M310] POST /crm/v3/objects/orders/search on salla_order_id."""
@@ -764,18 +790,52 @@ class HubSpot:
             "properties": ["hs_object_id"], "limit": 1}, f"dedup {salla_order_id}")
         return int(data.get("total", 0)) > 0
 
+    def _phone_filter_groups(self, mobile_code, mobile):
+        """OR-groups covering every spelling a contact's phone may be stored in.
+
+        Searching only `phone` was a real defect, not a theoretical one. The
+        UNIQUE property in this portal is `main_phone_number` and it stores the
+        E.164 form with a leading plus, so a contact could be invisible to the
+        search AND still reject the subsequent create with
+        "794345860327 already has that value" on a 400. The order then failed
+        with no contact and no record of why.
+
+        It matters far more for the historical import than for live sync:
+        roughly 817k of the 958k contacts carry no salla_customer_id, so they
+        came from somewhere other than this engine and their formatting is not
+        ours to assume.
+
+        HubSpot allows at most 5 filterGroups, so this returns 4 and leaves one
+        spare for callers that add their own.
+        """
+        bare, coded = str(mobile), f"{mobile_code}{mobile}"
+        return [
+            {"filters": [{"propertyName": "phone", "operator": "EQ", "value": bare}]},
+            {"filters": [{"propertyName": "phone", "operator": "EQ", "value": coded}]},
+            {"filters": [{"propertyName": "main_phone_number", "operator": "EQ",
+                          "value": f"+{coded}" if not coded.startswith("+") else coded}]},
+            {"filters": [{"propertyName": "main_phone_number", "operator": "EQ",
+                          "value": coded}]},
+        ]
+
     def search_contact_by_phone(self, mobile_code, mobile):
-        """[M7] query on code+mobile, phone EQ mobile OR phone EQ code+mobile."""
+        """[M7] Match on phone or main_phone_number, in either spelling."""
+        if not str(mobile or "").strip():
+            # HubSpot rejects an empty EQ value outright ("value must be
+            # non-empty and non-blank"), and search() then returns None, which
+            # the caller dereferenced. An order with no phone is a real thing
+            # in this data; it is not a search that should be attempted.
+            return (None, 0)
         data = self.search("/crm/v3/objects/contacts/search", {
             "query": f"{mobile_code}{mobile}",
-            "filterGroups": [
-                {"filters": [{"propertyName": "phone", "operator": "EQ", "value": str(mobile)}]},
-                {"filters": [{"propertyName": "phone", "operator": "EQ", "value": f"{mobile_code}{mobile}"}]},
-            ],
+            "filterGroups": self._phone_filter_groups(mobile_code, mobile),
             "sorts": [{"propertyName": "createdate", "direction": "DESCENDING"}],
-            "properties": ["phone", "hs_object_id"], "limit": 5}, "contact search")
-        results = data.get("results", [])
-        return (results[0]["id"], int(data.get("total", 0))) if results else (None, 0)
+            "properties": ["phone", "main_phone_number", "hs_object_id"],
+            "limit": 5}, "contact search")
+        if not data:
+            return (None, 0)
+        results = (data or {}).get("results") or []
+        return (results[0]["id"], int((data or {}).get("total", 0))) if results else (None, 0)
 
     def search_contact_retry(self, order):
         """[M3-guardrail v1.1] Post-create-failure re-search. Same dual phone
@@ -783,15 +843,23 @@ class HubSpot:
         customer-create scenario stamps that id. Returns contact id or None."""
         code = dig(order, "customer.mobile_code")
         mobile = dig(order, "customer.mobile")
+        groups = []
+        if str(mobile or "").strip():
+            groups = self._phone_filter_groups(code, mobile)
+        cust = str(dig(order, "customer.id") or "").strip()
+        if cust:
+            groups.append({"filters": [
+                {"propertyName": "salla_customer_id", "operator": "EQ",
+                 "value": cust}]})
+        if not groups:
+            return None          # nothing to match on
         data = self.search("/crm/v3/objects/contacts/search", {
-            "filterGroups": [
-                {"filters": [{"propertyName": "phone", "operator": "EQ", "value": str(mobile)}]},
-                {"filters": [{"propertyName": "phone", "operator": "EQ", "value": f"{code}{mobile}"}]},
-                {"filters": [{"propertyName": "salla_customer_id", "operator": "EQ",
-                              "value": str(dig(order, "customer.id"))}]},
-            ],
+            "filterGroups": groups,
             "sorts": [{"propertyName": "createdate", "direction": "DESCENDING"}],
-            "properties": ["phone", "hs_object_id"], "limit": 5}, "contact retry search")
+            "properties": ["phone", "main_phone_number", "hs_object_id"],
+            "limit": 5}, "contact retry search")
+        if not data:
+            return None
         results = data.get("results", [])
         return results[0]["id"] if results else None
 
@@ -901,7 +969,7 @@ class HubSpot:
                            "component_product_name_snapshot", "quantity_in_bundle",
                            "component_code"],
             "limit": 100}, "components")
-        return data.get("results", [])
+        return (data or {}).get("results") or []
 
     # -- writes (skipped in dry run) ------------------------------------------
 
@@ -915,7 +983,11 @@ class HubSpot:
     def create_contact(self, order):
         """[M3] upsert branch: only runs when the phone search found nothing,
         so semantically this is a create with the exact property set."""
-        c = order.get("customer", {})
+        # NOT .get("customer", {}): the default only applies when the key is
+        # ABSENT. Salla sends "customer": null on real orders (333560771 and
+        # 367920962 in the 2026-08-25 drain), which made c None and crashed on
+        # c.get("id") with 'NoneType' object has no attribute 'get'.
+        c = order.get("customer") or {}
         props = {
             "incorrect_email": dig(order, "customer.email"),
             "firstname": dig(order, "customer.first_name"),
@@ -945,7 +1017,7 @@ class HubSpot:
                                  .replace(tzinfo=ZoneInfo(tz)).timestamp() * 1000))
         except Exception:
             created_ms = ""
-        discounts = order.get("amounts", {}).get("discounts", []) or []
+        discounts = (order.get("amounts") or {}).get("discounts") or []
         props = {
             "hs_tax": str(dig(order, "amounts.tax.amount.amount")),
             "salla_store": "Salla",
@@ -1869,14 +1941,15 @@ class Engine:
                     "reporting_product_key": item.get("sku", ""),
                     "revenue_attribution_method": "standalone_revenue",
                 }
-                li = self.hs.create_line_item(props, "LI legacy sku")
+                # [M232] the product is stamped IN the create, not by a follow-up
+                # PATCH, so the line item inherits product_class/warranty_months
+                li = self.hs.create_line_item(
+                    with_product(props, ps_first.get("id", "")), "LI legacy sku")
                 if not li:
                     self.flag_partial(order_id, "Module 110S: Create LI legacy",
                                       "create failed")
                     return
                 self._bump("li_standalone")
-                self.hs.patch_line_item(li, {"hs_product_id": ps_first.get("id", "")},
-                                        "stamp product on LI")        # [M232]
                 self.hs.associate("order", "line_items", order_id, li,
                                   ASSOC_ORDER_LI, "HUBSPOT_DEFINED",
                                   "assoc order LI")                   # [M111]
@@ -1918,13 +1991,12 @@ class Engine:
                           "salla_currency": item.get("currency", ""),
                           "reporting_product_key": item.get("sku", ""),
                           "revenue_attribution_method": "standalone_revenue"})
-            li = self.hs.create_line_item(props, "LI standalone")
+            li = self.hs.create_line_item(                             # [M232]
+                with_product(props, p_first.get("id", "")), "LI standalone")
             if not li:
                 self.flag_partial(order_id, "Module 110: Create LI standalone", "create failed")
                 return
             self._bump("li_standalone")
-            self.hs.patch_line_item(li, {"hs_product_id": p_first.get("id", "")},
-                                    "stamp product on LI")            # [M232]
             self.hs.associate("order", "line_items", order_id, li,
                               ASSOC_ORDER_LI, "HUBSPOT_DEFINED", "assoc order LI")  # [M111]
             return
@@ -1948,7 +2020,7 @@ class Engine:
 
     def _route_bundle_template(self, order, order_id, item, common, price, tpl, p_first):
         oid = str(order.get("id"))
-        tprops = tpl.get("properties", {})
+        tprops = tpl.get("properties") or {}
         tkey = tprops.get("bundle_template_key", "")
         # [M120] bundle record
         bundle_props = {
@@ -1993,20 +2065,19 @@ class Engine:
                       "reporting_product_key": tprops.get("bundle_sku", ""),
                       "revenue_attribution_method": "bundle_parent_revenue",
                       "bundle_template_name_snapshot": tprops.get("bundle_template_name", "")})
-        parent_li = self.hs.create_line_item(props, "LI bundle parent")
+        parent_li = self.hs.create_line_item(                                      # [M233]
+            with_product(props, p_first.get("id", "")), "LI bundle parent")
         if not parent_li:
             self.flag_partial(order_id, "Module 123: Create LI bundle parent", "create failed")
             return
         self._bump("li_bundle_parent")
-        self.hs.patch_line_item(parent_li, {"hs_product_id": p_first.get("id", "")},
-                                "stamp parent LI")                                 # [M233]
         self.hs.associate("order", "line_items", order_id, parent_li,
                           ASSOC_ORDER_LI, "HUBSPOT_DEFINED", "assoc order parent")  # [M124]
         self.hs.associate(OBJ_BUNDLE, "line_items", bundle_id, parent_li,
                           ASSOC_BUNDLE_PARENT, "USER_DEFINED", "assoc bundle parent")  # [M125]
         # [M126/M127/M128/M234/M129/M130] components
         for comp in self.hs.search_active_components(tkey):
-            cp = comp.get("properties", {})
+            cp = comp.get("properties") or {}
             try:
                 qty = float(item.get("quantity", 1)) * float(cp.get("quantity_in_bundle", 1) or 1)
                 qty = int(qty) if qty == int(qty) else qty
@@ -2027,15 +2098,16 @@ class Engine:
                 "allocated_component_revenue": "0",
                 "bundle_template_name_snapshot": tprops.get("bundle_template_name", ""),
             }
-            comp_li = self.hs.create_line_item(cprops, "LI component")
+            # [M234] the component carries the device, so this is the line item
+            # whose inherited classification decides whether a warranty exists
+            comp_li = self.hs.create_line_item(
+                with_product(cprops, cp.get("component_hubspot_product_id", "")),
+                "LI component")
             if not comp_li:
                 self.flag_partial(order_id, "Module 128: Create LI bundle component",
                                   "create failed")
                 continue
             self._bump("li_component")
-            self.hs.patch_line_item(comp_li,
-                                    {"hs_product_id": cp.get("component_hubspot_product_id", "")},
-                                    "stamp component LI")                          # [M234]
             self.hs.associate("order", "line_items", order_id, comp_li,
                               ASSOC_ORDER_LI, "HUBSPOT_DEFINED", "assoc order comp")   # [M129]
             self.hs.associate(OBJ_BUNDLE, "line_items", bundle_id, comp_li,
@@ -2084,14 +2156,13 @@ class Engine:
                       "reporting_product_key": ifempty(item.get("sku", ""), pid),
                       "revenue_attribution_method": "bundle_parent_revenue",
                       "bundle_template_name_snapshot": item.get("name", "")})
-        parent_li = self.hs.create_line_item(props, "LI bundle parent salla")
+        parent_li = self.hs.create_line_item(                                      # [M235]
+            with_product(props, p_first.get("id", "")), "LI bundle parent salla")
         if not parent_li:
             self.flag_partial(order_id, "Module 152: Create LI (bundle parent, Salla)",
                               "create failed")
             return
         self._bump("li_bundle_parent")
-        self.hs.patch_line_item(parent_li, {"hs_product_id": p_first.get("id", "")},
-                                "stamp parent LI salla")                           # [M235]
         self.hs.associate("order", "line_items", order_id, parent_li,
                           ASSOC_ORDER_LI, "HUBSPOT_DEFINED", "assoc order parent")  # [M153]
         self.hs.associate(OBJ_BUNDLE, "line_items", bundle_id, parent_li,

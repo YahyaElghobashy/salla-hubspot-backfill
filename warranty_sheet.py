@@ -37,11 +37,11 @@ from googleapiclient.discovery import build
 CLASSES = ["device", "consumable", "accessory", "bundle", "other"]
 
 HEADERS = ["#", "Product", "SKU", "Units sold", "Product class",
-           "Confidence % (DELETE THIS COLUMN)", "Warranty months",
-           "Currently in HubSpot", "What is inside", "Your earlier answer",
-           "Flags / notes", "HubSpot ID"]
+           "Devices in this item", "Warranty months",
+           "What is inside (components)", "Confidence % (DELETE THIS COLUMN)",
+           "Era", "Flags / notes", "HubSpot ID"]
 
-README = [
+README_OLD = [
     ["ClaraHair - Product classification for the warranty system"],
     [""],
     ["WHY THIS SHEET EXISTS"],
@@ -104,6 +104,68 @@ README = [
     [""],
     ["QUESTIONS"],
     ["Anything unclear, leave a comment on the cell and we will pick it up."],
+]
+
+
+README = [
+    ["ClaraHair - product classification and warranty terms"],
+    [""],
+    ["WHAT THIS IS"],
+    ["Every product in HubSpot, 199 of them, covering both what you sell today "
+     "and the older catalogue recovered from the Zid order history."],
+    ["We have already filled in every column. In most cases we are asking you "
+     "to CONFIRM rather than to decide."],
+    [""],
+    ["WHY IT MATTERS"],
+    ["The warranty system creates a record for every device a customer buys, "
+     "starting the day their order is delivered, so support can see what a "
+     "customer owns and whether it is still covered."],
+    ["It cannot do any of that until every product says what it is and, for "
+     "devices, how long it is covered."],
+    ["The same answers release the historical import, which brings six years "
+     "of past orders into HubSpot."],
+    [""],
+    ["WHAT WE NEED FROM YOU - THREE THINGS"],
+    [""],
+    ["1. CONFIRM THE 24 MONTH DEFAULT."],
+    ["   Every device, and every set containing a device, is pre-filled with "
+     "24 months."],
+    ["   If 24 months is right as a general rule, you do not need to touch the "
+     "column at all."],
+    ["   Change only the rows where a specific device is covered for a "
+     "different length. You can also change any individual term later without "
+     "affecting warranties already issued."],
+    [""],
+    ["2. CHECK THE 'Product class' COLUMN."],
+    ["   Correct anything we got wrong using the dropdown. The five values are "
+     "the only ones the system accepts:"],
+    ["      device      - a powered appliance carrying a warranty"],
+    ["      consumable  - runs out (shampoo, spray, serum, cream, mousse)"],
+    ["      accessory   - unpowered (plain brushes, combs, clips, bags, "
+     "diffuser attachments)"],
+    ["      bundle      - a set containing more than one item"],
+    ["      other       - gift vouchers, test records"],
+    [""],
+    ["3. CHECK 'What is inside' FOR THE SETS."],
+    ["   For every bundle we have worked out exactly which products it "
+     "contains. This decides how many warranties a customer gets: a set with "
+     "two devices should produce two."],
+    ["   The 'Devices in this item' column shows only the parts that carry "
+     "cover. Please correct any set where the contents look wrong."],
+    [""],
+    ["THEN DELETE THE 'Confidence %' COLUMN AND SEND IT BACK."],
+    ["It is our working note, not your data, and it must not reach HubSpot."],
+    [""],
+    ["HOW TO READ THE SHEET"],
+    ["Rows are ordered by how much each product has sold, so the ones that "
+     "matter most are at the top."],
+    ["Amber rows are the few we were genuinely unsure about. If your time is "
+     "short, those are the ones to look at."],
+    ["The 'Era' column says whether a product is part of the current catalogue "
+     "or was recovered from the older Zid history."],
+    [""],
+    ["QUESTIONS"],
+    ["Leave a comment on any cell and we will pick it up."],
 ]
 
 
@@ -175,7 +237,7 @@ def build_sheet(rows, token_path, title, share=None):
             "booleanRule": {
                 "condition": {"type": "CUSTOM_FORMULA",
                               "values": [{"userEnteredValue":
-                                          "=AND($F2<>\"\",$F2<80)"}]},
+                                          "=AND($I2<>\"\",$I2<80)"}]},
                 "format": {"backgroundColor": {"red": 1, "green": .95,
                                                "blue": .8}}}}}},
         # devices needing a term: highlight the empty warranty cell
@@ -186,7 +248,7 @@ def build_sheet(rows, token_path, title, share=None):
             "booleanRule": {
                 "condition": {"type": "CUSTOM_FORMULA",
                               "values": [{"userEnteredValue":
-                                          "=AND($E2=\"device\",$G2=\"\")"}]},
+                                          "=AND(OR($E2=\"device\",$F2<>\"\"),$G2=\"\")"}]},
                 "format": {"backgroundColor": {"red": 1, "green": .85,
                                                "blue": .85}}}}}},
         {"updateSheetProperties": {
@@ -204,8 +266,8 @@ def build_sheet(rows, token_path, title, share=None):
                 "bold": True, "fontSize": 14}}},
             "fields": "userEnteredFormat.textFormat"}},
     ]
-    widths = [(0, 40), (1, 300), (2, 140), (3, 90), (4, 130), (5, 160),
-              (6, 120), (7, 150), (8, 260), (9, 150), (10, 300), (11, 120)]
+    widths = [(0, 40), (1, 300), (2, 140), (3, 90), (4, 120), (5, 190),
+              (6, 130), (7, 260), (8, 150), (9, 110), (10, 260), (11, 120)]
     for i, w in widths:
         reqs.append({"updateDimensionProperties": {
             "range": {"sheetId": 1, "dimension": "COLUMNS",
@@ -241,8 +303,9 @@ def main():
     for i, r in enumerate(data, 1):
         rows.append([
             i, r["name"], r["hs_sku"], r["units_sold"], r["product_class"],
-            r["confidence"], "", r.get("current_warranty_months", ""),
-            r.get("inside", ""), r.get("client_answer", ""),
+            r.get("devices_inside", ""), r.get("warranty_months", ""),
+            r.get("components", ""), r["confidence"],
+            "Legacy (Zid)" if r.get("is_legacy") else "Current",
             r.get("note", ""), r["hubspot_id"],
         ])
     sid = build_sheet(rows, args.token, args.title, args.share)
