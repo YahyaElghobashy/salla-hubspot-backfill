@@ -325,6 +325,85 @@ class TestRowShift(unittest.TestCase):
         self.assertNotIn(str(out[LEGACY_IX["total"]]).upper(), zn.CURRENCIES)
 
 
+class TestEmitterPlanParsing(unittest.TestCase):
+    """The emitter must understand every op the planner records, refuse what
+    it does not, and fold the status PATCH into the create."""
+
+    def _plan_lines(self):
+        return [
+            {"op": "POST", "path": "/crm/v3/objects/orders", "sym": "§1",
+             "order_id": "9", "what": "o",
+             "body": {"properties": {"salla_order_id": "9"},
+                      "associations": []}},
+            {"op": "PATCH", "path": "/crm/v3/objects/orders/§1",
+             "order_id": "9", "sym": "§2", "what": "s",
+             "body": {"properties": {"last_salla_sync_status": "synced"}}},
+            {"op": "POST", "path": "/crm/v3/objects/line_items", "sym": "§3",
+             "order_id": "9", "what": "li",
+             "body": {"properties": {"salla_order_item_id": "Z9-1"}}},
+            {"op": "POST",
+             "path": "/crm/v4/associations/order/line_items/batch/create",
+             "order_id": "9", "sym": "§4", "what": "a",
+             "body": {"inputs": [{"from": {"id": "§1"}, "to": {"id": "§3"},
+                                  "types": []}]}},
+        ]
+
+    def _write_plan(self, tmp, lines):
+        import zed_emit
+        plans = Path(tmp) / "plans"; norm = Path(tmp) / "norm"
+        plans.mkdir(); norm.mkdir()
+        pf = plans / "2020-01.plan.jsonl"
+        pf.write_text("\n".join(json.dumps(x) for x in lines))
+        return zed_emit, plans, norm
+
+    def test_parses_and_folds(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            ze, plans, norm = self._write_plan(tmp, self._plan_lines())
+            old_p, old_n = ze.PLANS, ze.NORM
+            ze.PLANS, ze.NORM = plans, norm
+            try:
+                orders = ze.load_plan("2020-01")
+            finally:
+                ze.PLANS, ze.NORM = old_p, old_n
+            o = orders["9"]
+            self.assertEqual(o["status"], "synced")     # folded, not sent
+            self.assertEqual(len(o["lis"]), 1)
+            self.assertEqual(len(o["assoc"]), 1)
+
+    def test_unknown_op_refuses_the_month(self):
+        import tempfile
+        bad = self._plan_lines() + [{"op": "DELETE", "path": "/x",
+                                     "order_id": "9", "sym": "§9",
+                                     "what": "?", "body": {}}]
+        with tempfile.TemporaryDirectory() as tmp:
+            ze, plans, norm = self._write_plan(tmp, bad)
+            old_p, old_n = ze.PLANS, ze.NORM
+            ze.PLANS, ze.NORM = plans, norm
+            try:
+                with self.assertRaises(SystemExit):
+                    ze.load_plan("2020-01")
+            finally:
+                ze.PLANS, ze.NORM = old_p, old_n
+
+    def test_stale_plan_refused(self):
+        import tempfile, gzip, os, time
+        with tempfile.TemporaryDirectory() as tmp:
+            ze, plans, norm = self._write_plan(tmp, self._plan_lines())
+            nf = norm / "2020-01.jsonl.gz"
+            with gzip.open(nf, "wt") as f:
+                f.write("{}")
+            past = time.time() - 9999
+            os.utime(plans / "2020-01.plan.jsonl", (past, past))
+            old_p, old_n = ze.PLANS, ze.NORM
+            ze.PLANS, ze.NORM = plans, norm
+            try:
+                with self.assertRaises(SystemExit):
+                    ze.load_plan("2020-01")
+            finally:
+                ze.PLANS, ze.NORM = old_p, old_n
+
+
 class TestBundleExpansion(unittest.TestCase):
     """Zid items carry product=None, so all of them take the legacy standalone
     route and the engine's bundle machinery never runs. Flat, a device-bearing
