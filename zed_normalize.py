@@ -363,7 +363,56 @@ class Mapper:
     # owning the history instead of two records splitting it.
     aliases = {}
     excluded = frozenset()
+    expansions = {}
     _head = None
+
+    def expand_bundles(self, oid, items):
+        """Replace each device-bearing bundle item with a parent plus its
+        confirmed components.
+
+        Why here and not in the engine: every Zid item carries product=None,
+        so the engine routes all of them down the legacy standalone path and
+        its bundle machinery never runs. Expanding at normalisation produces
+        exactly the parent/component shape the Salla era already produces, and
+        each component then resolves to its own product and inherits
+        product_class and warranty_months at create. The warranty engine gets
+        per-device cover with no new routing logic.
+
+        Money: the parent keeps the full price, components carry price 0, so
+        order revenue is counted once. The engine is told which is which via
+        _zed_sale_context, an optional hint that live Salla payloads never
+        carry.
+
+        Component ids extend the parent's deterministic id (Z{oid}-{seq}.{k}),
+        so a re-run mints nothing new.
+        """
+        if not self.expansions:
+            return items
+        out = []
+        for it in items:
+            exp = self.expansions.get(it["sku"])
+            if not exp:
+                out.append(it)
+                continue
+            qty = int(float(it.get("quantity") or 1))
+            parent = dict(it)
+            parent["_zed_sale_context"] = "bundle_parent"
+            out.append(parent)
+            for k, c in enumerate(exp["components"], 1):
+                out.append({
+                    "id": f"{it['id']}.{k}",
+                    "name": c["sku"],       # the engine prefers the product's name
+                    "sku": c["sku"],
+                    "quantity": str(c["qty"] * qty),
+                    "currency": it.get("currency", "SAR"),
+                    "product_type": "",
+                    "product": None,
+                    "amounts": {"price_without_tax": {"amount": "0"},
+                                "original_price": {"amount": "0"}},
+                    "_zed_sale_context": "bundle_component",
+                    "_zed": {"component_of": it["sku"]},
+                })
+        return out
 
     def canon(self, raw):
         """Canonical SKU: case-folded, then aliased. Returns "" to drop."""
@@ -410,6 +459,7 @@ class Mapper:
                 items.append(it)
         if not items:
             return None
+        items = self.expand_bundles(oid, items)
         order = self.order_head(head, ix, oid, items)
         order["items"] = items
         return order
@@ -659,6 +709,19 @@ def scan_corpus(z, members):
     return ({s: c.most_common(1)[0][0] for s, c in names.items()}, vocab)
 
 
+def load_bundle_expansions(dirname="approvals"):
+    """Bundle SKU -> confirmed component list, from the client's verified
+    workbook via tools/build_bundle_expansions.py.
+
+    Absence is not an error: without the table every bundle imports flat,
+    which is the pre-expansion behaviour.
+    """
+    p = Path(dirname) / "bundle_expansions.json"
+    if not p.exists():
+        return {}
+    return {canon_sku(k): v for k, v in json.loads(p.read_text()).items()}
+
+
 def load_review_decisions(dirname="approvals"):
     """(aliases, excluded) from the client's reviewed sheet, if ingested.
 
@@ -696,6 +759,10 @@ def normalize(zip_path, outdir="mirror/zed", repairs_log="mirror/zed_repairs.csv
     members.sort(key=lambda m: 0 if "2026" in m else 1)
 
     aliases, excluded = load_review_decisions()
+    expansions = load_bundle_expansions()
+    if expansions:
+        print(f"  bundle expansions loaded: {len(expansions)} device-bearing "
+              f"bundles", flush=True)
     if aliases or excluded:
         print(f"  client review: {len(aliases)} SKU alias(es), "
               f"{len(excluded)} excluded", flush=True)
@@ -717,6 +784,7 @@ def normalize(zip_path, outdir="mirror/zed", repairs_log="mirror/zed_repairs.csv
         mapper.vocab = sku_vocab
         mapper.aliases = aliases
         mapper.excluded = excluded
+        mapper.expansions = expansions
         oid_getter = (lambda r: r[ix["order_id"]]) if mapper.format == "rich" \
             else (lambda r: r[ix["id"]])
         st_c = ix.get("order_status_name", ix.get("order_status"))

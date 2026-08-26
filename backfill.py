@@ -334,6 +334,41 @@ def http_request(method, url, headers=None, body=None, timeout=90):
         return 0, {}, f"NETWORK_ERROR: {e}"
 
 
+_ZED_CONTEXT_ATTRS = {
+    # sale_context -> (revenue_attribution_method, is_bundle_parent)
+    "bundle_parent": ("bundle_parent_revenue", True),
+    "bundle_component": ("component_quantity_only", False),
+}
+
+
+def zed_context(item, props):
+    """Honour the normaliser's optional _zed_sale_context hint on a legacy
+    line item.
+
+    The Zid import expands device-bearing bundles at normalisation into a
+    parent plus components, because product=None routes every Zid item down
+    the legacy standalone path and the engine's own bundle machinery never
+    runs for them. Without the hint every expanded piece would land as
+    sale_context=standalone_product: components would double as revenue in
+    reporting, and the warranty engine could not tell a parent from a real
+    item.
+
+    Live Salla payloads never carry the hint, so live behaviour is untouched:
+    absent hint means the props pass through exactly as built. This is a
+    documented deviation extending [M110S]/[M110].
+    """
+    ctx = item.get("_zed_sale_context")
+    if not ctx:
+        return props
+    ram, parent = _ZED_CONTEXT_ATTRS.get(ctx, (props.get("revenue_attribution_method"), False))
+    props = dict(props)
+    props["sale_context"] = ctx
+    props["revenue_attribution_method"] = ram
+    if parent:
+        props["is_bundle_parent"] = True
+    return props
+
+
 def with_product(props, product_id):
     """Put hs_product_id INTO the line-item create payload.
 
@@ -1944,7 +1979,8 @@ class Engine:
                 # [M232] the product is stamped IN the create, not by a follow-up
                 # PATCH, so the line item inherits product_class/warranty_months
                 li = self.hs.create_line_item(
-                    with_product(props, ps_first.get("id", "")), "LI legacy sku")
+                    with_product(zed_context(item, props),
+                                 ps_first.get("id", "")), "LI legacy sku")
                 if not li:
                     self.flag_partial(order_id, "Module 110S: Create LI legacy",
                                       "create failed")
@@ -1992,7 +2028,8 @@ class Engine:
                           "reporting_product_key": item.get("sku", ""),
                           "revenue_attribution_method": "standalone_revenue"})
             li = self.hs.create_line_item(                             # [M232]
-                with_product(props, p_first.get("id", "")), "LI standalone")
+                with_product(zed_context(item, props),
+                             p_first.get("id", "")), "LI standalone")
             if not li:
                 self.flag_partial(order_id, "Module 110: Create LI standalone", "create failed")
                 return

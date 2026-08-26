@@ -325,6 +325,91 @@ class TestRowShift(unittest.TestCase):
         self.assertNotIn(str(out[LEGACY_IX["total"]]).upper(), zn.CURRENCIES)
 
 
+class TestBundleExpansion(unittest.TestCase):
+    """Zid items carry product=None, so all of them take the legacy standalone
+    route and the engine's bundle machinery never runs. Flat, a device-bearing
+    bundle yields ZERO warranties (the warranty engine only covers
+    class=device line items): 220,383 orders, 366,890 devices. Expansion at
+    normalisation is the fix, and these pin its contract."""
+
+    EXP = {"C1C3": {"components": [
+        {"sku": "C1", "qty": 1, "is_device": True},
+        {"sku": "C3", "qty": 1, "is_device": True}], "device_count": 2}}
+
+    def _mapper(self):
+        m = zn.LegacyMapper()
+        m.aliases, m.excluded, m.expansions = {}, frozenset(), self.EXP
+        return m
+
+    def test_bundle_becomes_parent_plus_components(self):
+        o = self._mapper().build("77", [legacy_row(sku="C1C3")], LEGACY_IX, {})
+        self.assertEqual([i["sku"] for i in o["items"]], ["C1C3", "C1", "C3"])
+        self.assertEqual([i.get("_zed_sale_context") for i in o["items"]],
+                         ["bundle_parent", "bundle_component",
+                          "bundle_component"])
+
+    def test_money_counted_once(self):
+        """Parent keeps the price; components are 0. Anything else double
+        counts revenue."""
+        o = self._mapper().build("77", [legacy_row(sku="C1C3")], LEGACY_IX, {})
+        parent, c1, c3 = o["items"]
+        self.assertNotEqual(str(parent["amounts"]["price_without_tax"]["amount"]), "0")
+        for c in (c1, c3):
+            self.assertEqual(str(c["amounts"]["price_without_tax"]["amount"]), "0")
+
+    def test_component_ids_extend_the_parent_deterministically(self):
+        o = self._mapper().build("77", [legacy_row(sku="C1C3")], LEGACY_IX, {})
+        parent = o["items"][0]
+        self.assertEqual([i["id"] for i in o["items"][1:]],
+                         [f"{parent['id']}.1", f"{parent['id']}.2"])
+
+    def test_quantity_multiplies_into_components(self):
+        o = self._mapper().build("77", [legacy_row(sku="C1C3", quantity=2)],
+                                 LEGACY_IX, {})
+        self.assertEqual([i["quantity"] for i in o["items"][1:]], ["2", "2"])
+
+    def test_non_bundle_items_pass_through_unchanged(self):
+        o = self._mapper().build("77", [legacy_row(sku="C2")], LEGACY_IX, {})
+        self.assertEqual(len(o["items"]), 1)
+        self.assertNotIn("_zed_sale_context", o["items"][0])
+
+    def test_no_table_means_no_expansion(self):
+        m = self._mapper(); m.expansions = {}
+        o = m.build("77", [legacy_row(sku="C1C3")], LEGACY_IX, {})
+        self.assertEqual(len(o["items"]), 1)
+
+
+class TestZedContextHint(unittest.TestCase):
+    """The engine honours the normaliser's hint, and ONLY the hint: a live
+    Salla item never carries it, so live props must pass through untouched."""
+
+    def test_absent_hint_is_identity(self):
+        props = {"sale_context": "standalone_product",
+                 "revenue_attribution_method": "standalone_revenue"}
+        out = backfill.zed_context({"sku": "C2"}, props)
+        self.assertIs(out, props)      # not even copied
+
+    def test_parent_hint(self):
+        out = backfill.zed_context(
+            {"_zed_sale_context": "bundle_parent"},
+            {"sale_context": "standalone_product",
+             "revenue_attribution_method": "standalone_revenue"})
+        self.assertEqual(out["sale_context"], "bundle_parent")
+        self.assertEqual(out["revenue_attribution_method"],
+                         "bundle_parent_revenue")
+        self.assertTrue(out["is_bundle_parent"])
+
+    def test_component_hint(self):
+        out = backfill.zed_context(
+            {"_zed_sale_context": "bundle_component"},
+            {"sale_context": "standalone_product",
+             "revenue_attribution_method": "standalone_revenue"})
+        self.assertEqual(out["sale_context"], "bundle_component")
+        self.assertEqual(out["revenue_attribution_method"],
+                         "component_quantity_only")
+        self.assertNotIn("is_bundle_parent", out)
+
+
 class TestProductStampedAtCreate(unittest.TestCase):
     """HubSpot copies product_class and warranty_months onto a line item only
     when hs_product_id is in the CREATE call. Stamping it afterwards by PATCH
