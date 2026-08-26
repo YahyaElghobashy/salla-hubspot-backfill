@@ -58,9 +58,23 @@ APPROVALS = Path("approvals")
 
 # Client wrote their new catalogue's SKU; the portal still carries the old one.
 # Explicit, not fuzzy-matched, so a human can check the pairing at a glance.
+# Direction flipped 2026-08-25 on the client's verified sheet: the BARCODES
+# are the wrong SKUs (on Salla and Zid both) and the letter codes are
+# canonical. The HubSpot product records get renamed to the letter codes, so
+# every barcode spelling in the corpus must fold INTO the letter code, never
+# the other way around.
 TARGET_OVERRIDES = {
     "CH1": "CH01",                  # Daily Shampoo
-    "CH11": "6287032431307",        # Volumizing Mousse (barcode-as-SKU)
+}
+
+BARCODE_TO_CODE = {
+    "6287032431307": "CH11",        # Volumizing Mousse
+    "6287032431314": "CH10",        # Hair Gloss / Shine Spray
+    "6287032431321": "CH09",        # Dry Shampoo Spray
+    "6287032432366": "CH15",        # Repair & Shine Gloss
+    "6287032432144": "CH14",        # Hair Styling Wax
+    "6287032431734": "CP1",         # Hair Perfume | C
+    "6287032432151": "CH16",        # Flexible Setting Hairspray
 }
 
 # SKUs the client's review could not have caught, because that review
@@ -80,7 +94,7 @@ LIVE_DUPLICATES = {
     "C011": "C11",              # مشد للعين والوجه, 33.91, cutover 2023-04-02
     "C012": "C12",              # مشبك الشعر, 25.22, cutover 2023-04-02
     "C021": "C21",              # مدلك لفروة الرأس, 21.74, cutover 2025-02-10
-    "CH14": "6287032432144",    # Hair Wax Stick, 94.78, cutover 2025-10-09
+    "WAX":  "CH14",             # Hair Wax Stick sold under the bare word
 }
 
 # device_or_consumable -> product_class. "Device + Consumable" is a mixed
@@ -133,6 +147,12 @@ def build(rows, hs):
                     f"note; {held} orders would hold forever")
             continue
         aliases[sku] = target
+
+    for bc, code in BARCODE_TO_CODE.items():
+        bc = zn.canon_sku(bc)
+        if bc in approved:
+            approved.discard(bc)
+        aliases[bc] = zn.canon_sku(code)
 
     for sku, target in LIVE_DUPLICATES.items():
         sku = zn.canon_sku(sku)
