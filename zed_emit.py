@@ -48,6 +48,7 @@ Usage:
 import argparse
 import csv
 import fcntl
+import re
 import glob
 import json
 import logging
@@ -114,8 +115,13 @@ def load_plan(month):
     for line in open(pf, encoding="utf-8"):
         r = json.loads(line)
         o = orders.setdefault(r["order_id"], {"create": None, "status": None,
-                                              "lis": [], "assoc": []})
-        if r["op"] == "POST" and r["path"] == "/crm/v3/objects/orders":
+                                              "lis": [], "assoc": [],
+                                              "contacts": []})
+        if r["op"] == "POST" and r["path"] == "/crm/v3/objects/contacts":
+            # a customer that exists nowhere in the portal: 26 across the
+            # whole corpus, so these go one create per contact, no batching
+            o["contacts"].append(r)
+        elif r["op"] == "POST" and r["path"] == "/crm/v3/objects/orders":
             o["create"] = r
         elif r["op"] == "PATCH" and r["path"].startswith("/crm/v3/objects/orders/"):
             props = r["body"].get("properties") or {}
@@ -135,6 +141,55 @@ def load_plan(month):
     return orders
 
 
+_CONFLICT_ID = re.compile(r"(\d{6,}) already has that value")
+
+
+def create_or_resolve_contact(hs, body):
+    """One new contact. Idempotent: main_phone_number is unique in this
+    portal, and the 400 a duplicate create returns NAMES the existing record
+    ("794345860327 already has that value"), which is the resolve path a
+    re-run takes. A search fallback covers any other conflict wording."""
+    st, data = hs._req("POST", "/crm/v3/objects/contacts", body=body,
+                       what="emit contact")
+    if st in (200, 201):
+        return str(data["id"])
+    msg = json.dumps(data or {})
+    m = _CONFLICT_ID.search(msg)
+    if m:
+        return m.group(1)
+    phone = (body.get("properties") or {}).get("main_phone_number") or ""
+    if phone.strip():
+        st, d = hs._req("POST", "/crm/v3/objects/contacts/search",
+                        body={"filterGroups": [{"filters": [
+                                {"propertyName": "main_phone_number",
+                                 "operator": "EQ", "value": phone}]}],
+                              "properties": ["main_phone_number"], "limit": 1},
+                        what="contact resolve")
+        rs = (d or {}).get("results") or []
+        if rs:
+            return str(rs[0]["id"])
+    raise RuntimeError(f"contact create failed HTTP {st}: {msg[:240]}")
+
+
+def sub_symbols(node, symtab):
+    """Replace every §N id inside a create body's associations, recursively.
+    An unresolved symbol raises rather than being sent to HubSpot."""
+    if isinstance(node, dict):
+        out = {}
+        for k, v in node.items():
+            if k == "id" and isinstance(v, str) and v.startswith("§"):
+                real = symtab.get(v)
+                if not real:
+                    raise RuntimeError(f"unresolved symbol {v} in body")
+                out[k] = real
+            else:
+                out[k] = sub_symbols(v, symtab)
+        return out
+    if isinstance(node, list):
+        return [sub_symbols(x, symtab) for x in node]
+    return node
+
+
 def yield_to_live():
     """Same convention as the backfill engine: live wins."""
     return bool(glob.glob("mirror/live_active*.json"))
@@ -145,6 +200,15 @@ def emit_chunk(hs, month, ledger, chunk, live):
 
     Returns (created, repaired, li_count).
     """
+    # ---- phase 0: brand-new contacts (26 in the whole corpus) -------------
+    symtab0 = {}
+    for oid, o in chunk:
+        for r in o.get("contacts") or []:
+            if live:
+                symtab0[r["sym"]] = create_or_resolve_contact(hs, r["body"])
+            else:
+                symtab0[r["sym"]] = f"DRY-CT-{oid}"
+
     # ---- phase 1: orders --------------------------------------------------
     to_create, sym_of_oid = [], {}
     for oid, o in chunk:
@@ -153,10 +217,12 @@ def emit_chunk(hs, month, ledger, chunk, live):
         if o["status"]:
             props["last_salla_sync_status"] = o["status"]   # the fold
         body["properties"] = props
+        # a new contact's §sym can appear in the order's inline associations
+        body = sub_symbols(body, symtab0) if symtab0 else body
         sym_of_oid[oid] = o["create"]["sym"]
         to_create.append(body)
 
-    symtab = {}
+    symtab = dict(symtab0)
     if live:
         st, data = hs._req("POST", "/crm/v3/objects/orders/batch/create",
                            body={"inputs": to_create}, what="emit orders")

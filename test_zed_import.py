@@ -356,6 +356,48 @@ class TestEmitterPlanParsing(unittest.TestCase):
         pf.write_text("\n".join(json.dumps(x) for x in lines))
         return zed_emit, plans, norm
 
+    def test_contact_create_op_is_understood(self):
+        import tempfile
+        lines = self._plan_lines()
+        lines.insert(0, {"op": "POST", "path": "/crm/v3/objects/contacts",
+                         "order_id": "9", "sym": "§0", "what": "c",
+                         "body": {"properties": {"main_phone_number":
+                                                 "+966500000001"}}})
+        # the order references the new contact in its inline associations
+        lines[1]["body"]["associations"] = [
+            {"to": {"id": "§0"}, "types": []}]
+        with tempfile.TemporaryDirectory() as tmp:
+            ze, plans, norm = self._write_plan(tmp, lines)
+            old_p, old_n = ze.PLANS, ze.NORM
+            ze.PLANS, ze.NORM = plans, norm
+            try:
+                orders = ze.load_plan("2020-01")
+            finally:
+                ze.PLANS, ze.NORM = old_p, old_n
+            self.assertEqual(len(orders["9"]["contacts"]), 1)
+
+    def test_symbol_substitution_reaches_inline_associations(self):
+        import zed_emit as ze
+        body = {"properties": {"a": "1"},
+                "associations": [{"to": {"id": "§0"}, "types": []}]}
+        out = ze.sub_symbols(body, {"§0": "853000000001"})
+        self.assertEqual(out["associations"][0]["to"]["id"], "853000000001")
+        self.assertEqual(body["associations"][0]["to"]["id"], "§0")  # copy
+
+    def test_unresolved_symbol_raises_not_sends(self):
+        import zed_emit as ze
+        with self.assertRaises(RuntimeError):
+            ze.sub_symbols({"to": {"id": "§9"}}, {})
+
+    def test_conflict_400_names_the_existing_contact(self):
+        import zed_emit as ze
+        hs = object.__new__(backfill.HubSpot)
+        hs._req = lambda *a, **k: (400, {"message":
+            "Cannot set ... 794345860327 already has that value."})
+        cid = ze.create_or_resolve_contact(hs, {"properties":
+            {"main_phone_number": "+966504947749"}})
+        self.assertEqual(cid, "794345860327")
+
     def test_parses_and_folds(self):
         import tempfile
         with tempfile.TemporaryDirectory() as tmp:
