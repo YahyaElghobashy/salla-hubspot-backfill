@@ -190,24 +190,44 @@ def sub_symbols(node, symtab):
     return node
 
 
+def _persist_contacts(month, month_syms):
+    """Contact resolutions survive a restart: without this, a resume in the
+    back half of a month could meet a symbol resolved before the crash."""
+    p = LEDGERS / f"{month}.contacts.json"
+    LEDGERS.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(month_syms, sort_keys=True))
+
+
+def _load_contacts(month):
+    p = LEDGERS / f"{month}.contacts.json"
+    return json.loads(p.read_text()) if p.exists() else {}
+
+
 def yield_to_live():
     """Same convention as the backfill engine: live wins."""
     return bool(glob.glob("mirror/live_active*.json"))
 
 
-def emit_chunk(hs, month, ledger, chunk, live):
+def emit_chunk(hs, month, ledger, chunk, live, month_syms):
     """One chunk: batch order create -> batch LI create -> batch assoc.
 
     Returns (created, repaired, li_count).
     """
     # ---- phase 0: brand-new contacts (26 in the whole corpus) -------------
-    symtab0 = {}
+    # Resolutions go into the MONTH-scoped table, not a chunk-local one. The
+    # planner caches contacts per month, so a customer's second order in the
+    # same month references the contact's symbol WITHOUT carrying the create
+    # op. A chunk-local table missed exactly that and sent a literal "§9737"
+    # to HubSpot as a contact id (404, caught in production on 2020-10).
     for oid, o in chunk:
         for r in o.get("contacts") or []:
+            if r["sym"] in month_syms:
+                continue
             if live:
-                symtab0[r["sym"]] = create_or_resolve_contact(hs, r["body"])
+                month_syms[r["sym"]] = create_or_resolve_contact(hs, r["body"])
+                _persist_contacts(month, month_syms)
             else:
-                symtab0[r["sym"]] = f"DRY-CT-{oid}"
+                month_syms[r["sym"]] = f"DRY-CT-{oid}"
 
     # ---- phase 1: orders --------------------------------------------------
     to_create, sym_of_oid = [], {}
@@ -217,12 +237,13 @@ def emit_chunk(hs, month, ledger, chunk, live):
         if o["status"]:
             props["last_salla_sync_status"] = o["status"]   # the fold
         body["properties"] = props
-        # a new contact's §sym can appear in the order's inline associations
-        body = sub_symbols(body, symtab0) if symtab0 else body
+        # a new contact's §sym can appear in the order's inline associations,
+        # including for orders whose chunk carries no contact op at all
+        body = sub_symbols(body, month_syms)
         sym_of_oid[oid] = o["create"]["sym"]
         to_create.append(body)
 
-    symtab = dict(symtab0)
+    symtab = dict(month_syms)
     if live:
         st, data = hs._req("POST", "/crm/v3/objects/orders/batch/create",
                            body={"inputs": to_create}, what="emit orders")
@@ -334,6 +355,24 @@ def repair_order(hs, month, ledger, oid, o, hs_id):
 def emit_month(hs, month, live):
     orders = load_plan(month)
     ledger = MonthLedger(month)
+    month_syms = _load_contacts(month)
+
+    # Resolve EVERY contact symbol in the month up front, including those
+    # whose owning order is already done. A resume must be able to satisfy a
+    # reference to a contact created before the restart: the owning order is
+    # skipped as done, so its chunk never runs, and only this pre-pass puts
+    # the symbol in the table. create_or_resolve is idempotent (the duplicate
+    # 400 names the existing record), so re-resolving costs one call and can
+    # never mint a second contact. At most 26 exist corpus-wide.
+    for oid, o in orders.items():
+        for r in o.get("contacts") or []:
+            if r["sym"] in month_syms:
+                continue
+            if live:
+                month_syms[r["sym"]] = create_or_resolve_contact(hs, r["body"])
+                _persist_contacts(month, month_syms)
+            else:
+                month_syms[r["sym"]] = f"DRY-CT-{oid}"
 
     done = {oid for oid, (s, _) in ledger.state.items() if s == "done"}
     dirty = {oid: hid for oid, (s, hid) in ledger.state.items()
@@ -358,7 +397,7 @@ def emit_month(hs, month, live):
             log.info("live sync active; yielding 30s")
             time.sleep(30)
         chunk = todo[i:i + CHUNK_ORDERS]
-        c, _, l = emit_chunk(hs, month, ledger, chunk, live)
+        c, _, l = emit_chunk(hs, month, ledger, chunk, live, month_syms)
         sent += c
         lis += l
         if sent % 1000 < CHUNK_ORDERS:
