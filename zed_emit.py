@@ -247,6 +247,43 @@ def emit_chunk(hs, month, ledger, chunk, live, month_syms):
     if live:
         st, data = hs._req("POST", "/crm/v3/objects/orders/batch/create",
                            body={"inputs": to_create}, what="emit orders")
+        if st == 400 and "already has that value" in json.dumps(data or {}):
+            # Lost-response recovery. A batch can SUCCEED at HubSpot while its
+            # response dies with the network (it did, in the 2026-08-28
+            # outage), leaving orders in the portal that the ledger never saw.
+            # salla_order_id is unique on orders, so the re-create 400s -- the
+            # portal itself is refusing the duplicate, which is the correct
+            # refusal. Find every chunk order that already exists, hand each
+            # to the repair path (which finishes line items + associations and
+            # marks it done), and emit the genuinely-fresh remainder.
+            oids = [str(oid) for oid, _ in chunk]
+            st2, d2 = hs._req(
+                "POST", "/crm/v3/objects/orders/search",
+                body={"filterGroups": [{"filters": [
+                        {"propertyName": "salla_order_id", "operator": "IN",
+                         "values": oids}]}],
+                      "properties": ["salla_order_id"], "limit": 100},
+                what="lost-response scan")
+            existing = {str((r.get("properties") or {}).get("salla_order_id")):
+                        str(r["id"]) for r in (d2 or {}).get("results", [])}
+            if not existing:
+                raise RuntimeError(f"order batch 400 duplicate but scan found "
+                                   f"none: {json.dumps(data)[:300]}")
+            log.warning("lost-response recovery: %d of %d chunk orders "
+                        "already exist; repairing them", len(existing),
+                        len(chunk))
+            fresh = []
+            for oid, o in chunk:
+                hid = existing.get(str(oid))
+                if hid:
+                    ledger.mark(oid, hid, len(o["lis"]), "created")
+                    repair_order(hs, month, ledger, oid, o, hid)
+                else:
+                    fresh.append((oid, o))
+            if not fresh:
+                return len(chunk), len(existing), 0
+            c, r, l = emit_chunk(hs, month, ledger, fresh, live, month_syms)
+            return len(chunk), len(existing) + r, l
         if st not in (200, 201):
             raise RuntimeError(f"order batch create HTTP {st}: "
                                f"{json.dumps(data)[:300]}")
