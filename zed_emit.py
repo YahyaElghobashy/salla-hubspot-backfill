@@ -371,14 +371,39 @@ def repair_order(hs, month, ledger, oid, o, hs_id):
                if str((r["body"].get("properties") or {})
                       .get("salla_order_item_id")) not in have]
     for i in range(0, len(missing), 100):
+        batch = missing[i:i + 100]
         st, data = hs._req("POST", "/crm/v3/objects/line_items/batch/create",
-                           body={"inputs": [r["body"] for r in missing[i:i+100]]},
+                           body={"inputs": [r["body"] for r in batch]},
                            what="repair LI create")
-        if st not in (200, 201):
-            raise RuntimeError(f"repair LI create HTTP {st}")
-        for r in (data or {}).get("results", []):
-            iid = (r.get("properties") or {}).get("salla_order_item_id")
-            have[str(iid)] = str(r["id"])
+        if st in (200, 201):
+            for r in (data or {}).get("results", []):
+                iid = (r.get("properties") or {}).get("salla_order_item_id")
+                have[str(iid)] = str(r["id"])
+            continue
+        if st == 400 and "already has that value" in json.dumps(data or {}):
+            # The line item EXISTS but the search that built `have` did not
+            # return it: HubSpot search is eventually consistent, and items
+            # created seconds before a crash are not yet indexed when the
+            # repair runs. Fall back to one create per item; the unique
+            # salla_order_item_id turns each duplicate into a 400 that NAMES
+            # the existing record, which is the id we wanted anyway.
+            for r in batch:
+                iid = str((r["body"].get("properties") or {})
+                          .get("salla_order_item_id"))
+                st1, d1 = hs._req("POST", "/crm/v3/objects/line_items",
+                                  body=r["body"], what="repair LI single")
+                if st1 in (200, 201):
+                    have[iid] = str((d1 or {}).get("id"))
+                    continue
+                m = _CONFLICT_ID.search(json.dumps(d1 or {}))
+                if m:
+                    have[iid] = m.group(1)
+                    continue
+                raise RuntimeError(f"repair LI {iid} HTTP {st1}: "
+                                   f"{json.dumps(d1)[:200]}")
+            continue
+        raise RuntimeError(f"repair LI create HTTP {st}: "
+                           f"{json.dumps(data)[:200]}")
     inputs = [{"from": {"id": hs_id}, "to": {"id": li},
                "types": [{"associationCategory": "HUBSPOT_DEFINED",
                           "associationTypeId": 513}]}
