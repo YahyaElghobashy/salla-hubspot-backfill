@@ -19,7 +19,7 @@ from pathlib import Path
 WS = Path(os.path.expanduser("~/zed_local/ws"))
 PLANS = WS / "mirror/zed_plans"
 LEDGERS = WS / "mirror/zed_emitted"
-LOG = Path("/tmp/emit_all.log")
+LOG = WS / "emit_all.log"
 PORT = 8899
 
 
