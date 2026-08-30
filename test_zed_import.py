@@ -325,6 +325,93 @@ class TestRowShift(unittest.TestCase):
         self.assertNotIn(str(out[LEGACY_IX["total"]]).upper(), zn.CURRENCIES)
 
 
+class TestContinuationRowShift(unittest.TestCase):
+    """The 2nd+ line of a multi-item order slides exactly like a first line,
+    but carries no order-level cells -- so the currency anchor has nothing to
+    anchor ON and the row was left shifted.
+
+    Production defect, 2026-08-30: 11,544 line items across 6,805 orders in
+    2025-05 and 2025-06 reached the planner with a product name in
+    hs_line_item_currency_code, quantity 0, and no price. HubSpot refused the
+    batch ("Could not hydrate LINE_ITEM with properties from PRODUCT ...:
+    Provide a valid ISO currency code") because a price-less line item makes
+    it read the price off the product, and no product in this catalogue
+    carries a currency code. The rows below are order 51655150 verbatim.
+    """
+
+    # the corpus vocabulary the second anchor tests against
+    VOCAB = {"C1", "C18", "C13", "CH04"}
+
+    def _continuation(self):
+        """Raw row 2 of order 51655150, exactly as the 2025 workbook holds it:
+        four populated cells, everything from coupon_name onward slid left."""
+        r = [None] * len(LEGACY_HDR)
+        for k, v in {
+            "id": 51655150,
+            "source": "المتجر الإلكتروني",
+            "coupon_name": 0,
+            "currency": "جهاز تمويج الشعر الذاتي - ويفي - ويفي رمادي",
+            "product name": "C1",
+            "sku": 1,
+            "quantity": 0,
+            "order_products_cost": 30.804052288488,
+        }.items():
+            r[LEGACY_IX[k]] = v
+        return tuple(r)
+
+    def test_the_bug_reproduces_without_the_vocabulary(self):
+        """No vocabulary means no second anchor: this is the pre-fix result,
+        kept so the test proves the fix rather than merely asserting it."""
+        out, shift = zn.repair_row_shift(self._continuation(), LEGACY_IX)
+        self.assertEqual(shift, 0)
+        self.assertEqual(out[LEGACY_IX["quantity"]], 0)
+        self.assertIsNone(out[LEGACY_IX["unit_price"]])
+        self.assertNotIn(str(out[LEGACY_IX["currency"]]).upper(), zn.CURRENCIES)
+
+    def test_continuation_row_is_realigned(self):
+        out, shift = zn.repair_row_shift(self._continuation(), LEGACY_IX,
+                                         self.VOCAB)
+        self.assertEqual(shift, 1)
+        self.assertEqual(out[LEGACY_IX["sku"]], "C1")
+        self.assertEqual(out[LEGACY_IX["quantity"]], 1)
+        self.assertEqual(out[LEGACY_IX["unit_price"]], 30.804052288488)
+        self.assertEqual(out[LEGACY_IX["product name"]],
+                         "جهاز تمويج الشعر الذاتي - ويفي - ويفي رمادي")
+        self.assertEqual(out[LEGACY_IX["sub_totals"]], 0)
+
+    def test_currency_is_left_for_the_order_head_to_supply(self):
+        """A continuation row never carried a currency of its own; after
+        realignment the cell is empty, which is what makes the mapper inherit
+        the order's."""
+        out, _ = zn.repair_row_shift(self._continuation(), LEGACY_IX,
+                                     self.VOCAB)
+        self.assertIsNone(out[LEGACY_IX["currency"]])
+
+    def test_quantity_zero_is_never_shipped(self):
+        """The pre-fix quantity was 0 -- a real cost value read through the
+        quantity label. Zero quantity is the symptom to refuse."""
+        out, _ = zn.repair_row_shift(self._continuation(), LEGACY_IX,
+                                     self.VOCAB)
+        self.assertNotEqual(out[LEGACY_IX["quantity"]], 0)
+
+    def test_an_aligned_continuation_row_is_left_alone(self):
+        r = [None] * len(LEGACY_HDR)
+        for k, v in {"id": 51655150, "product name": "Auto-Curler",
+                     "sku": "C1", "quantity": 1, "unit_price": 30.8}.items():
+            r[LEGACY_IX[k]] = v
+        out, shift = zn.repair_row_shift(tuple(r), LEGACY_IX, self.VOCAB)
+        self.assertEqual(shift, 0)
+        self.assertEqual(out[LEGACY_IX["sku"]], "C1")
+
+    def test_the_second_anchor_does_not_touch_order_level_rows(self):
+        """An aligned first row with a populated currency window must never
+        reach the SKU anchor, whatever its currency says."""
+        row = legacy_row(currency="SAR", sku="C18", quantity=2)
+        out, shift = zn.repair_row_shift(tuple(row), LEGACY_IX, self.VOCAB)
+        self.assertEqual(shift, 0)
+        self.assertEqual(out[LEGACY_IX["quantity"]], 2)
+
+
 class TestEmitterPlanParsing(unittest.TestCase):
     """The emitter must understand every op the planner records, refuse what
     it does not, and fold the status PATCH into the create."""

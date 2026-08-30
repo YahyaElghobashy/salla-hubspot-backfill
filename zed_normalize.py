@@ -273,7 +273,7 @@ CURRENCIES = {"SAR", "AED", "KWD", "QAR", "BHD", "OMR", "USD", "EGP", "JOD",
               "IQD"}
 
 
-def repair_row_shift(row, ix):
+def repair_row_shift(row, ix, vocab=None):
     """Legacy rows that carry no coupon_name lose that CELL, not just its
     value, so every column after it slides one position left.
 
@@ -299,6 +299,13 @@ def repair_row_shift(row, ix):
     The arithmetic proves the alignment: for the row this was found on,
     sub_total 528.85 + shipping 48.97 = 577.82, which is the 577.81 sitting in
     the discount slot.
+
+    A continuation row -- the 2nd+ line of a multi-item order -- carries no
+    order-level cells at all, so the currency anchor is absent rather than
+    wrong and the search finds nothing. `vocab` supplies the second anchor:
+    the SKU column, tested against the same corpus vocabulary the swap repair
+    uses. Without it those rows stay shifted and reach HubSpot with a product
+    name in the currency, a cost in the quantity and no unit price at all.
     """
     cur_i = ix.get("currency")
     if cur_i is None or str(row[cur_i] or "").strip().upper() in CURRENCIES:
@@ -310,6 +317,24 @@ def repair_row_shift(row, ix):
             # not truncated back to header length: columns are read by name,
             # so the k trailing cells simply go unread
             return tuple(list(row[:at]) + [None] * k + list(row[at:])), k
+
+    # Second anchor, for continuation rows. Only consulted when every cell in
+    # the currency window is EMPTY -- that emptiness is what distinguishes a
+    # continuation row from an aligned row carrying an odd currency, and it
+    # keeps this from guessing at rows the first anchor deliberately left
+    # alone. A SKU sitting k columns left of the SKU column, in a row whose
+    # own SKU cell holds something the corpus never uses as a SKU, is the
+    # same displacement the currency anchor detects, measured a different way.
+    sku_i = ix.get("sku")
+    if (vocab and sku_i is not None
+            and all(row[j] in (None, "")
+                    for j in range(max(0, cur_i - 3), cur_i))
+            and str(row[sku_i] or "").strip().upper() not in vocab):
+        for j in range(max(0, sku_i - 3), sku_i):
+            if str(row[j] or "").strip().upper() in vocab:
+                k = sku_i - j
+                at = ix.get("coupon_name", j)
+                return tuple(list(row[:at]) + [None] * k + list(row[at:])), k
     return row, 0
 
 
@@ -798,7 +823,7 @@ def normalize(zip_path, outdir="mirror/zed", repairs_log="mirror/zed_repairs.csv
             stats["source_rows"] += 1
             # realign BEFORE anything reads a column past coupon_name --
             # including the date, which decides the month file
-            r, shift = repair_row_shift(r, ix)
+            r, shift = repair_row_shift(r, ix, sku_vocab)
             if shift:
                 stats["shifted_rows"] += 1
             # NO per-row junk test here. In a line-item-level export the
