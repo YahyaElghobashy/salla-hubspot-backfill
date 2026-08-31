@@ -2169,6 +2169,11 @@ class Engine:
         props = dict(common)
         props.update({"name": item.get("name", ""), "price": price,
                       "sale_context": "bundle_parent", "is_bundle_parent": True,
+                      # explicit: a bundle "product" is often born after the
+                      # catalogue classification pass, so inheritance finds
+                      # nothing to copy; HubSpot fills gaps and never
+                      # overwrites, so stating it here is always safe
+                      "product_class": "bundle",
                       "bundle_template_key": tkey,
                       "reporting_product_key": tprops.get("bundle_sku", ""),
                       "revenue_attribution_method": "bundle_parent_revenue",
@@ -2260,6 +2265,11 @@ class Engine:
         props = dict(common)
         props.update({"name": item.get("name", ""), "price": price,
                       "sale_context": "bundle_parent", "is_bundle_parent": True,
+                      # explicit: a bundle "product" is often born after the
+                      # catalogue classification pass, so inheritance finds
+                      # nothing to copy; HubSpot fills gaps and never
+                      # overwrites, so stating it here is always safe
+                      "product_class": "bundle",
                       "bundle_template_key": pid,
                       "reporting_product_key": ifempty(item.get("sku", ""), pid),
                       "revenue_attribution_method": "bundle_parent_revenue",
