@@ -125,6 +125,76 @@ def ifempty(a, b):
     return b if a in (None, "", [], {}) else a
 
 
+GIFT_TEXT_LIMIT = 5000  # HubSpot textarea holds 65k; a gift card does not
+
+
+def gift_props(order):
+    """[v2.8] Salla "buy as gift" orders -> order-level gift properties.
+
+    A gift order arrives with type="gift", source="buy_as_gift", a `gift`
+    block (message text, card image, optional scheduled delivery, and the
+    expiry of the address-confirmation link) and a `receiver` block (the
+    person being gifted; the `customer` stays the BUYER). Verified against
+    live order 745906244 fetched through the relay on 2026-08-31.
+
+    Returns {} for a normal order, so the caller can merge unconditionally.
+    The receiver deliberately does NOT become a contact: they never consented
+    to marketing and may not even know the gift is coming. Workflows that
+    notify them (WhatsApp/SMS) read the phone straight off the order.
+
+    Defensive by construction: any malformed shape degrades to fewer
+    properties or {} -- a gift payload must never be able to break order
+    creation, so the whole body is wrapped and the failure is one WARNING.
+    """
+    try:
+        gift = order.get("gift") if isinstance(order.get("gift"), dict) else {}
+        recv = order.get("receiver") if isinstance(order.get("receiver"), dict) else {}
+        is_gift = (str(order.get("type") or "").strip().lower() == "gift"
+                   or str(order.get("source") or "").strip().lower() == "buy_as_gift"
+                   or str(dig(order, "source_details.type") or "").strip().lower() == "buy_as_gift"
+                   or bool(gift.get("text") or gift.get("image"))
+                   or bool(recv.get("phone") or recv.get("name")))
+        if not is_gift:
+            return {}
+
+        def _s(v, n):
+            return str(v).strip()[:n] if v not in (None, "", False) else ""
+
+        phone = _s(recv.get("phone"), 32).replace(" ", "").replace("-", "")
+        if phone and not phone.startswith("+"):
+            digits = phone.lstrip("0")
+            phone = "+" + digits if digits.isdigit() and len(digits) >= 8 else ""
+        elif phone and not phone[1:].isdigit():
+            phone = ""
+
+        def _date(v):
+            v = _s(v, 20)[:10]
+            return v if (len(v) == 10 and v[4] == "-" and v[7] == "-"
+                         and v[:4].isdigit()) else ""
+
+        props = {
+            "is_gift_order": "true",
+            "gift_receiver_name": _s(recv.get("name"), 255),
+            "gift_receiver_phone": phone,
+            "gift_receiver_email": _s(recv.get("email"), 255),
+            "gift_message": _s(gift.get("text"), GIFT_TEXT_LIMIT),
+            "gift_card_image_url": _s(gift.get("image"), 1024),
+            "gift_confirmation_url": _s(dig(order, "urls.gift_confirmation"), 1024),
+            "gift_confirmation_expiry": _date(gift.get("expiry_date")),
+            "gift_deliver_at": _date(gift.get("deliver_at")),
+            "gift_receiver_salla_notified": "true" if recv.get("notify") else "false",
+            "gift_address_incomplete": "true" if order.get("address_incomplete") else "false",
+        }
+        return {k: v for k, v in props.items() if v != ""}
+    except Exception as e:  # noqa: BLE001 -- degrade, never break the order
+        try:
+            oid = (order or {}).get("id")
+        except Exception:  # even .get() can be hostile; the id is optional
+            oid = "?"
+        log.warning("gift_props: unusable gift shape on order %s: %s", oid, e)
+        return {}
+
+
 def now_str():
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -1086,6 +1156,7 @@ class HubSpot:
             "hs_billing_address_firstname": dig(order, "customer.first_name"),
             "hs_payment_processing_method": order.get("payment_method", ""),
         }
+        props.update(gift_props(order))   # [v2.8] {} on non-gift orders
         body = {"properties": props}
         if customer_id:
             body["associations"] = [{"to": {"id": str(customer_id)},
