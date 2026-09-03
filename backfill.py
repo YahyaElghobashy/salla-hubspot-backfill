@@ -1023,7 +1023,8 @@ class HubSpot:
             "filterGroups": [{"filters": [{"propertyName": "salla_product_id",
                                            "operator": "EQ",
                                            "value": str(salla_product_id)}]}],
-            "properties": ["hs_object_id", "hs_sku", "name", "salla_product_id"],
+            "properties": ["hs_object_id", "hs_sku", "name", "salla_product_id",
+                           "product_class", "warranty_months"],
             "limit": 1}, "item product")
         return data
 
@@ -1039,7 +1040,8 @@ class HubSpot:
                  "values": [str(x) for x in skus]},
                 {"propertyName": "catalog_approval_status", "operator": "EQ",
                  "value": "approved"}]}],
-            "properties": ["hs_object_id", "hs_sku", "name", "salla_product_id"],
+            "properties": ["hs_object_id", "hs_sku", "name", "salla_product_id",
+                           "product_class", "warranty_months"],
             "limit": 2}, "item product by sku")
         return data
 
@@ -1084,6 +1086,13 @@ class HubSpot:
             return 200, {"id": f"DRY-{what.replace(' ', '_')}"}
         status, data = self._req(method, path, body, what=what)
         return status, data
+
+    def patch_contact(self, contact_id, props, what):
+        """Small targeted contact update, used for the growth signal flags."""
+        status, data = self._write("PATCH",
+                                   f"/crm/v3/objects/contacts/{contact_id}",
+                                   {"properties": props}, what)
+        return status in (200, 201)
 
     def create_contact(self, order):
         """[M3] upsert branch: only runs when the phone search found nothing,
@@ -1710,6 +1719,10 @@ class Engine:
         self._phone_guard = threading.Lock()
         self._phone_locks = {}
         self._contact_cache = {}  # customer key -> resolved HubSpot contact id
+        # growth signals: contact ids already stamped this run, so one buyer
+        # with many orders costs one PATCH. Cross-run repeats are harmless --
+        # setting a checkbox true twice is a no-op at HubSpot.
+        self._signal_stamped = {}  # contact_id -> frozenset of flags sent
         self.created_ledger = CreatedLedger(getattr(mirror, "dir", Path("mirror")))
         self._outcome = {}        # v1.6: salla id -> created/held/error (live mode)
         self._in_flight = 0  # maintained by the main loop only
@@ -1952,8 +1965,45 @@ class Engine:
             return
         self._finish_create(order, audit_row, customer_id, total)
 
+    def _note_signal(self, prod_record):
+        """Collect the growth signal a resolved product record implies.
+
+        device/consumable are direct. A bundle CONTAINING a device is
+        recognised by the verified-catalogue rule that only device-bearing
+        bundles carry warranty_months; a bundle's consumable content is not
+        knowable here without extra reads, so live-forward mixed bundles
+        under-flag consumable slightly -- the retro backfill derives from
+        component line items and is exact for all history.
+        """
+        pr = (prod_record or {}).get("properties") or {}
+        cls = (pr.get("product_class") or "").strip()
+        if cls in ("device", "consumable"):
+            self._order_signals.add(cls)
+        elif cls == "bundle" and str(pr.get("warranty_months") or "").strip():
+            self._order_signals.add("device")
+
+    def _stamp_signals(self, customer_id):
+        """[GS1] One idempotent PATCH per contact per run, after a clean
+        item loop. Absent signals write nothing; an unset checkbox already
+        reads false everywhere."""
+        want = frozenset(self._order_signals)
+        if not want or not customer_id:
+            return
+        have = self._signal_stamped.get(str(customer_id), frozenset())
+        missing = want - have
+        if not missing:
+            return
+        props = {}
+        if "device" in missing:
+            props["has_purchased_device"] = "true"
+        if "consumable" in missing:
+            props["has_purchased_consumable"] = "true"
+        if self.hs.patch_contact(customer_id, props, "growth signals"):
+            self._signal_stamped[str(customer_id)] = have | want
+
     def _finish_create(self, order, audit_row, customer_id, total):
         oid = str(order.get("id"))
+        self._order_signals = set()
         # [M2] order create
         order_id, was_fresh = self.hs.create_order(
             order, customer_id, self.cfg.salla_timezone_default)
@@ -2013,6 +2063,7 @@ class Engine:
         # instead of silently accepting a partial.
         if not item_error:
             self.created_ledger.add(oid, order_id)
+            self._stamp_signals(customer_id)
 
     def process_item(self, order, order_id, item):
         oid = str(order.get("id"))
@@ -2049,6 +2100,7 @@ class Engine:
                 }
                 # [M232] the product is stamped IN the create, not by a follow-up
                 # PATCH, so the line item inherits product_class/warranty_months
+                self._note_signal(ps_first)
                 li = self.hs.create_line_item(
                     with_product(zed_context(item, props),
                                  ps_first.get("id", "")), "LI legacy sku")
@@ -2098,6 +2150,7 @@ class Engine:
                           "salla_currency": item.get("currency", ""),
                           "reporting_product_key": item.get("sku", ""),
                           "revenue_attribution_method": "standalone_revenue"})
+            self._note_signal(p_first)
             li = self.hs.create_line_item(                             # [M232]
                 with_product(zed_context(item, props),
                              p_first.get("id", "")), "LI standalone")
@@ -2178,6 +2231,7 @@ class Engine:
                       "reporting_product_key": tprops.get("bundle_sku", ""),
                       "revenue_attribution_method": "bundle_parent_revenue",
                       "bundle_template_name_snapshot": tprops.get("bundle_template_name", "")})
+        self._note_signal(p_first)
         parent_li = self.hs.create_line_item(                                      # [M233]
             with_product(props, p_first.get("id", "")), "LI bundle parent")
         if not parent_li:
@@ -2274,6 +2328,7 @@ class Engine:
                       "reporting_product_key": ifempty(item.get("sku", ""), pid),
                       "revenue_attribution_method": "bundle_parent_revenue",
                       "bundle_template_name_snapshot": item.get("name", "")})
+        self._note_signal(p_first)
         parent_li = self.hs.create_line_item(                                      # [M235]
             with_product(props, p_first.get("id", "")), "LI bundle parent salla")
         if not parent_li:

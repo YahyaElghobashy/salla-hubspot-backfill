@@ -658,6 +658,81 @@ class TestProductStampedAtCreate(unittest.TestCase):
                          "every create_line_item site must stamp the product")
 
 
+class TestGrowthSignals(unittest.TestCase):
+    """The engine stamps has_purchased_device / has_purchased_consumable on
+    the contact after a clean item loop: one idempotent PATCH per contact per
+    run, nothing written for accessory-only orders, and a device-bearing
+    bundle recognised by the verified-catalogue rule that only those carry
+    warranty_months."""
+
+    def _engine(self):
+        e = object.__new__(backfill.Engine)
+        e._order_signals = set()
+        e._signal_stamped = {}
+        e.patches = []
+        class HS:
+            def patch_contact(_, cid, props, what):
+                e.patches.append((cid, dict(props)))
+                return True
+        e.hs = HS()
+        return e
+
+    def _rec(self, cls, months=""):
+        return {"properties": {"product_class": cls,
+                               "warranty_months": months}}
+
+    def test_device_and_consumable_noted(self):
+        e = self._engine()
+        e._note_signal(self._rec("device"))
+        e._note_signal(self._rec("consumable"))
+        self.assertEqual(e._order_signals, {"device", "consumable"})
+
+    def test_accessory_and_other_note_nothing(self):
+        e = self._engine()
+        e._note_signal(self._rec("accessory"))
+        e._note_signal(self._rec("other"))
+        e._note_signal(self._rec(""))
+        self.assertEqual(e._order_signals, set())
+
+    def test_device_bearing_bundle_counts_as_device(self):
+        e = self._engine()
+        e._note_signal(self._rec("bundle", "24"))
+        self.assertEqual(e._order_signals, {"device"})
+
+    def test_consumable_only_bundle_counts_as_nothing(self):
+        """Its consumable content is not knowable without extra reads; the
+        retro backfill covers history exactly via component line items."""
+        e = self._engine()
+        e._note_signal(self._rec("bundle", ""))
+        self.assertEqual(e._order_signals, set())
+
+    def test_one_patch_per_contact_per_run(self):
+        e = self._engine()
+        e._order_signals = {"device"}
+        e._stamp_signals("111")
+        e._order_signals = {"device"}
+        e._stamp_signals("111")          # second order, same buyer
+        self.assertEqual(len(e.patches), 1)
+        self.assertEqual(e.patches[0],
+                         ("111", {"has_purchased_device": "true"}))
+
+    def test_new_signal_for_known_contact_still_patches(self):
+        e = self._engine()
+        e._order_signals = {"device"}
+        e._stamp_signals("111")
+        e._order_signals = {"consumable"}
+        e._stamp_signals("111")
+        self.assertEqual(len(e.patches), 2)
+        self.assertEqual(e.patches[1],
+                         ("111", {"has_purchased_consumable": "true"}))
+
+    def test_empty_signals_write_nothing(self):
+        e = self._engine()
+        e._order_signals = set()
+        e._stamp_signals("111")
+        self.assertEqual(e.patches, [])
+
+
 class TestNullCustomerBlock(unittest.TestCase):
     """Salla sends "customer": null on real orders. dict.get(k, {}) does NOT
     protect against that: the default only applies when the key is ABSENT, so
