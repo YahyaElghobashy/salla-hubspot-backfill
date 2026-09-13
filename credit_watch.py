@@ -286,7 +286,11 @@ class CreditWatch:
                 continue
             try:
                 d = _get(f"/dlqs?scenarioId={sid}&pg[limit]=10")
-                items = d.get("dlqs") or []
+                # the endpoint returns HANDLED items too ("resolved": true --
+                # Make auto-reprocesses ~30min after a transient failure and
+                # keeps the record). Only unresolved ones are lost events.
+                items = [x for x in (d.get("dlqs") or [])
+                         if not x.get("resolved")]
                 if items:
                     oldest = min(str(x.get("created") or "") for x in items)
                     found.append((label, sid, len(items), oldest[:10]))
