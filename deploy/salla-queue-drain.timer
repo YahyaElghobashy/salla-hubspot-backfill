@@ -1,0 +1,13 @@
+[Unit]
+Description=Drain catalog-held orders hourly
+
+[Timer]
+# hourly at :17 -- deliberately off the hour so it never lands on the live
+# sync's own bursty minute or the 09:00 digest
+OnCalendar=*-*-* *:17:00
+# a reboot across the scheduled minute must still run the period, not skip it
+Persistent=true
+RandomizedDelaySec=120
+
+[Install]
+WantedBy=timers.target

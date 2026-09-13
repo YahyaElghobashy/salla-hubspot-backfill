@@ -1,0 +1,25 @@
+[Unit]
+Description=Queue drain: release catalog-held orders once their products are approved
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=integrations_claragroup_com
+WorkingDirectory=/home/integrations_claragroup_com/app
+# Why this exists: approving a product in the catalog sheet does NOT create the
+# orders that were held waiting for it. Only the drain re-checks held rows and
+# creates the ones that now pass the gate. Run by hand, it had not run between
+# 2026-08-25 and 2026-09-13, so every approval in that window looked like it
+# did nothing and the backlog reached 372 orders.
+#
+# --max-orders caps one pass so a large backlog drains over several runs rather
+# than one long burst against HubSpot's rate limits. The engine is idempotent
+# (created.csv ledger + dedup search), so a capped pass simply resumes next hour.
+# STOP.drain still halts it, and drain.lock prevents overlapping runs.
+ExecStart=/bin/bash -lc 'set -a; . /home/integrations_claragroup_com/app/.env; set +a; exec /home/integrations_claragroup_com/app/venv/bin/python3 queue_drain.py --config config.live.json --live --max-orders 120 --yes'
+# a drain that dies must never take the box with it
+Restart=no
+TimeoutStartSec=3600
+
+[Install]
+WantedBy=multi-user.target
