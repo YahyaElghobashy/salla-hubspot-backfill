@@ -269,6 +269,50 @@ class CreditWatch:
             log.warning("credit alert dispatch failed: %s", e)
         log.error("ALERT: %s", subject)
 
+    # ------------- relay DLQ watch (v2.8) -------------
+
+    def check_relay_dlq(self):
+        """Incomplete executions parked on the relay scenarios = order events
+        that DIED before reaching the engine. Three sat unnoticed for weeks in
+        September (Salla 502s during capture); each one is a permanently
+        missing order until someone replays it. One Make API call per relay
+        per tick; alert at most every 12h while anything is parked."""
+        team = str(getattr(self.cfg, "make_team_id", "") or "")
+        scen = {"live intake": str(getattr(self.cfg, "make_intake_scenario_id", "") or ""),
+                "backfill relay": str(getattr(self.cfg, "make_backfill_scenario_id", "") or "")}
+        found = []
+        for label, sid in scen.items():
+            if not sid:
+                continue
+            try:
+                d = _get(f"/dlqs?scenarioId={sid}&pg[limit]=10")
+                items = d.get("dlqs") or []
+                if items:
+                    oldest = min(str(x.get("created") or "") for x in items)
+                    found.append((label, sid, len(items), oldest[:10]))
+            except Exception as e:
+                log.debug("dlq check %s skipped: %s", label, e)
+        self.state["relay_dlq"] = sum(n for _, _, n, _ in found)
+        if not found:
+            self.state.pop("dlq_alerted_at", None)
+            return
+        last = float(self.state.get("dlq_alerted_at") or 0)
+        if time.time() - last < 12 * 3600:
+            return
+        self.state["dlq_alerted_at"] = time.time()
+        lines = [f"• {label}: {n} stuck (oldest {oldest}) — "
+                 f"https://eu1.make.com/{getattr(self.cfg, 'make_team_id', '')}"
+                 f"/scenarios/{sid}"
+                 for label, sid, n, oldest in found]
+        total = sum(n for _, _, n, _ in found)
+        self._alert(
+            f"🟠 {total} webhook delivery(ies) stuck in Make's retry queue",
+            "Each of these is an order event that never reached the engine, "
+            "so its order is missing from HubSpot until the execution is "
+            "replayed (Make: scenario → Incomplete executions → Retry). "
+            "Replaying is safe: the engine ignores duplicates.\n"
+            + "\n".join(lines))
+
     # ------------- the tick -------------
 
     def tick(self):
@@ -285,6 +329,10 @@ class CreditWatch:
                 self.state["usage_daily"] = usage
         except Exception as e:
             log.debug("usage history skipped: %s", e)
+        try:
+            self.check_relay_dlq()
+        except Exception as e:
+            log.debug("relay dlq watch skipped: %s", e)
 
         prev = self.state.get("org") or {}
         remaining = org["remaining"]

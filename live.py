@@ -369,9 +369,10 @@ class LiveEngine(Engine):
                                             "done", row["attempts"], f"HS {ref}")
                         self.processed_today += 1
                     elif outcome == "held":
+                        note = (f"catalog gate: {ref} -- in review queue"
+                                if ref else "catalog gate -- in review queue")
                         self.gio.queue_mark(self.qsid, row["row"], oid,
-                                            "held", row["attempts"],
-                                            "catalog gate -- in review queue")
+                                            "held", row["attempts"], note)
                         self.processed_today += 1
                     else:
                         att = row["attempts"] + 1

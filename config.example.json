@@ -82,5 +82,8 @@
     50000,
     10000,
     1000
-  ]
+  ],
+  "live_min_reference": 0,
+  "status_digest_hour": 18,
+  "held_index_refresh_s": 600
 }

@@ -590,6 +590,14 @@ class Config:
     status_relay_enabled: bool = True
     status_queue_tab: str = "Status Queue"
     status_retry_ladder: tuple = (30, 120, 600, 3600, 21600)
+    # v2.8 status-alert classification. live_min_reference: Salla reference
+    # numbers at/above this are treated as live-era when the order is absent
+    # from the Live Queue index (0 disables era classification entirely, which
+    # preserves the pre-v2.8 single-alert behavior). status_digest_hour: local
+    # hour at which the backfill-pending digest is flushed.
+    live_min_reference: int = 0
+    status_digest_hour: int = 18
+    held_index_refresh_s: int = 600
     customer_sync_enabled: bool = True
     customer_queue_tab: str = "Customer Queue"
     customer_auto_merge: bool = True
@@ -1900,7 +1908,10 @@ class Engine:
                     headers={"Content-Type": "application/json"}, body=body)
                 if status != 200:
                     log.warning("Held notify webhook returned %s: %s", status, text[:200])
-        self._outcome[str(order.get("id"))] = ("held", "")
+        # v2.8: carry the blocking item names into the outcome so the live
+        # queue note (and therefore the status relay and the daily report) can
+        # say WHICH products are holding the order, not just that one is.
+        self._outcome[str(order.get("id"))] = ("held", names[:140])
         log.info("HELD order %s (%d unverified item(s): %s)",
                  order.get("id"), len(unverified), names)
 

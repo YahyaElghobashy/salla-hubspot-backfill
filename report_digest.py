@@ -170,7 +170,22 @@ def aggregate(period):
     latest = days[-1] if days else {}
     live_now = roll.collect(datetime.now().strftime("%Y-%m-%d"))
 
+    # v2.8: backfill-stall watchdog. The cursor page/window frozen across two
+    # consecutive dailies means the backfill loop is not advancing, which is
+    # exactly how "page 15 of 29" sat unnoticed for five days in September.
+    stalled = False
+    bf_now = (live_now.get("backfill") or {})
+    bf_prev = ((days[-1].get("backfill") if days else None) or {})
+    if (period == "daily" and bf_now.get("window") and bf_prev.get("window")
+            and bf_now.get("window") == bf_prev.get("window")
+            and bf_now.get("page") == bf_prev.get("page")
+            and str(bf_now.get("status") or "").lower() not in
+            ("done", "complete", "finished", "disabled")):
+        stalled = True
+
     return {
+        "live_held": _live_held() if period == "daily" else None,
+        "backfill_stalled": stalled,
         "period": period, "start": start, "end": end, "label": label,
         "days_recorded": len(days), "days_expected": span,
         "created": created, "prev_created": prev_created,
@@ -191,6 +206,52 @@ def aggregate(period):
 # rendering
 # --------------------------------------------------------------------------
 
+def _live_held():
+    """Outstanding catalog-held orders, measured LIVE from the Live Queue tab.
+
+    v2.8: the old number came from the last drain-scan line in drain.log, which
+    goes stale the moment scans stop (it reported "1 (as of 2026-08-25)" for
+    two weeks while the true backlog reached 19). Best-effort by design: any
+    failure falls back to the stale-but-dated figure rather than breaking the
+    digest.
+    Returns {"value", "as_of", "oldest_days", "top"} or None.
+    """
+    try:
+        from backfill import Config, GoogleIO
+        cfg = Config.load(os.environ.get("ENGINE_CONFIG", "config.json"))
+        gio = GoogleIO(cfg, enabled=True)
+        rows = gio.queue_read(cfg.queue_spreadsheet_id, start_row=2,
+                              tab=getattr(cfg, "live_queue_tab", "Live Queue"))
+        held = [r for r in rows or []
+                if str(r.get("status") or r.get("state") or "") == "held"]
+        oldest = None
+        names = {}
+        for r in held:
+            ts = str(r.get("received_at") or "")[:10]
+            if ts:
+                oldest = ts if oldest is None or ts < oldest else oldest
+            note = str(r.get("note") or "")
+            if note.startswith("catalog gate:"):
+                for nm in note[len("catalog gate:"):].split("--")[0].split(","):
+                    nm = nm.strip()
+                    if nm:
+                        names[nm] = names.get(nm, 0) + 1
+        oldest_days = None
+        if oldest:
+            try:
+                oldest_days = (datetime.now()
+                               - datetime.strptime(oldest, "%Y-%m-%d")).days
+            except ValueError:
+                pass
+        top = ", ".join(f"{nm} ({c})" for nm, c in
+                        sorted(names.items(), key=lambda kv: -kv[1])[:3])
+        return {"value": len(held), "as_of": "live",
+                "oldest_days": oldest_days, "top": top}
+    except Exception as e:
+        log.warning("live held count unavailable: %s", e)
+        return None
+
+
 def _verdict(a):
     """One honest sentence up top. Reads the actual numbers, not a fixed string."""
     bad = []
@@ -200,6 +261,12 @@ def _verdict(a):
         bad.append(f"availability {a['availability']}%")
     if a["alerts"]:
         bad.append(f"{len(a['alerts'])} alert(s)")
+    lh = a.get("live_held") or {}
+    if (lh.get("value") or 0) >= 5 or (lh.get("oldest_days") or 0) >= 3:
+        bad.append(f"{lh['value']} orders held for catalog "
+                   f"(oldest {lh.get('oldest_days', '?')}d)")
+    if a.get("backfill_stalled"):
+        bad.append("backfill has not advanced since the previous report")
     if not a["created"]:
         return "No sync activity recorded in this period."
     if not bad:
@@ -270,14 +337,26 @@ def render(a):
     elif a["queue_depth_max"] is not None:
         head.append(f"• Queue: peak depth {a['queue_depth_max']} over the period"
                     f" (now {q.get('queue_depth_max', 0)})")
-    held = (q.get("held") or {})
-    if held.get("value") is not None:
-        head.append(f"• Held for catalog: {held['value']:,} "
-                    f"(as of {held.get('as_of') or 'unknown'})")
+    lh = a.get("live_held")
+    if lh and lh.get("value") is not None:
+        line = f"• Held for catalog: *{lh['value']:,}* (live count)"
+        if lh.get("oldest_days") is not None:
+            line += f", oldest {lh['oldest_days']}d"
+        head.append(line)
+        if lh.get("top"):
+            head.append(f"   ↳ blocking products: {lh['top']}")
+    else:
+        held = (q.get("held") or {})
+        if held.get("value") is not None:
+            head.append(f"• Held for catalog: {held['value']:,} "
+                        f"(as of {held.get('as_of') or 'unknown'})")
     bf = (q.get("backfill") or {})
     if bf.get("window"):
-        head.append(f"• Backfill: {bf['window']}, page {bf.get('page')} "
-                    f"of {bf.get('total_pages')}")
+        line = (f"• Backfill: {bf['window']}, page {bf.get('page')} "
+                f"of {bf.get('total_pages')}")
+        if a.get("backfill_stalled"):
+            line += "  ⚠️ unchanged since the previous report"
+        head.append(line)
     head += _credit_lines(a)
     if a["errors_unrecovered"] is not None:
         head.append(f"• Errors: {n(a['errors_unrecovered'])} unrecovered")

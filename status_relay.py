@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Delivery-Status Relay (v2.7, sub-product A).
+"""Delivery-Status Relay (v2.8, sub-product A).
 
 Moves a Salla order's delivery status onto its HubSpot order as a pipeline
 stage change, in realtime, from the `Status Queue` tab that the thin-capture
@@ -46,6 +46,21 @@ log = logging.getLogger("backfill")
 
 LEDGER = Path("mirror/status_applied.csv")
 EXCEPTIONS_TAB = "Delivery Status Exceptions"
+
+
+def _sheet_url(sheet_id):
+    return f"https://docs.google.com/spreadsheets/d/{sheet_id}" if sheet_id else ""
+
+
+def _hubspot_search_url(term):
+    portal = (os.environ.get("HUBSPOT_PORTAL_ID") or "").strip()
+    if not portal:
+        return ""
+    return f"https://app.hubspot.com/search/{portal}/search?term={term}"
+
+
+def _slack_link(url, label):
+    return f"<{url}|{label}>" if url else label
 
 
 class StatusLedger:
@@ -95,6 +110,14 @@ class StatusRelay(RealtimeConsumer):
         self.ladder = list(getattr(cfg, "status_retry_ladder",
                                    (30, 120, 600, 3600, 21600)))
         self._alert_last = {}
+        # v2.8: classification state. The Live Queue index answers "did the
+        # live engine see this order, and is it catalog-held right now?" --
+        # which turns the old one-size-fits-all orange alert into three honest
+        # stories (held / live-order-missing / awaiting-backfill).
+        self._live_index = {}          # order_id -> (state, note)
+        self._live_index_at = 0.0
+        self._digest = []              # backfill-era give-ups awaiting flush
+        self._digest_sent_day = ""
 
     # -- helpers ---------------------------------------------------------------
 
@@ -121,9 +144,144 @@ class StatusRelay(RealtimeConsumer):
         res = d.get("results") or []
         return res[0] if res else None
 
+    def _refresh_live_index(self):
+        every = float(getattr(self.cfg, "held_index_refresh_s", 600))
+        if time.time() - self._live_index_at < every:
+            return
+        self._live_index_at = time.time()
+        try:
+            rows = self.gio.queue_read(
+                self.cfg.queue_spreadsheet_id, start_row=2,
+                tab=getattr(self.cfg, "live_queue_tab", "Live Queue")) or []
+            self._live_index = {str(r.get("order_id")):
+                                (str(r.get("status") or r.get("state") or ""),
+                                 str(r.get("note") or ""))
+                                for r in rows if r.get("order_id")}
+        except Exception as e:
+            log.warning("live-queue index refresh failed: %s", e)
+
+    def _classify(self, oid, reference_id):
+        """'held' | 'recent' | 'backfill' | None (classification disabled)."""
+        min_ref = int(getattr(self.cfg, "live_min_reference", 0) or 0)
+        if min_ref <= 0:
+            return None
+        self._refresh_live_index()
+        state, _ = self._live_index.get(str(oid), ("", ""))
+        if state == "held":
+            return "held"
+        if state:
+            # the live engine SAW this order (done/error/gone) yet HubSpot
+            # cannot find it: that is a genuine anomaly, never digest fodder
+            return "recent"
+        try:
+            return "recent" if int(reference_id or 0) >= min_ref else "backfill"
+        except (TypeError, ValueError):
+            return "backfill"
+
+    def _held_summary(self):
+        held = [(o, note) for o, (st, note) in self._live_index.items()
+                if st == "held"]
+        names = {}
+        for _, note in held:
+            if note.startswith("catalog gate:"):
+                for n in note[len("catalog gate:"):].split("--")[0].split(","):
+                    n = n.strip()
+                    if n:
+                        names[n] = names.get(n, 0) + 1
+        top = ", ".join(f"{n} ({c})" for n, c in
+                        sorted(names.items(), key=lambda kv: -kv[1])[:4])
+        return len(held), top
+
+    def _links_line(self):
+        parts = [
+            _slack_link(_sheet_url(self.cfg.queue_spreadsheet_id),
+                        "Live Queue sheet"),
+            _slack_link(_sheet_url(self.cfg.spreadsheet_id),
+                        "Audit workbook (exceptions tab)"),
+        ]
+        return "  ·  ".join(x for x in parts if x)
+
+    def _flush_digest(self, force=False):
+        if not self._digest:
+            return
+        today = datetime.now().strftime("%Y-%m-%d")
+        due = (datetime.now().hour >=
+               int(getattr(self.cfg, "status_digest_hour", 18))
+               and self._digest_sent_day != today)
+        if not (due or force or len(self._digest) >= 50):
+            return
+        items = self._digest
+        self._digest = []
+        self._digest_sent_day = today
+        sample = ", ".join(f"{o} ({s})" for o, s in items[:10])
+        more = f" and {len(items) - 10} more" if len(items) > 10 else ""
+        self._alert(
+            "backfill-digest",
+            f"🟠 {len(items)} status event(s) waiting on historical backfill",
+            f"These orders predate the live sync and their backfill window "
+            f"has not run yet, so their delivery statuses cannot apply: "
+            f"{sample}{more}. No action needed: each stage is baked in "
+            f"automatically when its order is created by the backfill. If "
+            f"this number grows day over day, check that the backfill is "
+            f"actually progressing.\n{self._links_line()}")
+
+    def _giveup_alert(self, kind, oid, reference_id, slug, attempts):
+        """One give-up, three honest stories. kind=None preserves the pre-v2.8
+        single orange alert so an unconfigured deployment behaves as before."""
+        hs_link = _slack_link(_hubspot_search_url(oid), "search HubSpot")
+        if kind == "held":
+            self._refresh_live_index()
+            count, top = self._held_summary()
+            blockers = f" Blocking products: {top}." if top else ""
+            self._alert(
+                "held-backlog",
+                f"🟡 {count} order(s) held for catalog approval are getting "
+                f"delivery updates",
+                f"Latest: order {oid} (status “{slug}”). It cannot be created "
+                f"until its products are approved in the catalog review, so "
+                f"its delivery status cannot apply yet.{blockers} Once "
+                f"approved and drained, the order is created with the CURRENT "
+                f"status baked in, so nothing is lost. The backlog ages "
+                f"until someone approves: that is the action.\n"
+                f"{self._links_line()}  ·  {hs_link}")
+            return
+        if kind == "recent":
+            self._alert(
+                f"missing:{oid}",
+                f"🔴 Live order {oid} is missing from HubSpot",
+                f"This order is from the live era (reference "
+                f"{reference_id or '?'}), its delivery status “{slug}” has "
+                f"been arriving for ~8 hours, and the order itself is not in "
+                f"HubSpot. This is NOT catalog-hold and NOT backfill lag: "
+                f"the intake likely lost the creation event. Check the Live "
+                f"Queue row and mirror/errors.csv on the server, then "
+                f"re-drain or create manually.\n"
+                f"{self._links_line()}  ·  {hs_link}")
+            return
+        if kind == "backfill":
+            self._digest.append((oid, slug))
+            self._flush_digest()
+            return
+        self._alert("order-missing",
+                    "🟠 Status events arriving for orders HubSpot "
+                    "does not have",
+                    f"Latest: order {oid} (status “{slug}”). Retried "
+                    f"{attempts} times over ~8 hours. Usual causes: "
+                    f"the order is catalog-held, or its creation "
+                    f"failed. The event is logged in the exceptions "
+                    f"tab and will apply automatically if the order "
+                    f"appears later via drain/backfill (stage is "
+                    f"baked in at creation).")
+
     def _alert(self, key, subject, body):
         """Cooldown-respecting Slack alert (per key, alert_cooldown_minutes)."""
         cool = float(getattr(self.cfg, "alert_cooldown_minutes", 30)) * 60
+        if key == "held-backlog":
+            cool = max(cool, 6 * 3600)
+        elif key.startswith("missing:"):
+            cool = max(cool, 24 * 3600)
+        elif key == "backfill-digest":
+            cool = max(cool, 20 * 3600)
         if time.time() - self._alert_last.get(key, 0) < cool:
             return
         self._alert_last[key] = time.time()
@@ -178,22 +336,21 @@ class StatusRelay(RealtimeConsumer):
         if hs_order is None:
             attempts = int(row["attempts"] or 0)
             if attempts >= len(self.ladder):
-                self._exception_row(row, slug, "Order not in HubSpot after "
-                                    f"{attempts} retries over ~8h",
+                kind = self._classify(oid, row["reference_id"])
+                why = {"held": "Order is catalog-held (products awaiting "
+                               "approval)",
+                       "recent": "LIVE order missing from HubSpot",
+                       "backfill": "Order awaits its backfill window"}.get(
+                    kind, f"Order not in HubSpot after {attempts} retries "
+                          "over ~8h")
+                self._exception_row(row, slug, why,
                                     "Check whether the order is held/failed",
                                     hs_order_id="")
-                self._alert("order-missing",
-                            "🟠 Status events arriving for orders HubSpot "
-                            "does not have",
-                            f"Latest: order {oid} (status “{slug}”). Retried "
-                            f"{attempts} times over ~8 hours. Usual causes: "
-                            f"the order is catalog-held, or its creation "
-                            f"failed. The event is logged in the exceptions "
-                            f"tab and will apply automatically if the order "
-                            f"appears later via drain/backfill (stage is "
-                            f"baked in at creation).")
+                self._giveup_alert(kind, oid, row["reference_id"], slug,
+                                   attempts)
                 log.error("STATUS order %s absent from HubSpot after %d "
-                          "retries -- giving up on %r", oid, attempts, slug)
+                          "retries (class=%s) -- giving up on %r",
+                          oid, attempts, kind or "legacy", slug)
                 return "error-final", f"order absent after {attempts} tries"
             nb = time.time() + self.ladder[min(attempts, len(self.ladder) - 1)]
             return "deferred", f"order not in HS yet nb={int(nb)} ({slug})"

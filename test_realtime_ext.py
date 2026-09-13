@@ -318,5 +318,169 @@ class TestYieldGlob(unittest.TestCase):
         self.assertFalse(eng._yielding)
 
 
+# ---------------------------------------------------------------------------
+# v2.8: classification-aware give-up alerting
+# ---------------------------------------------------------------------------
+
+class IndexedGIO(FakeGIO):
+    """FakeGIO whose Live Queue tab read returns configurable rows."""
+
+    def __init__(self, live_rows=None):
+        super().__init__()
+        self.live_rows = live_rows or []
+
+    def queue_read(self, qsid, start_row=2, tab=None):
+        if tab == "Live Queue":
+            return self.live_rows
+        return []
+
+
+class TestStatusClassification(unittest.TestCase):
+    def mk(self, live_rows=None, **cfg_kw):
+        _chdir_tmp(self)
+        import status_relay
+        self.status_relay = status_relay
+        hs = FakeHS()
+        cfg_kw.setdefault("live_min_reference", 280000000)
+        cfg_kw.setdefault("live_queue_tab", "Live Queue")
+        r = status_relay.StatusRelay(_cfg(**cfg_kw), hs,
+                                     IndexedGIO(live_rows), live=True)
+        return r, hs
+
+    def _patch_alerts(self):
+        import notify
+        sent = []
+        return sent, mock.patch.object(
+            notify, "send_alert",
+            side_effect=lambda s, b, **k: sent.append((s, b)))
+
+    def test_held_order_gets_held_story_not_legacy(self):
+        rows = [{"order_id": "101", "status": "held",
+                 "note": "catalog gate: Airbrush Combo -- in review queue"},
+                {"order_id": "202", "status": "held",
+                 "note": "catalog gate: Airbrush Combo -- in review queue"}]
+        r, _ = self.mk(rows)
+        sent, patcher = self._patch_alerts()
+        with patcher:
+            state, _ = r.handle_row(_row(oid="101", ref="284000001",
+                                         attempts=5))
+        self.assertEqual(state, "error-final")
+        self.assertEqual(len(sent), 1)
+        subj, body = sent[0]
+        self.assertIn("held for catalog", subj)
+        self.assertIn("2 order(s)", subj)
+        self.assertIn("Airbrush Combo (2)", body)
+        self.assertIn("docs.google.com", body)
+        self.assertIn("catalog-held", r.gio.appends[0][1][0][5])
+
+    def test_live_era_missing_is_red_and_specific(self):
+        r, _ = self.mk([])
+        sent, patcher = self._patch_alerts()
+        with patcher:
+            state, _ = r.handle_row(_row(oid="909", ref="284123456",
+                                         attempts=5))
+        self.assertEqual(state, "error-final")
+        self.assertEqual(len(sent), 1)
+        self.assertIn("\U0001F534", sent[0][0])
+        self.assertIn("909", sent[0][0])
+        self.assertIn("NOT catalog-hold", sent[0][1])
+
+    def test_engine_seen_but_absent_is_red_even_with_old_reference(self):
+        rows = [{"order_id": "777", "status": "done", "note": "HS 123"}]
+        r, _ = self.mk(rows)
+        sent, patcher = self._patch_alerts()
+        with patcher:
+            r.handle_row(_row(oid="777", ref="100000000", attempts=5))
+        self.assertEqual(len(sent), 1)
+        self.assertIn("\U0001F534", sent[0][0])
+
+    def test_backfill_era_goes_to_digest_not_alert(self):
+        r, _ = self.mk([])
+        sent, patcher = self._patch_alerts()
+        with patcher:
+            for i in range(4):
+                r.handle_row(_row(oid=str(500 + i), ref="250000000",
+                                  attempts=5))
+            self.assertEqual(sent, [])
+            self.assertEqual(len(r._digest), 4)
+            r._flush_digest(force=True)
+        self.assertEqual(len(sent), 1)
+        self.assertIn("4 status event(s)", sent[0][0])
+        self.assertEqual(r._digest, [])
+
+    def test_zero_min_reference_preserves_legacy_alert(self):
+        r, _ = self.mk([], live_min_reference=0)
+        sent, patcher = self._patch_alerts()
+        with patcher:
+            r.handle_row(_row(oid="101", ref="284000001", attempts=5))
+        self.assertEqual(len(sent), 1)
+        self.assertIn("Status events arriving", sent[0][0])
+
+    def test_held_backlog_cooldown_suppresses_second_alert(self):
+        rows = [{"order_id": "101", "status": "held", "note": "catalog gate"},
+                {"order_id": "102", "status": "held", "note": "catalog gate"}]
+        r, _ = self.mk(rows)
+        sent, patcher = self._patch_alerts()
+        with patcher:
+            r.handle_row(_row(oid="101", ref="284000001", attempts=5))
+            r.handle_row(_row(oid="102", ref="284000002", attempts=5))
+        self.assertEqual(len(sent), 1)
+
+    def test_held_outcome_carries_names(self):
+        _chdir_tmp(self)
+        eng = backfill.Engine.__new__(backfill.Engine)
+        eng.cfg = _cfg()
+        eng.live = False
+        eng.is_live_sync = True
+        eng.legacy = None
+        eng.mirror = mock.Mock()
+        eng.gio = mock.Mock()
+        eng.stats = backfill.Stats()
+        eng._stats_lock = __import__("threading").Lock()
+        eng._outcome = {}
+        order = {"id": 55, "reference_id": 284999999, "items": []}
+        eng.route_held(order, 7, [{"id": 1, "name": "Airbrush Combo"},
+                                  {"id": 2, "name": "Volume Foam"}])
+        outcome, ref = eng._outcome["55"]
+        self.assertEqual(outcome, "held")
+        self.assertIn("Airbrush Combo", ref)
+        self.assertIn("Volume Foam", ref)
+
+
+class TestStatusStress(unittest.TestCase):
+    def test_five_hundred_giveups_bounded_alerts_and_time(self):
+        _chdir_tmp(self)
+        import status_relay
+        import notify
+        rows = [{"order_id": str(9000 + i), "status": "held",
+                 "note": "catalog gate: X -- in review queue"}
+                for i in range(50)]
+        cfg = _cfg(live_min_reference=280000000, live_queue_tab="Live Queue")
+        r = status_relay.StatusRelay(cfg, FakeHS(), IndexedGIO(rows),
+                                     live=True)
+        sent = []
+        t0 = time.time()
+        with mock.patch.object(notify, "send_alert",
+                               side_effect=lambda s, b, **k: sent.append(s)):
+            for i in range(400):
+                r.handle_row(_row(oid=str(20000 + i), ref="250000000",
+                                  attempts=5))
+            for i in range(50):
+                r.handle_row(_row(oid=str(9000 + i), ref="284000000",
+                                  attempts=5))
+            for i in range(50):
+                r.handle_row(_row(oid=str(70000 + i),
+                                  ref=str(284100000 + i), attempts=5))
+            r._flush_digest(force=True)
+        took = time.time() - t0
+        self.assertLess(took, 10, f"stress took {took:.1f}s")
+        self.assertEqual(len(sent), 52, sent[:5])
+        self.assertEqual(len([s for s in sent if "\U0001F534" in s]), 50)
+        self.assertEqual(len([s for s in sent if "held for catalog" in s]), 1)
+        self.assertEqual(len([s for s in sent if "backfill" in s]), 1)
+        self.assertEqual(sum(len(a[1]) for a in r.gio.appends
+                             if a[0] == "Delivery Status Exceptions"), 500)
+
+
 if __name__ == "__main__":
     unittest.main()
