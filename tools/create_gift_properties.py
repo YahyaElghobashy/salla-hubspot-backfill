@@ -37,7 +37,12 @@ PROPS = [
     {"name": "gift_address_incomplete", "label": "Gift address incomplete", "type": "bool",
      "fieldType": "booleancheckbox",
      "options": [{"label": "Yes", "value": "true"}, {"label": "No", "value": "false"}],
-     "description": "True when the receiver had not yet confirmed their address at sync time. Drives the confirm-your-address nudge."},
+     "description": "True while the receiver has not yet confirmed their delivery address. Set at sync time and kept current by the gift refresh loop: it flips to false the cycle after the receiver confirms. Drives the confirm-your-address nudge."},
+    {"name": "gift_address_state", "label": "Gift address state", "type": "enumeration",
+     "fieldType": "select",
+     "options": [{"label": "Confirmed", "value": "confirmed"},
+                 {"label": "Expired unconfirmed", "value": "expired_unconfirmed"}],
+     "description": "Terminal outcome of the address-confirmation lifecycle, written by the gift refresh loop. Empty while the receiver can still confirm. 'Expired unconfirmed' is the chase list: the link lapsed with no address, support should contact the receiver."},
 ]
 
 def main():

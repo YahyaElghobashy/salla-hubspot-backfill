@@ -128,6 +128,32 @@ def ifempty(a, b):
 GIFT_TEXT_LIMIT = 5000  # HubSpot textarea holds 65k; a gift card does not
 
 
+def gift_address_unconfirmed(order):
+    """[v2.9] Evidence-based address flag for a gift order.
+
+    Truthy `address_incomplete` and explicit False are both trusted verbatim.
+    The dangerous shape is the ABSENT key: the old snapshot read it as
+    "confirmed", so a payload that simply omitted it marked a fresh unconfirmed
+    gift as complete -- the exact polarity the client reported. An absent key
+    now claims "confirmed" only when the order actually carries a shipping
+    address.
+    """
+    if order.get("address_incomplete"):
+        return True
+    if isinstance(order, dict) and order.get("address_incomplete") is False:
+        return False
+    addr = dig(order, "shipping.address", None)
+    if not isinstance(addr, dict):  # shipments: [{"address": {...}}] variant
+        ship = dig(order, "shipments", None)
+        addr = (ship[0].get("address")
+                if isinstance(ship, list) and ship
+                and isinstance(ship[0], dict) else None)
+    if isinstance(addr, dict):
+        return not any(str(v or "").strip() for v in addr.values()
+                       if isinstance(v, (str, int, float)))
+    return True  # no address block anywhere -> not confirmed
+
+
 def gift_props(order):
     """[v2.8] Salla "buy as gift" orders -> order-level gift properties.
 
@@ -183,7 +209,7 @@ def gift_props(order):
             "gift_confirmation_expiry": _date(gift.get("expiry_date")),
             "gift_deliver_at": _date(gift.get("deliver_at")),
             "gift_receiver_salla_notified": "true" if recv.get("notify") else "false",
-            "gift_address_incomplete": "true" if order.get("address_incomplete") else "false",
+            "gift_address_incomplete": "true" if gift_address_unconfirmed(order) else "false",
         }
         return {k: v for k, v in props.items() if v != ""}
     except Exception as e:  # noqa: BLE001 -- degrade, never break the order
@@ -601,6 +627,16 @@ class Config:
     customer_sync_enabled: bool = True
     customer_queue_tab: str = "Customer Queue"
     customer_auto_merge: bool = True
+    # ---- v2.9 gift address refresh (gift_refresh.py) --------------------
+    # A gift order's receiver confirms their delivery address AFTER purchase;
+    # nothing else in the engine re-reads an order once created, so a bounded
+    # refresh loop reconciles the one field Salla mutates post-checkout.
+    # Defaults keep the module inert until config.live.json enables it.
+    gift_refresh_enabled: bool = False
+    gift_refresh_batch: int = 48            # orders hydrated per cycle (x12 relay batches)
+    gift_refresh_search_limit: int = 100    # working-set page (>= batch + parked headroom)
+    gift_stale_terminal_days: int = 120     # no-expiry orders age out to terminal
+    gift_hydrate_fail_max: int = 5          # consecutive fetch misses before parking
     # ---- v2.6 legacy auto-resolver (deleted-in-Salla products) ----------
     # The prefix namespaces every record the resolver creates: live Salla
     # listings will never mint an "LGCY-" SKU, so auto-created records can

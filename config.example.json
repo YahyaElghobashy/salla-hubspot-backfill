@@ -85,5 +85,10 @@
   ],
   "live_min_reference": 0,
   "status_digest_hour": 18,
-  "held_index_refresh_s": 600
+  "held_index_refresh_s": 600,
+  "gift_refresh_enabled": false,
+  "gift_refresh_batch": 48,
+  "gift_refresh_search_limit": 100,
+  "gift_stale_terminal_days": 120,
+  "gift_hydrate_fail_max": 5
 }

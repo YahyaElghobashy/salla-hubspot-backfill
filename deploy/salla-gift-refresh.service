@@ -1,0 +1,27 @@
+[Unit]
+Description=Gift address refresh: reconcile receiver-confirmed addresses onto HubSpot orders
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=integrations_claragroup_com
+WorkingDirectory=/home/integrations_claragroup_com/app
+# Why this exists: a "buy as gift" order is created BEFORE the receiver
+# confirms their delivery address, and order creation is forward-only -- no
+# other component ever re-reads an order. This oneshot closes the lifecycle:
+# it searches the bounded working set (gift orders still awaiting an address),
+# re-fetches them from Salla, clears the flag + re-bakes the receiver/shipping
+# properties on confirmation, and marks lapsed links expired_unconfirmed with
+# one aggregated chase alert.
+#
+# One cycle is bounded (gift_refresh_batch orders); the timer provides the
+# cadence. Idempotent by property: a cleared order exits the search, so an
+# interrupted run simply resumes next cycle. STOP.gift halts it,
+# gift_refresh.lock prevents overlap, gift_refresh_enabled=false idles it.
+ExecStart=/bin/bash -lc 'set -a; . /home/integrations_claragroup_com/app/.env; set +a; exec /home/integrations_claragroup_com/app/venv/bin/python3 gift_refresh.py --config config.live.json --once --live'
+# a refresh that dies must never take the box with it
+Restart=no
+TimeoutStartSec=1500
+
+[Install]
+WantedBy=multi-user.target

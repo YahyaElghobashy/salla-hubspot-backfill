@@ -1,0 +1,13 @@
+[Unit]
+Description=Refresh gift-order address confirmations every 30 minutes
+
+[Timer]
+# :09 and :39 -- deliberately off the queue drain's :17, the live sync's
+# bursty minute, and the digest hour
+OnCalendar=*-*-* *:09,39:00
+# a reboot across a scheduled minute must still run the period, not skip it
+Persistent=true
+RandomizedDelaySec=120
+
+[Install]
+WantedBy=timers.target

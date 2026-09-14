@@ -185,6 +185,7 @@ def aggregate(period):
 
     return {
         "live_held": _live_held() if period == "daily" else None,
+        "gift_watch": _gift_watch() if period == "daily" else None,
         "backfill_stalled": stalled,
         "period": period, "start": start, "end": end, "label": label,
         "days_recorded": len(days), "days_expected": span,
@@ -249,6 +250,37 @@ def _live_held():
                 "oldest_days": oldest_days, "top": top}
     except Exception as e:
         log.warning("live held count unavailable: %s", e)
+        return None
+
+
+def _gift_watch():
+    """Gift orders still awaiting address confirmation, from the refresh
+    loop's own state file (mirror/gift_refresh_state.json) -- local file per
+    rule 3, so the line still renders during a platform outage. Returns None
+    when the loop is disabled or has never run; {"stale": True} when the loop
+    is enabled but has not written state for 48h (renders "not recorded" per
+    rule 2, never a confident 0)."""
+    try:
+        p = ROOT / "mirror/gift_refresh_state.json"
+        if not p.exists():
+            return None
+        d = json.loads(p.read_text())
+        if not d.get("enabled"):
+            return None
+        try:
+            fresh = (datetime.now() - datetime.strptime(
+                str(d.get("ts") or ""), "%Y-%m-%d %H:%M:%S")
+            ) <= timedelta(hours=48)
+        except ValueError:
+            fresh = False
+        if not fresh:
+            return {"stale": True}
+        return {"stale": False,
+                "pending": int(d.get("pending") or 0),
+                "oldest_days": d.get("oldest_days"),
+                "expired_total": int(d.get("expired_total") or 0)}
+    except Exception as e:
+        log.warning("gift watch state unavailable: %s", e)
         return None
 
 
@@ -350,6 +382,20 @@ def render(a):
         if held.get("value") is not None:
             head.append(f"• Held for catalog: {held['value']:,} "
                         f"(as of {held.get('as_of') or 'unknown'})")
+    gw = a.get("gift_watch")
+    if gw:
+        if gw.get("stale"):
+            head.append("• Gift addresses: not recorded (refresh loop enabled "
+                        "but its state is stale — check the timer)")
+        elif gw.get("pending") or gw.get("expired_total"):
+            line = (f"• Gift orders awaiting address confirmation: "
+                    f"*{gw['pending']:,}*")
+            if gw.get("oldest_days"):
+                line += f", oldest {gw['oldest_days']}d"
+            if gw.get("expired_total"):
+                line += (f" · {gw['expired_total']:,} expired unconfirmed "
+                         f"(chase list)")
+            head.append(line)
     bf = (q.get("backfill") or {})
     if bf.get("window"):
         line = (f"• Backfill: {bf['window']}, page {bf.get('page')} "
