@@ -87,6 +87,22 @@ class RecordingGio(FakeGio):
         return {}
 
 
+def chdir_tmp(test):
+    """Hermetic cwd for a test: every cwd-relative piece of engine state
+    (the STOP file, mirror/ ledgers, the blocker matrix, drain locks) must
+    come from a scratch directory, never from wherever the suite happens to
+    run. The production app directory on the VM carries a real STOP file,
+    which latched _should_stop() and made run_drain exit before processing
+    a single order -- and a non-hermetic run also WROTE its blocker matrix
+    into the production mirror."""
+    tmp = tempfile.mkdtemp()
+    test.addCleanup(shutil.rmtree, tmp, True)
+    cwd = os.getcwd()
+    os.chdir(tmp)
+    test.addCleanup(os.chdir, cwd)
+    return tmp
+
+
 def make_cfg(tmp):
     # Config is a dataclass with ~19 required fields; fill them with inert
     # placeholders so tests construct one without a config file on disk.
@@ -175,11 +191,8 @@ class TestDotenv(unittest.TestCase):
 
 class TestClaimDedupe(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.mkdtemp()
+        self.tmp = chdir_tmp(self)
         self.eng, *_ = make_engine(self.tmp)
-
-    def tearDown(self):
-        shutil.rmtree(self.tmp)
 
     def row(self, n, oid, status, attempts=0):
         return {"row": n, "order_id": oid, "status": status,
@@ -210,11 +223,8 @@ class TestClaimDedupe(unittest.TestCase):
 
 class TestGateCache(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.mkdtemp()
+        self.tmp = chdir_tmp(self)
         self.eng, self.hs, *_ = make_engine(self.tmp)
-
-    def tearDown(self):
-        shutil.rmtree(self.tmp)
 
     def prime(self, table):
         """table: pid -> (p, te, ta)"""
@@ -259,11 +269,8 @@ class TestGateCache(unittest.TestCase):
 
 class TestResolvePreexisting(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.mkdtemp()
+        self.tmp = chdir_tmp(self)
         self.eng, self.hs, *_ = make_engine(self.tmp)
-
-    def tearDown(self):
-        shutil.rmtree(self.tmp)
 
     def test_ledger_hit(self):
         self.eng.created_ledger.add("55", "HS9")
@@ -300,10 +307,7 @@ class TestResolvePreexisting(unittest.TestCase):
 
 class TestDrainOne(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.mkdtemp()
-
-    def tearDown(self):
-        shutil.rmtree(self.tmp)
+        self.tmp = chdir_tmp(self)
 
     def test_blocked_stays_queued_with_note(self):
         eng, hs, *_ = make_engine(self.tmp, live=True)
@@ -360,11 +364,8 @@ class TestDrainOne(unittest.TestCase):
 
 class TestBufferedAudit(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.mkdtemp()
+        self.tmp = chdir_tmp(self)
         self.cfg = make_cfg(self.tmp)
-
-    def tearDown(self):
-        shutil.rmtree(self.tmp)
 
     def test_hold_reason_injected_and_runs_grouped(self):
         gio = FakeGio(self.cfg)
@@ -405,11 +406,8 @@ class TestBufferedAudit(unittest.TestCase):
 
 class TestQlogMark(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.mkdtemp()
+        self.tmp = chdir_tmp(self)
         self.cfg = make_cfg(self.tmp)
-
-    def tearDown(self):
-        shutil.rmtree(self.tmp)
 
     def test_verify_then_write_refuses_moved_rows(self):
         gio = FakeGio(self.cfg)
@@ -440,10 +438,7 @@ class TestQlogMark(unittest.TestCase):
 
 class TestStress(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.mkdtemp()
-
-    def tearDown(self):
-        shutil.rmtree(self.tmp)
+        self.tmp = chdir_tmp(self)
 
     def test_20k_claim_and_dedupe_fast(self):
         eng, *_ = make_engine(self.tmp)
