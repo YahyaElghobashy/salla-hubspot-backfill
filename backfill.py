@@ -175,11 +175,19 @@ def gift_props(order):
     try:
         gift = order.get("gift") if isinstance(order.get("gift"), dict) else {}
         recv = order.get("receiver") if isinstance(order.get("receiver"), dict) else {}
+        # Detection accepts any signal that ONLY a buy-as-gift order carries:
+        # the type, the source (in either spelling), a gift block, or the
+        # address-confirmation link. The receiver block is deliberately NOT a
+        # signal: since 2026-09 Salla attaches `receiver` to NORMAL orders as
+        # the delivery contact (often the buyer herself), and receiver-alone
+        # detection falsely flagged 77 normal orders as gifts. Receiver data
+        # is still MAPPED below once an order is known to be a gift.
         is_gift = (str(order.get("type") or "").strip().lower() == "gift"
                    or str(order.get("source") or "").strip().lower() == "buy_as_gift"
                    or str(dig(order, "source_details.type") or "").strip().lower() == "buy_as_gift"
-                   or bool(gift.get("text") or gift.get("image"))
-                   or bool(recv.get("phone") or recv.get("name")))
+                   or bool(gift.get("text") or gift.get("image")
+                           or gift.get("expiry_date") or gift.get("deliver_at"))
+                   or bool(dig(order, "urls.gift_confirmation")))
         if not is_gift:
             return {}
 

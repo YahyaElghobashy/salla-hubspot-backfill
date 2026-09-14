@@ -76,8 +76,26 @@ class DetectionEdges(unittest.TestCase):
     def test_source_alone_is_enough(self):
         self.assertEqual(gift_props({"id": 5, "source": "buy_as_gift"})["is_gift_order"], "true")
 
-    def test_receiver_alone_is_enough(self):
-        p = gift_props({"id": 6, "receiver": {"name": "x", "phone": "", "notify": True}})
+    def test_receiver_alone_is_not_enough(self):
+        # Salla attaches `receiver` to NORMAL orders as the delivery contact
+        # (since 2026-09); it must never identify a gift on its own
+        self.assertEqual(
+            gift_props({"id": 6, "receiver": {"name": "x", "phone": "",
+                                              "notify": True}}), {})
+
+    def test_normal_order_with_delivery_receiver(self):
+        # the exact shape that falsely flagged 77 normal orders as gifts
+        self.assertEqual(gift_props({
+            "id": 6, "type": "normal", "source": "store",
+            "source_details": {"type": "direct"},
+            "gift": None, "urls": {"gift_confirmation": None},
+            "receiver": {"name": "Fatima", "phone": "971586803805"},
+            "customer": {"first_name": "فاطمه", "mobile": 586803805}}), {})
+
+    def test_confirmation_url_alone_is_enough(self):
+        p = gift_props({"id": 6,
+                        "urls": {"gift_confirmation": "https://x/gifts/T"},
+                        "receiver": {"name": "x", "notify": True}})
         self.assertEqual(p["is_gift_order"], "true")
         self.assertEqual(p["gift_receiver_salla_notified"], "true")
 
