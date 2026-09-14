@@ -44,13 +44,23 @@ STOP_FILE = Path("STOP.relabel")
 
 
 def api(tok, path, body=None):
-    req = urllib.request.Request("https://api.hubapi.com" + path,
-        data=json.dumps(body).encode() if body else None,
-        headers={"Authorization": "Bearer " + tok,
-                 "Content-Type": "application/json"},
-        method="POST" if body else "GET")
-    with urllib.request.urlopen(req, timeout=60) as r:
-        return json.load(r)
+    """One call with polite 429 handling: the account budget is shared with
+    the live sync and any running sweep, so a throttle means wait, not fail."""
+    for attempt in range(6):
+        req = urllib.request.Request("https://api.hubapi.com" + path,
+            data=json.dumps(body).encode() if body else None,
+            headers={"Authorization": "Bearer " + tok,
+                     "Content-Type": "application/json"},
+            method="POST" if body else "GET")
+        try:
+            with urllib.request.urlopen(req, timeout=60) as r:
+                return json.load(r)
+        except urllib.error.HTTPError as e:
+            if e.code == 429 and attempt < 5:
+                time.sleep(5 * (attempt + 1))
+                continue
+            raise
+    raise RuntimeError("unreachable")
 
 
 def cutover_ms():
@@ -81,7 +91,7 @@ def select_copies(tok):
             if str(p.get("hs_external_created_date", "")).endswith("T21:00:00Z"):
                 midnight += 1
         after = (d.get("paging") or {}).get("next", {}).get("after")
-        time.sleep(0.3)
+        time.sleep(1.2)   # leave search budget for the live sync + any sweep
         if not after:
             break
     return rows, midnight
@@ -99,9 +109,14 @@ def main():
     print("selecting pre-cutover Salla-store records ...")
     rows, midnight = select_copies(tok)
     print(f"selected {len(rows)}; {midnight} carry the midnight copy signature")
-    for sid, hid, d in rows:
-        if not d.endswith("T21:00:00Z"):
-            print(f"  non-midnight outlier: salla {sid} hs {hid} date {d}")
+    outliers = [(s, h, d) for s, h, d in rows if not d.endswith("T21:00:00Z")]
+    for sid, hid, d in outliers:
+        print(f"  non-midnight outlier (EXCLUDED, review manually): "
+              f"salla {sid} hs {hid} date {d}")
+    # only records carrying the copy signature are relabeled; a pre-cutover
+    # order with a real intraday timestamp is likely a pre-launch test order,
+    # not a migration copy, and is left for a human
+    rows = [(s, h, d) for s, h, d in rows if d.endswith("T21:00:00Z")]
 
     if not rows:
         print("nothing to relabel -- selector is clean")
@@ -135,7 +150,7 @@ def main():
                   for _, hid, _ in rows[i:i + 100]]
         api(tok, "/crm/v3/objects/orders/batch/update", {"inputs": inputs})
         patched += len(inputs)
-        time.sleep(0.6)
+        time.sleep(1.5)
         if patched % 1000 < 100:
             print(f"  {patched}/{len(rows)}")
     print(f"relabeled {patched}/{len(rows)}; ledger: {LEDGER}")
