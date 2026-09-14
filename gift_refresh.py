@@ -227,6 +227,12 @@ def run_cycle(cfg, hs, relay, ledger, state, live, log_shipping=False):
                 if ledger.outcome.get(
                     str((r.get("properties") or {}).get("salla_order_id") or ""))
                 not in TERMINAL]
+    # recheck rotation: an order checked last cycle and still pending must not
+    # crowd never-checked orders out of the batch (oldest-first sort would pin
+    # sticky pendings to the front of every page and starve the backlog)
+    checked = state.data.get("checked", {})
+    eligible.sort(key=lambda r: checked.get(
+        str((r.get("properties") or {}).get("salla_order_id") or ""), ""))
     batch = eligible[:int(cfg.gift_refresh_batch)]
     by_salla = {str((r.get("properties") or {}).get("salla_order_id") or ""): r
                 for r in batch if (r.get("properties") or {}).get("salla_order_id")}
@@ -244,8 +250,10 @@ def run_cycle(cfg, hs, relay, ledger, state, live, log_shipping=False):
 
     cleared = expired = pending = parked = failed = 0
     newly_expired = []
+    cycle_ts = now_str()
 
     for salla_id, row in by_salla.items():
+        state.data.setdefault("checked", {})[salla_id] = cycle_ts
         hs_id = row.get("id")
         hsp = row.get("properties") or {}
         payload = payloads.get(salla_id)
@@ -341,6 +349,10 @@ def run_cycle(cfg, hs, relay, ledger, state, live, log_shipping=False):
         d = _created_of(r.get("properties") or {})
         if d and (oldest is None or d < oldest):
             oldest = d
+    # the checked map only matters for orders still in watch
+    for oid, out in ledger.outcome.items():
+        if out in TERMINAL:
+            state.data.get("checked", {}).pop(oid, None)
     metrics = dict(
         pending=max(remaining, 0),
         oldest_days=(today - oldest).days if oldest else 0,

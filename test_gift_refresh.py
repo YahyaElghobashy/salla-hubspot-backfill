@@ -288,6 +288,26 @@ class PendingAndExpired(unittest.TestCase):
         self.assertEqual(m["pending"], 1)
 
 
+class RecheckRotation(unittest.TestCase):
+    def setUp(self):
+        _chdir_tmp(self)
+
+    def test_never_checked_orders_beat_sticky_pendings(self):
+        cfg = _cfg(gift_refresh_batch=1)
+        # order 1 is older (page front) but stays pending; order 2 never checked
+        hs = FakeHS(dict([_order(1, created="2026-01-05"),
+                          _order(2, created="2026-06-01")]))
+        pays = {"1": _payload(1, confirmed=False), "2": _payload(2)}
+        relay = FakeRelay(pays)
+        l = GiftLedger(); s = GiftState()
+        with mock.patch.object(gift_refresh, "send_alert"):
+            run_cycle(cfg, hs, relay, l, s, live=True)   # checks 1, pending
+            run_cycle(cfg, hs, relay, l, s, live=True)   # must pick 2, not 1
+        self.assertEqual(l.outcome.get("2"), "cleared")
+        self.assertEqual(relay.calls[0], ["1"])
+        self.assertEqual(relay.calls[1], ["2"])
+
+
 class DegradedPayloads(unittest.TestCase):
     def setUp(self):
         _chdir_tmp(self)
