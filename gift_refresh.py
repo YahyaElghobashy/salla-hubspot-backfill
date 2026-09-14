@@ -207,20 +207,32 @@ def run_cycle(cfg, hs, relay, ledger, state, live, log_shipping=False):
     today = datetime.now().date()
     stale_cutoff = today - timedelta(days=int(cfg.gift_stale_terminal_days))
 
-    data = hs.search("/crm/v3/objects/orders/search", {
-        "filterGroups": [{"filters": [
-            {"propertyName": "is_gift_order", "operator": "EQ", "value": "true"},
-            {"propertyName": "gift_address_incomplete", "operator": "EQ",
-             "value": "true"},
-            {"propertyName": "gift_address_state",
-             "operator": "NOT_HAS_PROPERTY"},
-        ]}],
-        "sorts": [{"propertyName": "hs_createdate", "direction": "ASCENDING"}],
-        "properties": SEARCH_PROPS,
-        "limit": int(cfg.gift_refresh_search_limit),
-    }, "gift working set")
-    results = data.get("results") or []
+    # Two working sets, one lifecycle. Primary: still awaiting confirmation.
+    # Secondary: orders created AFTER the receiver confirmed (the catalog
+    # drain routinely creates orders late), whose flag is correctly false but
+    # whose shipping fields were baked from the buyer and which carry no
+    # terminal stamp yet. Both converge to gift_address_state being set.
+    def _page(flag_value, what):
+        return hs.search("/crm/v3/objects/orders/search", {
+            "filterGroups": [{"filters": [
+                {"propertyName": "is_gift_order", "operator": "EQ",
+                 "value": "true"},
+                {"propertyName": "gift_address_incomplete", "operator": "EQ",
+                 "value": flag_value},
+                {"propertyName": "gift_address_state",
+                 "operator": "NOT_HAS_PROPERTY"},
+            ]}],
+            "sorts": [{"propertyName": "hs_createdate",
+                       "direction": "ASCENDING"}],
+            "properties": SEARCH_PROPS,
+            "limit": int(cfg.gift_refresh_search_limit),
+        }, what).get("results") or []
+
+    results = _page("true", "gift working set")
     searched = len(results)
+    if searched < int(cfg.gift_refresh_search_limit):
+        results = results + _page("false", "gift stamp sweep")
+        searched = len(results)
 
     # index-lag guard: a just-patched order can linger in the search page
     eligible = [r for r in results
@@ -309,6 +321,11 @@ def run_cycle(cfg, hs, relay, ledger, state, live, log_shipping=False):
                 _note_patch_failure(cfg, state, salla_id, status, resp, live)
             continue
 
+        # a stamp-sweep order that hydrates UNconfirmed had the wrong-false
+        # flag (the exact polarity the client reported): correct the evidence
+        flag_fix = ({"gift_address_incomplete": "true"}
+                    if hsp.get("gift_address_incomplete") == "false" else {})
+
         expiry = _expiry_of(payload, hsp)
         created = _created_of(hsp)
         lapsed = ((expiry is not None and expiry < today)
@@ -316,7 +333,8 @@ def run_cycle(cfg, hs, relay, ledger, state, live, log_shipping=False):
                       and created < stale_cutoff))
         if lapsed:
             status, resp = hs.update_order(
-                hs_id, {"gift_address_state": "expired_unconfirmed"},
+                hs_id, dict(flag_fix,
+                            gift_address_state="expired_unconfirmed"),
                 f"gift expire {salla_id}")
             if status in (200, 201):
                 state.clear("patch_fail", salla_id)
@@ -338,7 +356,13 @@ def run_cycle(cfg, hs, relay, ledger, state, live, log_shipping=False):
                 _note_patch_failure(cfg, state, salla_id, status, resp, live)
             continue
 
-        pending += 1  # not confirmed, not lapsed: stays in watch, no write
+        if flag_fix:
+            status, _ = hs.update_order(hs_id, flag_fix,
+                                        f"gift flag fix {salla_id}")
+            if status in (200, 201):
+                log.info("GIFT %s wrong-false flag corrected; now in watch",
+                         salla_id)
+        pending += 1  # not confirmed, not lapsed: stays in watch
 
     if newly_expired and live:
         _chase_alert(cfg, newly_expired)

@@ -83,12 +83,14 @@ class FakeHS:
 
     def search(self, path, body, what):
         self.searches.append((path, body))
+        flag = next((f["value"] for f in body["filterGroups"][0]["filters"]
+                     if f["propertyName"] == "gift_address_incomplete"), "true")
         rows = []
         for sid, o in sorted(self.orders.items(),
                              key=lambda kv: kv[1]["props"].get("hs_createdate", "")):
             p = o["props"]
             if (p.get("is_gift_order") == "true"
-                    and p.get("gift_address_incomplete") == "true"
+                    and p.get("gift_address_incomplete") == flag
                     and not p.get("gift_address_state")):
                 rows.append({"id": o["id"], "properties": dict(p)})
         limit = body.get("limit") or len(rows)
@@ -220,6 +222,50 @@ class ConfirmedOrders(unittest.TestCase):
         m2, _, _, _ = _run(hs, relay)
         self.assertEqual(len(hs.patches), 1)  # no second patch
         self.assertEqual(m2["pending"], 0)
+
+
+class StampSweep(unittest.TestCase):
+    """Orders created after confirmation: flag correctly false, but no stamp
+    and buyer-baked shipping until the sweep reaches them."""
+
+    def setUp(self):
+        _chdir_tmp(self)
+
+    def test_confirmed_false_order_gets_stamped_not_flipped(self):
+        hs = FakeHS(dict([_order(1, incomplete="false")]))
+        _, ledger, _, alert = _run(hs, FakeRelay({"1": _payload(1)}))
+        self.assertEqual(len(hs.patches), 1)
+        props = hs.patches[0][1]
+        self.assertEqual(props["gift_address_state"], "confirmed")
+        self.assertEqual(props["gift_address_incomplete"], "false")
+        self.assertEqual(props["hs_shipping_address_city"], "جدة")
+        self.assertEqual(ledger.outcome["1"], "cleared")
+        alert.assert_not_called()
+
+    def test_wrong_false_unconfirmed_young_flag_corrected(self):
+        hs = FakeHS(dict([_order(1, incomplete="false")]))
+        _, ledger, _, _ = _run(hs, FakeRelay({"1": _payload(1, confirmed=False)}))
+        self.assertEqual(hs.patches, [("HS1",
+                                       {"gift_address_incomplete": "true"})])
+        self.assertEqual(ledger.outcome, {})   # in watch now, not terminal
+
+    def test_wrong_false_lapsed_gets_state_and_flag(self):
+        hs = FakeHS(dict([_order(1, incomplete="false")]))
+        _, ledger, _, _ = _run(hs, FakeRelay(
+            {"1": _payload(1, confirmed=False, expiry="2026-01-01 00:00:00")}))
+        self.assertEqual(hs.patches[0][1],
+                         {"gift_address_incomplete": "true",
+                          "gift_address_state": "expired_unconfirmed"})
+        self.assertEqual(ledger.outcome["1"], "expired")
+
+    def test_sweep_yields_to_a_full_primary_page(self):
+        cfg = _cfg(gift_refresh_search_limit=1, gift_refresh_batch=1)
+        hs = FakeHS(dict([_order(1), _order(2, incomplete="false")]))
+        relay = FakeRelay({"1": _payload(1), "2": _payload(2)})
+        l = GiftLedger(); s = GiftState()
+        with mock.patch.object(gift_refresh, "send_alert"):
+            run_cycle(cfg, hs, relay, l, s, live=True)
+        self.assertEqual(relay.calls[0], ["1"])   # primary first, sweep waits
 
 
 class PendingAndExpired(unittest.TestCase):
@@ -498,9 +544,10 @@ class Stress(unittest.TestCase):
                                      expiry="2026-01-01 00:00:00")
             else:
                 pays[sid] = _payload(1000 + i)
-        for i in range(76):    # confirmed-at-creation orders: must never be touched
+        for i in range(76):    # created after confirmation: swept and stamped
             sid, o = _order(2000 + i, incomplete="false")
             orders[sid] = o
+            pays[sid] = _payload(2000 + i)
         hs = FakeHS(orders)
         relay = FakeRelay(pays)
         t0 = time.time()
@@ -515,14 +562,14 @@ class Stress(unittest.TestCase):
             cycles += 1
             if m["pending"] == 0:
                 break
-        self.assertLessEqual(cycles, -(-500 // cfg.gift_refresh_batch) + 1)
+        self.assertLessEqual(cycles, -(-576 // cfg.gift_refresh_batch) + 1)
         self.assertLess(time.time() - t0, 10)
-        self.assertEqual(len(l.outcome), 500)
-        touched = {hs.orders[k]["id"] for k, _ in
-                   [(sid, o) for sid, o in hs.orders.items()
-                    if sid.startswith("2")]}
-        patched_ids = {hid for hid, _ in hs.patches}
-        self.assertFalse(touched & patched_ids)   # flag=false orders untouched
+        self.assertEqual(len(l.outcome), 576)
+        for sid, o in hs.orders.items():
+            if sid.startswith("2"):
+                self.assertEqual(o["props"]["gift_address_state"], "confirmed")
+                self.assertEqual(o["props"]["gift_address_incomplete"],
+                                 "false")   # stamped, never flipped
 
 
 if __name__ == "__main__":
