@@ -186,8 +186,11 @@ def _confirm_patch(payload):
     if addr:
         city = str(addr.get("city") or "").strip()
         country = str(addr.get("country") or "").strip()
-        phone = str(addr.get("phone") or addr.get("mobile") or "").strip() \
-            or props.get("gift_receiver_phone", "")
+        # live-verified shape (order 861883089): shipping.address has no phone;
+        # the delivery contact is shipping.receiver.phone
+        phone = (str(addr.get("phone") or addr.get("mobile") or "").strip()
+                 or str(dig(payload, "shipping.receiver.phone") or "").strip()
+                 or props.get("gift_receiver_phone", ""))
         if city:
             props["hs_shipping_address_city"] = city
         if country:

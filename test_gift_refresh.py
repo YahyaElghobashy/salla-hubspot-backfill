@@ -204,6 +204,15 @@ class ConfirmedOrders(unittest.TestCase):
         self.assertEqual(patch["gift_receiver_phone"], "+966500000009")
         self.assertEqual(patch["hs_shipping_address_phone"], "+966500000009")
 
+    def test_shipping_phone_priority_matches_live_shape(self):
+        # live-verified: shipping.address carries no phone; the delivery
+        # contact is shipping.receiver.phone (falls back to the gift phone)
+        pay = _payload(1)
+        pay["shipping"]["address"].pop("phone")
+        pay["shipping"]["receiver"] = {"name": "x", "phone": "966500000003"}
+        patch = _confirm_patch(pay)
+        self.assertEqual(patch["hs_shipping_address_phone"], "966500000003")
+
     def test_cleared_exits_next_search(self):
         hs = FakeHS(dict([_order(1)]))
         relay = FakeRelay({"1": _payload(1)})
