@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 """gift_props: the mapping and every way a payload can try to break it.
 
-The GOOD fixture is the real gift order 745906244, fetched through the
-production relay on 2026-08-31 and trimmed to the fields the helper reads.
+The GOOD fixture is synthetic. It mirrors the exact shape of a buy_as_gift
+order as returned by the production relay (trimmed to the fields the helper
+reads), but every value — ids, names, phones, message, confirmation token —
+is invented. Fixtures in this repo are synthetic by policy; never paste a
+real payload here.
 """
 import copy, json, sys, unittest
 from pathlib import Path
@@ -10,12 +13,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from backfill import gift_props, GIFT_TEXT_LIMIT
 
 GOOD = {
-    "id": 745906244, "type": "gift", "source": "buy_as_gift",
+    "id": 900000001, "type": "gift", "source": "buy_as_gift",
     "source_details": {"type": "buy_as_gift"},
     "address_incomplete": False,
     "urls": {"gift_confirmation": "https://clarahair.com/en/gifts/TESTTOKEN0TESTTOKEN0TESTTOKEN000"},
     "gift": {"text": "هدية بسيطة وكل عام وأنتم بخير ❤️",
-             "image": "https://cdn.salla.sa/ZYpdRp/card.jpg",
+             "image": "https://cdn.salla.sa/example/card.jpg",
              "deliver_at": None, "expiry_date": "2026-10-31 13:40:14"},
     "receiver": {"name": "نور ❤️", "email": "", "phone": "+966500000001", "notify": False},
     "customer": {"first_name": "Saleh", "mobile": "512345678"},
@@ -40,7 +43,7 @@ class GoodPayload(unittest.TestCase):
         self.assertEqual(self.p["gift_receiver_phone"], "+966500000001")
 
     def test_message_card_and_links(self):
-        self.assertIn("هديه", self.p["gift_message"])
+        self.assertIn("هدية", self.p["gift_message"])
         self.assertTrue(self.p["gift_card_image_url"].startswith("https://cdn.salla.sa/"))
         self.assertIn("/gifts/", self.p["gift_confirmation_url"])
 
@@ -98,7 +101,7 @@ class HostileShapes(unittest.TestCase):
         def ph(v):
             return gift_props({"id": 10, "type": "gift",
                                "receiver": {"phone": v}}).get("gift_receiver_phone")
-        self.assertEqual(ph("+966 54 619-2790"), "+966500000001")
+        self.assertEqual(ph("+966 50 000-0001"), "+966500000001")
         self.assertEqual(ph("00500000001"), "+500000001")
         self.assertEqual(ph("966500000001"), "+966500000001")
         self.assertIsNone(ph("call me maybe"))
@@ -124,13 +127,17 @@ class HostileShapes(unittest.TestCase):
         self.assertEqual(gift_props({}), {})
 
 
-class RealRelayFixture(unittest.TestCase):
-    """The untrimmed relay payload, when present on this machine."""
-    FIX = Path("/private/tmp/claude-501/-Users-yahyaelghobashy-Yahya-Meticulousity-EMEA-ClaraHair/64ef14ee-de4e-47dd-bd83-e9cf38c50ec0/scratchpad/gift_order_relay.json")
+class UntrimmedRelayFixture(unittest.TestCase):
+    """An untrimmed relay-shaped payload, when a synthetic one is checked in.
+
+    fixtures/gift_order_relay.json must be SYNTHETIC (same policy as GOOD):
+    full relay field surface, invented values, receiver phone +966500000001.
+    """
+    FIX = Path(__file__).resolve().parent / "fixtures" / "gift_order_relay.json"
 
     def test_full_payload(self):
         if not self.FIX.exists():
-            self.skipTest("relay fixture not on this machine")
+            self.skipTest("no synthetic relay fixture checked in")
         p = gift_props(json.loads(self.FIX.read_text()))
         self.assertEqual(p["is_gift_order"], "true")
         self.assertEqual(p["gift_receiver_phone"], "+966500000001")
