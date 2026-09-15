@@ -90,6 +90,11 @@ class RecoverEngine(backfill.Engine):
                          live=live, workers=1)
         self.is_live_sync = False
         self.health = None
+        # process_item is called directly here, bypassing _finish_create,
+        # which is where the engine normally resets this per-order set (the
+        # cross-sell signal collector added in v2.6). Without it every item
+        # raises AttributeError and the repair reports a false PARTIAL.
+        self._order_signals = set()
 
 
 def orders_from_errors(path="mirror/errors.csv"):
