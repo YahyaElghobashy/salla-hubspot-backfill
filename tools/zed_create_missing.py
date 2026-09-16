@@ -98,6 +98,35 @@ def main():
         if not (len(cur) == 3 and cur.isascii() and cur.isalpha()):
             o.setdefault("amounts", {}).setdefault(
                 "shipping_cost", {})["currency"] = "SAR"
+
+        def _num(v):
+            try:
+                return float(str(v))
+            except (TypeError, ValueError):
+                return None
+
+        # deeper shift damage: total.amount holding a currency code, item
+        # prices holding UUIDs. Reconstruct the total deterministically as
+        # sub_total + shipping when the parts are numeric; zero out garbled
+        # item price fields so line items carry no fabricated numbers.
+        reconstructed = False
+        if _num(dig(o, "amounts.total.amount")) is None:
+            sub = _num(dig(o, "amounts.sub_total.amount"))
+            ship = _num(dig(o, "amounts.shipping_cost.amount")) or 0.0
+            if sub and sub > 0:
+                o["amounts"]["total"] = {"amount": round(sub + ship, 2)}
+                reconstructed = True
+            else:
+                print(f"SKIP {sid}: total and sub_total both garbled -- "
+                      f"cannot reconstruct honestly; left for manual review")
+                failed += 1
+                continue
+        for item in o.get("items") or []:
+            am = item.get("amounts")
+            if isinstance(am, dict):
+                for k, v in list(am.items()):
+                    if isinstance(v, dict) and _num(v.get("amount")) is None:
+                        am[k] = {"amount": "0"}
         try:
             cid = eng.hs.search_contact_retry(o)
         except Exception:
