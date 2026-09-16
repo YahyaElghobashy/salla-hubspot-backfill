@@ -90,6 +90,14 @@ def main():
             names = [u.get("name", "?") for u in unverified][:2]
             print(f"HELD {sid}: {names}")
             continue
+        # corpus defect on a handful of rows: the shipping-cost currency
+        # field holds an Arabic product name instead of an ISO code, which
+        # HubSpot rejects (and which is why these rows never imported).
+        # Everything in this store is SAR; force it when the code is junk.
+        cur = str(dig(o, "amounts.shipping_cost.currency") or "")
+        if not (len(cur) == 3 and cur.isascii() and cur.isalpha()):
+            o.setdefault("amounts", {}).setdefault(
+                "shipping_cost", {})["currency"] = "SAR"
         try:
             cid = eng.hs.search_contact_retry(o)
         except Exception:
