@@ -702,7 +702,10 @@ def main():
     src = SallaSource(relay, hs)
     cache = {}
     run_id = datetime.now(RIYADH).strftime("%G-W%V")
-    manifest = _load_manifest(run_id)
+    # the manifest exists so a CRASHED live run can resume its week without
+    # re-measuring; a dry run is a diagnostic and must always measure fresh
+    manifest = _load_manifest(run_id) if live else {"run_id": run_id,
+                                                    "phases": {}}
 
     findings = []
     for name, fn in [("counts", lambda: phase_counts(src, cfg)),
@@ -718,9 +721,10 @@ def main():
         log.info("--- phase %s ---", name)
         f = fn()
         findings.append(f)
-        manifest["phases"][name] = {"done": True,
-                                    "finding": dataclasses.asdict(f)}
-        _save_manifest(manifest)
+        if live:
+            manifest["phases"][name] = {"done": True,
+                                        "finding": dataclasses.asdict(f)}
+            _save_manifest(manifest)
         log.info("phase %s: %s", name, f.summary)
 
     head, body = render(findings, cfg)
@@ -772,9 +776,10 @@ def main():
     else:
         print("\nrepairs (dry preview):",
               json.dumps(repairs, indent=1)[:1500])
-    # a finished run clears the manifest so next week starts fresh
-    manifest["phases"]["finished"] = {"done": True}
-    _save_manifest(manifest)
+    # a COMPLETED run clears its manifest: resume is for crashes only, and a
+    # deliberate re-run after a posted certificate must measure fresh
+    if live:
+        MANIFEST.unlink(missing_ok=True)
 
 
 if __name__ == "__main__":
