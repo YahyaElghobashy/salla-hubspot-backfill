@@ -186,6 +186,7 @@ def aggregate(period):
     return {
         "live_held": _live_held() if period == "daily" else None,
         "gift_watch": _gift_watch() if period == "daily" else None,
+        "reconcile": _reconcile_watch() if period == "daily" else None,
         "backfill_stalled": stalled,
         "period": period, "start": start, "end": end, "label": label,
         "days_recorded": len(days), "days_expected": span,
@@ -284,6 +285,32 @@ def _gift_watch():
         return None
 
 
+def _reconcile_watch():
+    """The weekly certificate's dead-man switch. Reads the reconciler's own
+    state file (local, rule 3). Returns None while the feature has never run;
+    {"stale": True, "age_days": n} when the last certificate is older than 8
+    days -- a dead Sunday timer is exactly the failure this line exists to
+    surface; otherwise the latest verdict."""
+    try:
+        p = ROOT / "mirror/reconcile_state.json"
+        if not p.exists():
+            return None
+        d = json.loads(p.read_text())
+        try:
+            age = (datetime.now() - datetime.strptime(
+                str(d.get("ts") or ""), "%Y-%m-%d %H:%M:%S")).days
+        except ValueError:
+            age = 99
+        if age > 8:
+            return {"stale": True, "age_days": age}
+        return {"stale": False, "green": bool(d.get("green")),
+                "ts": str(d.get("ts") or "")[:10],
+                "repairs": d.get("repairs") or {}}
+    except Exception as e:
+        log.warning("reconcile state unavailable: %s", e)
+        return None
+
+
 def _verdict(a):
     """One honest sentence up top. Reads the actual numbers, not a fixed string."""
     bad = []
@@ -299,6 +326,9 @@ def _verdict(a):
                    f"(oldest {lh.get('oldest_days', '?')}d)")
     if a.get("backfill_stalled"):
         bad.append("backfill has not advanced since the previous report")
+    if (a.get("reconcile") or {}).get("stale"):
+        bad.append("the weekly reconciliation has not run for "
+                   f"{a['reconcile']['age_days']} days")
     if not a["created"]:
         return "No sync activity recorded in this period."
     if not bad:
@@ -382,6 +412,16 @@ def render(a):
         if held.get("value") is not None:
             head.append(f"• Held for catalog: {held['value']:,} "
                         f"(as of {held.get('as_of') or 'unknown'})")
+    rc = a.get("reconcile")
+    if rc:
+        if rc.get("stale"):
+            head.append(f"• Weekly reconciliation: not recorded for "
+                        f"{rc['age_days']}d — its Sunday timer may be dead")
+        elif rc.get("green"):
+            head.append(f"• Weekly reconciliation ({rc.get('ts')}): all green")
+        else:
+            head.append(f"• Weekly reconciliation ({rc.get('ts')}): findings "
+                        f"posted — see the Sunday certificate thread")
     gw = a.get("gift_watch")
     if gw:
         if gw.get("stale"):

@@ -645,6 +645,24 @@ class Config:
     gift_refresh_search_limit: int = 100    # working-set page (>= batch + parked headroom)
     gift_stale_terminal_days: int = 120     # no-expiry orders age out to terminal
     gift_hydrate_fail_max: int = 5          # consecutive fetch misses before parking
+    # ---- v3.0 weekly reconciliation (reconcile.py, Sunday certificate) --
+    # Re-derives Salla<->HubSpot truth every Sunday at the quietest hour,
+    # posts one certificate to every channel, then repairs what it found.
+    # The live sync always keeps priority: reconcile's own search budget is
+    # capped far below the account pool, and repairs are suppressed entirely
+    # when any measurement failed or a gap breaches the insanity ceiling.
+    reconcile_enabled: bool = False
+    reconcile_window_days: int = 35
+    reconcile_samples_per_era: int = 12
+    reconcile_day_allowance: int = 2
+    reconcile_month_allowance: int = 10
+    reconcile_stale_stage_days: int = 14
+    reconcile_hydrate_max: int = 600
+    reconcile_backfill_max: int = 200       # auto-sweep gaps up to this size
+    reconcile_autorepair_tier: int = 0      # 0 report / 1 +stage patches / 2 +auto-backfill
+    reconcile_search_per_s: float = 1.0
+    reconcile_insane_month_pct: float = 5.0
+    reconcile_insane_orders: int = 5000
     # ---- v2.6 legacy auto-resolver (deleted-in-Salla products) ----------
     # The prefix namespaces every record the resolver creates: live Salla
     # listings will never mint an "LGCY-" SKU, so auto-created records can

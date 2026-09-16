@@ -1,0 +1,14 @@
+[Unit]
+Description=Weekly Salla vs HubSpot reconciliation, Sunday at the quietest hour
+
+[Timer]
+# Sunday 03:33 Riyadh: off the 03:17 drain, ahead of the 03:39 gift run,
+# store traffic at its weekly floor. The explicit timezone keeps the unit
+# correct even if the VM's own timezone ever changes.
+OnCalendar=Sun *-*-* 03:33:00 Asia/Riyadh
+# a reboot across the scheduled minute must still run the period, not skip it
+Persistent=true
+RandomizedDelaySec=60
+
+[Install]
+WantedBy=timers.target

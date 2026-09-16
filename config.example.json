@@ -90,5 +90,17 @@
   "gift_refresh_batch": 48,
   "gift_refresh_search_limit": 100,
   "gift_stale_terminal_days": 120,
-  "gift_hydrate_fail_max": 5
+  "gift_hydrate_fail_max": 5,
+  "reconcile_enabled": false,
+  "reconcile_window_days": 35,
+  "reconcile_samples_per_era": 12,
+  "reconcile_day_allowance": 2,
+  "reconcile_month_allowance": 10,
+  "reconcile_stale_stage_days": 14,
+  "reconcile_hydrate_max": 600,
+  "reconcile_backfill_max": 200,
+  "reconcile_autorepair_tier": 0,
+  "reconcile_search_per_s": 1.0,
+  "reconcile_insane_month_pct": 5.0,
+  "reconcile_insane_orders": 5000
 }

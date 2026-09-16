@@ -1,0 +1,25 @@
+[Unit]
+Description=Weekly reconciliation: re-derive Salla vs HubSpot truth, certify, repair
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=integrations_claragroup_com
+WorkingDirectory=/home/integrations_claragroup_com/app
+# Why this exists: three divergence classes once ran silent for months (an
+# outage window no sweep owned, statuses frozen at creation, a copied
+# population counted twice) until a manual audit caught them. This oneshot IS
+# that audit on a timer: count parity per day and month, random field diffs,
+# a stale-stage sweep, pipeline sensors -- then one Slack certificate to
+# every channel and bounded repairs, with the live sync always keeping
+# priority (reconcile's search budget is a sliver of the account pool).
+# STOP.reconcile halts it, reconcile.lock forbids overlap, and repairs are
+# suppressed outright when a measurement failed or a gap breaches the
+# insanity ceiling.
+ExecStart=/bin/bash -lc 'set -a; . /home/integrations_claragroup_com/app/.env; set +a; exec /home/integrations_claragroup_com/app/venv/bin/python3 reconcile.py --config config.live.json --live'
+# a reconcile that dies must never take the box with it
+Restart=no
+TimeoutStartSec=7200
+
+[Install]
+WantedBy=multi-user.target

@@ -94,28 +94,84 @@ def collect(hs, cfg, before_ms):
                            | {cfg.default_pipeline_stage}) - terminal - {""})
     out = {}
     for stage in non_terminal:
-        after = None
-        while True:
-            body = {"filterGroups": [{"filters": [
-                {"propertyName": "salla_store", "operator": "EQ", "value": "Salla"},
-                {"propertyName": "hs_pipeline_stage", "operator": "EQ", "value": stage},
-                {"propertyName": "hs_external_created_date", "operator": "LT",
-                 "value": before_ms},
-            ]}], "properties": ["salla_order_id", "hs_pipeline_stage"],
-                "sorts": [{"propertyName": "hs_object_id", "direction": "ASCENDING"}],
-                "limit": 100}
-            if after:
-                body["after"] = after
-            data = hs.search("/crm/v3/objects/orders/search", body, "resweep collect")
-            for r in data.get("results") or []:
-                sid = (r.get("properties") or {}).get("salla_order_id")
-                if sid:
-                    out[str(sid)] = {"hs_id": r["id"], "stage": stage}
-            after = (data.get("paging") or {}).get("next", {}).get("after")
-            if not after:
-                break
+        _collect_bucket(hs, stage, None, before_ms, out)
         print(f"  stage {stage}: cumulative {len(out)}")
     return out
+
+
+def _collect_bucket(hs, stage, after_ms, before_ms, out):
+    """Page one (stage, date-window) bucket into `out`. The search API stops
+    paging at 10k results per filter set; a bucket that reports >=10k on its
+    first page is split in half by created-date and each half collected
+    recursively, so no straggler can hide past the ceiling."""
+    filters = [
+        {"propertyName": "salla_store", "operator": "EQ", "value": "Salla"},
+        {"propertyName": "hs_pipeline_stage", "operator": "EQ", "value": stage},
+        {"propertyName": "hs_external_created_date", "operator": "LT",
+         "value": before_ms},
+    ]
+    if after_ms:
+        filters.append({"propertyName": "hs_external_created_date",
+                        "operator": "GTE", "value": after_ms})
+    after = None
+    while True:
+        body = {"filterGroups": [{"filters": filters}],
+                "properties": ["salla_order_id", "hs_pipeline_stage"],
+                "sorts": [{"propertyName": "hs_object_id",
+                           "direction": "ASCENDING"}],
+                "limit": 100}
+        if after:
+            body["after"] = after
+        data = hs.search("/crm/v3/objects/orders/search", body, "resweep collect")
+        if after is None and int(data.get("total") or 0) >= 10000:
+            lo = int(after_ms or ms("2026-02-01"))
+            hi = int(before_ms)
+            mid = str((lo + hi) // 2)
+            _collect_bucket(hs, stage, str(lo), mid, out)
+            _collect_bucket(hs, stage, mid, str(hi), out)
+            return
+        for r in data.get("results") or []:
+            sid = (r.get("properties") or {}).get("salla_order_id")
+            if sid:
+                out[str(sid)] = {"hs_id": r["id"], "stage": stage}
+        after = (data.get("paging") or {}).get("next", {}).get("after")
+        if not after:
+            return
+
+
+def plan_patch(payload, current_stage, stage_map, default_stage):
+    """The one decision both the CLI and the weekly reconciler share: given a
+    FRESH Salla payload and the stored stage, return the property dict to
+    PATCH, or None when the stage is already right. Includes the status text
+    refresh (nothing else ever updates it after creation)."""
+    slug = str(dig(payload, "status.slug")).lower()
+    want = stage_map.get(slug, default_stage)
+    if want == current_stage:
+        return None
+    props = {"hs_pipeline_stage": want}
+    name = str(dig(payload, "status.name") or "").strip()
+    if name:
+        props["hs_fulfillment_status"] = name
+        props["hs_external_order_status"] = name
+    return props
+
+
+def flush_batch(hs, batch, ledger_live):
+    """One batch/update for up to 100 planned patches; ledger on success when
+    ledger_live. `batch` rows: (sid, hs_id, old_stage, new_stage, slug, props).
+    Returns (ok_count, fail_count)."""
+    if not batch:
+        return 0, 0
+    inputs = [{"id": h, "properties": p} for _, h, _, _, _, p in batch]
+    status, resp = hs._write("POST", "/crm/v3/objects/orders/batch/update",
+                             {"inputs": inputs}, f"resweep batch x{len(inputs)}")
+    if status in (200, 201):
+        if ledger_live:
+            append_ledger([(now_str(), s, h, o, n, sl)
+                           for s, h, o, n, sl, _ in batch])
+        return len(batch), 0
+    print(f"BATCH FAILED {status}: {json.dumps(resp)[:200]}")
+    return 0, len(batch)
 
 
 def main():
@@ -157,20 +213,9 @@ def main():
     missing = []
 
     def flush():
-        """One batch/update per 100 planned patches; ledger after success."""
-        if not batch_props:
-            return
-        inputs = [{"id": h, "properties": p} for _, h, _, _, _, p in batch_props]
-        status, resp = hs._write("POST", "/crm/v3/objects/orders/batch/update",
-                                 {"inputs": inputs}, f"resweep batch x{len(inputs)}")
-        if status in (200, 201):
-            if args.live:
-                append_ledger([(now_str(), s, h, o, n, sl)
-                               for s, h, o, n, sl, _ in batch_props])
-            stats["patched"] += len(batch_props)
-        else:
-            stats["batch_failed"] += len(batch_props)
-            print(f"BATCH FAILED {status}: {json.dumps(resp)[:200]}")
+        ok, failed = flush_batch(hs, batch_props, ledger_live=args.live)
+        stats["patched"] += ok
+        stats["batch_failed"] += failed
         batch_props.clear()
 
     for i in range(0, len(todo), cfg.relay_batch_size):
@@ -191,18 +236,15 @@ def main():
                 missing.append(sid)
                 stats["unfetchable"] += 1
                 continue
-            slug = str(dig(p, "status.slug")).lower()
-            want = stage_map.get(slug, backfill.ORDER_PIPELINE_STAGE)
-            plan_hist[slug] += 1
-            if want == row["stage"]:
+            plan_hist[str(dig(p, "status.slug")).lower()] += 1
+            props = plan_patch(p, row["stage"], stage_map,
+                               backfill.ORDER_PIPELINE_STAGE)
+            if props is None:
                 stats["already_right"] += 1
                 continue
-            props = {"hs_pipeline_stage": want}
-            name = str(dig(p, "status.name") or "").strip()
-            if name:
-                props["hs_fulfillment_status"] = name
-                props["hs_external_order_status"] = name
-            batch_props.append((sid, row["hs_id"], row["stage"], want, slug, props))
+            batch_props.append((sid, row["hs_id"], row["stage"],
+                                props["hs_pipeline_stage"],
+                                str(dig(p, "status.slug")).lower(), props))
             if len(batch_props) >= 100:
                 flush()
         if (i // cfg.relay_batch_size) % 25 == 0:
