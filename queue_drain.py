@@ -213,6 +213,7 @@ class DrainGoogleIO(GoogleIO):
                 "attempts": attempts,
                 "notes": str(raw[QC_NOTES] or ""),
                 "older": str(raw[QC_OLDER] or ""),
+                "queued_at": str(raw[QC_QUEUED_AT] or ""),
             })
         return out
 

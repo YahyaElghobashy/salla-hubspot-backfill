@@ -455,30 +455,39 @@ def phase_pipeline(cfg, now=None):
         if age_h > 3:
             detail.append(f"drain blocker matrix is {age_h:.0f}h old -- the "
                           f"hourly drain may be dead")
-    # queue rows stuck beyond a week
-    stuck = []
-    qm = Path("mirror/queue_mirror.csv")
-    if qm.exists():
-        try:
-            with open(qm, newline="", encoding="utf-8") as f:
-                rows = list(csv.reader(f))
-            for r in rows[1:]:
-                if len(r) > 7 and str(r[7]).strip().lower() in ("queued", "held"):
-                    try:
-                        qd = datetime.strptime(r[0][:19], "%Y-%m-%d %H:%M:%S")
-                        if (now.replace(tzinfo=None) - qd).days >= 7:
-                            stuck.append((r[2], (r[6] or "")[:50]))
-                    except ValueError:
-                        continue
-        except OSError:
-            pass
+    # queue rows stuck beyond a week -- read the LIVE sheet, never the local
+    # append-only mirror: the mirror records what was once written and never
+    # learns a row was drained, so it accumulates history forever (a first
+    # dry run read 88k ancient rows out of it)
+    stuck, queue_read = [], True
+    try:
+        from queue_drain import DrainGoogleIO
+        gio = DrainGoogleIO(cfg, enabled=True)
+        for row in gio.qlog_read() or []:
+            status = str(row.get("status") or "").strip().lower()
+            if status not in ("queued", "held"):
+                continue
+            qd = str(row.get("queued_at") or "")[:19]
+            try:
+                age = (now.replace(tzinfo=None)
+                       - datetime.strptime(qd, "%Y-%m-%d %H:%M:%S")).days
+            except ValueError:
+                continue
+            if age >= 7:
+                stuck.append((row.get("order_id"),
+                              str(row.get("items") or row.get("reason")
+                                  or "")[:50]))
+    except Exception as e:   # sheet unreachable: report, never fake a zero
+        queue_read = False
+        detail.append(f"queue check not recorded (sheet unreachable: "
+                      f"{str(e)[:70]})")
     if stuck:
-        blockers = Counter(b for _, b in stuck)
+        blockers = Counter(b for _, b in stuck if b)
         detail.append(f"{len(stuck)} queue row(s) stuck >7d; top blockers: "
                       + ", ".join(f"{b} ({n})"
                                   for b, n in blockers.most_common(3)))
     ok = not detail
-    return Finding("pipeline", True, ok,
+    return Finding("pipeline", queue_read, ok,
                    "pipeline clean" if ok else f"{len(detail)} pipeline "
                                                f"finding(s)",
                    detail, {"stuck": len(stuck)})

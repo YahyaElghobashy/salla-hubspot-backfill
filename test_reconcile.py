@@ -238,28 +238,45 @@ class Pipeline(unittest.TestCase):
     def setUp(self):
         _chdir_tmp(self)
 
+    def _with_queue(self, rows):
+        gio = mock.MagicMock()
+        gio.qlog_read.return_value = rows
+        return mock.patch("queue_drain.DrainGoogleIO", return_value=gio)
+
     def test_clean_pipeline(self):
-        f = phase_pipeline(_cfg(gift_refresh_enabled=False))
+        with self._with_queue([]):
+            f = phase_pipeline(_cfg(gift_refresh_enabled=False))
         self.assertTrue(f.ok)
 
     def test_dead_gift_timer_detected(self):
         Path("mirror/gift_refresh_state.json").write_text(json.dumps(
             {"ts": "2026-09-01 00:00:00"}))
-        f = phase_pipeline(_cfg(gift_refresh_enabled=True),
-                           now=datetime(2026, 9, 20, tzinfo=RIYADH))
+        with self._with_queue([]):
+            f = phase_pipeline(_cfg(gift_refresh_enabled=True),
+                               now=datetime(2026, 9, 20, tzinfo=RIYADH))
         self.assertFalse(f.ok)
         self.assertTrue(any("timer may be dead" in d for d in f.detail))
 
-    def test_stuck_queue_rows_named(self):
-        with open("mirror/queue_mirror.csv", "w", newline="") as fh:
-            w = csv.writer(fh)
-            w.writerow(["ts"] + [f"c{i}" for i in range(14)])
-            w.writerow(["2026-09-01 00:00:00", "x", "42", "R42", "x",
-                        "n", "Blocked Product", "Queued", "", "", "", "",
-                        "", "", ""])
-        f = phase_pipeline(_cfg(), now=datetime(2026, 9, 20, tzinfo=RIYADH))
+    def test_stuck_queue_rows_named_from_live_sheet(self):
+        rows = [{"status": "queued", "queued_at": "2026-09-01 00:00:00",
+                 "order_id": "42", "items": "Blocked Product"},
+                {"status": "processed", "queued_at": "2026-09-01 00:00:00",
+                 "order_id": "43", "items": "x"},
+                {"status": "queued", "queued_at": "2026-09-19 00:00:00",
+                 "order_id": "44", "items": "young, not stuck"}]
+        with self._with_queue(rows):
+            f = phase_pipeline(_cfg(),
+                               now=datetime(2026, 9, 20, tzinfo=RIYADH))
         self.assertFalse(f.ok)
+        self.assertEqual(f.data["stuck"], 1)
         self.assertTrue(any("Blocked Product" in d for d in f.detail))
+
+    def test_unreachable_sheet_is_not_recorded_never_zero(self):
+        with mock.patch("queue_drain.DrainGoogleIO",
+                        side_effect=RuntimeError("no creds")):
+            f = phase_pipeline(_cfg())
+        self.assertFalse(f.measured)
+        self.assertTrue(any("not recorded" in d for d in f.detail))
 
 
 class InsanityAndRepairs(unittest.TestCase):
