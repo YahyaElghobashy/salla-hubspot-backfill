@@ -112,13 +112,14 @@ def main():
         if slug and args.live:
             hs.update_order(hs_id, {"last_salla_sync_status": slug},
                             f"zed status fold {sid}")
-        new = not LEDGER.exists()
-        with open(LEDGER, "a", newline="") as f:
-            w = csv.writer(f)
-            if new:
-                w.writerow(["ts", "salla_order_id", "hs_order_id",
-                            "line_items", "fresh"])
-            w.writerow([now_str(), sid, hs_id, li, fresh])
+        if args.live:   # the ledger records reality, never rehearsals
+            new = not LEDGER.exists()
+            with open(LEDGER, "a", newline="") as f:
+                w = csv.writer(f)
+                if new:
+                    w.writerow(["ts", "salla_order_id", "hs_order_id",
+                                "line_items", "fresh"])
+                w.writerow([now_str(), sid, hs_id, li, fresh])
         ok += 1
         print(f"CREATED {sid} -> {hs_id} ({li} line items)")
     print(f"done: created={ok} failed={failed} held={held}")
