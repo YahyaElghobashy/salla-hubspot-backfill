@@ -395,7 +395,13 @@ class TestStatusClassification(unittest.TestCase):
         self.assertIn("\U0001F534", sent[0][0])
 
     def test_backfill_era_goes_to_digest_not_alert(self):
-        r, _ = self.mk([])
+        # pin the digest hour past the wall clock: the flush fires when
+        # now.hour >= status_digest_hour, so any run at or after the default
+        # 18:00 flushed per-row and made the buffer assertion below flaky.
+        # now.hour + 1 is never reached within the test (and 24 at 23:xx is
+        # simply an hour that never arrives).
+        import datetime as _dt
+        r, _ = self.mk([], status_digest_hour=_dt.datetime.now().hour + 1)
         sent, patcher = self._patch_alerts()
         with patcher:
             for i in range(4):
