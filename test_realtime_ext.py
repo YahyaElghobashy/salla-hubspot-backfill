@@ -218,6 +218,27 @@ class TestCustomerSync(unittest.TestCase):
         self.assertEqual(body["properties"]["incorrect_email"], "x@store.fake")
         self.assertEqual(body["properties"]["phone"], "9665550001")
 
+    def test_consent_flag_lands_on_create_and_update(self):
+        # [v2.10] is_notifications_enabled -> salla_consent_status, both paths
+        s, hs = self.mk()
+        on = {"id": "778", "first_name": "N", "last_name": "K", "mobile": "5550002",
+              "mobile_code": "966", "is_notifications_enabled": True}
+        s.handle_row(_cust_row(cid="778", payload=on, phone="9665550002"))
+        self.assertEqual(hs.writes[-1][2]["properties"]["salla_consent_status"], "true")
+
+        hs.contacts = [{"id": "C7", "properties": {}}]
+        off = {"id": "779", "first_name": "N", "last_name": "K", "mobile": "5550003",
+               "mobile_code": "966", "is_notifications_enabled": False}
+        s.handle_row(_cust_row(cid="779", payload=off, phone="9665550003"))
+        method, path, body = hs.writes[-1]
+        self.assertEqual((method, path), ("PATCH", "/crm/v3/objects/contacts/C7"))
+        self.assertEqual(body["properties"]["salla_consent_status"], "false")
+
+    def test_missing_consent_flag_leaves_property_alone(self):
+        s, hs = self.mk()
+        s.handle_row(_cust_row())            # default payload has no flag
+        self.assertNotIn("salla_consent_status", hs.writes[-1][2]["properties"])
+
     def test_one_hit_updates(self):
         s, hs = self.mk()
         hs.contacts = [{"id": "C1", "properties": {"firstname": "N"}}]
@@ -256,6 +277,34 @@ class TestCustomerSync(unittest.TestCase):
         self.assertEqual(len([w for w in hs.writes
                               if w[0] == "POST" and w[1].endswith("contacts")]),
                          1)
+
+
+class TestConsentStatus(unittest.TestCase):
+    """[v2.10] One helper feeds both contact writers."""
+
+    def test_flag_rendering(self):
+        cs = backfill.consent_status
+        self.assertEqual(cs({"is_notifications_enabled": True}), "true")
+        self.assertEqual(cs({"is_notifications_enabled": False}), "false")
+        self.assertEqual(cs({"is_notifications_enabled": "true"}), "true")
+        self.assertEqual(cs({"is_notifications_enabled": 0}), "false")
+        self.assertIsNone(cs({"is_notifications_enabled": None}))
+        self.assertIsNone(cs({}))
+        self.assertIsNone(cs(None))
+
+    def test_order_path_contact_carries_flag_only_when_present(self):
+        hs = backfill.HubSpot(_cfg(), "tok", live=False)
+        seen = []
+        hs._write = lambda m, p, body, what: (seen.append(body), (201, {"id": "C9"}))[1]
+        base = {"first_name": "A", "mobile": "5", "mobile_code": "966",
+                "urls": {"admin": "u"}}
+        hs.create_contact({"customer": {**base, "id": 1,
+                                        "is_notifications_enabled": True}})
+        self.assertEqual(seen[-1]["properties"]["salla_consent_status"], "true")
+        hs.create_contact({"customer": {**base, "id": 2}})
+        self.assertNotIn("salla_consent_status", seen[-1]["properties"])
+        hs.create_contact({"customer": None})       # the null-customer order
+        self.assertNotIn("salla_consent_status", seen[-1]["properties"])
 
 
 class TestTwinCollapse(unittest.TestCase):

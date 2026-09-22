@@ -125,6 +125,31 @@ def ifempty(a, b):
     return b if a in (None, "", [], {}) else a
 
 
+def consent_status(customer):
+    """[v2.10] salla_consent_status <- Salla `is_notifications_enabled`.
+
+    The portal property is plain text (created 2026-09-22), so the value is
+    the lowercase boolean word, the same rendering Make gives
+    {{1.data.is_notifications_enabled}}. Returns None when the payload does
+    not carry the flag at all, so callers omit the property and never blank a
+    value that an earlier event set. Booleans, 0/1 and true/false strings all
+    normalise; anything else passes through lowercased.
+    """
+    if not isinstance(customer, dict) or "is_notifications_enabled" not in customer:
+        return None
+    v = customer.get("is_notifications_enabled")
+    if v is None:
+        return None
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    s = str(v).strip().lower()
+    if s in ("true", "1", "yes", "on"):
+        return "true"
+    if s in ("false", "0", "no", "off"):
+        return "false"
+    return s
+
+
 GIFT_TEXT_LIMIT = 5000  # HubSpot textarea holds 65k; a gift card does not
 
 
@@ -1184,6 +1209,12 @@ class HubSpot:
             "lifecyclestage": "customer",
             "phone": f"{dig(order,'customer.mobile_code')}{dig(order,'customer.mobile')}",
         }
+        # [v2.10] The order's customer block from the Merchant API carries no
+        # `is_notifications_enabled` today (verified 2026-09-22), so this only
+        # fires if Salla ever adds it; the key is omitted otherwise.
+        consent = consent_status(c)
+        if consent is not None:
+            props["salla_consent_status"] = consent
         status, data = self._write("POST", "/crm/v3/objects/contacts",
                                    {"properties": props}, "create contact")
         if status not in (200, 201):

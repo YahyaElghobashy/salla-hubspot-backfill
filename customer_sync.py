@@ -37,7 +37,8 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-from backfill import Config, HubSpot, GoogleIO, now_str, setup_logging
+from backfill import (Config, HubSpot, GoogleIO, consent_status, now_str,
+                      setup_logging)
 from realtime_base import RealtimeConsumer, TabLock
 
 log = logging.getLogger("backfill")
@@ -105,6 +106,12 @@ class CustomerSync(RealtimeConsumer):
              "salla_customer_id": str(c.get("id") or ""),
              "incorrect_email": c.get("email") or "",
              "customer_location": c.get("location") or ""}
+        # [v2.10] Salla `is_notifications_enabled` -> salla_consent_status, on
+        # create and on update alike. Only when the capture forwarded the flag:
+        # an absent key leaves whatever the property already holds.
+        consent = consent_status(c)
+        if consent is not None:
+            p["salla_consent_status"] = consent
         bday = str(c.get("birthday") or "")
         if bday:
             # blueprint: substring(...) of the {date:...} struct; capture side
