@@ -189,6 +189,25 @@ class CustomerSync(RealtimeConsumer):
     def handle_row(self, row):
         c = self.payload(row)
         cid = row["order_id"]          # generic entity-id column = customer id
+        # [v2.10] An unreadable or id-less payload must never become a
+        # phone-only contact (2026-09-22: a broken capture template did exactly
+        # that for nine minutes). Park the row with its payload intact so a
+        # human or tools/repair_customer_contacts.py can act on it.
+        raw = (row.get("note") or "").strip()
+        if not c or not str(c.get("id") or "").strip():
+            log.error("CUSTOMER row %s (%s): payload unreadable or without id -- held",
+                      row.get("row"), cid)
+            try:
+                import notify
+                notify.send_alert(
+                    "🖐 Customer capture payload unreadable",
+                    f"Salla customer {cid}: the queue row's payload could not be "
+                    f"parsed, so no contact was created. The row is parked as held. "
+                    f"Check the capture scenario's payload template, then run "
+                    f"tools/repair_customer_contacts.py.")
+            except Exception as e:
+                log.warning("held notify failed: %s", e)
+            return "held", raw[:900]
         phone = row["reference_id"] or (
             f"{c.get('mobile_code', '')}{c.get('mobile', '')}")
         mobile = str(c.get("mobile") or "")

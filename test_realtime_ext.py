@@ -234,6 +234,22 @@ class TestCustomerSync(unittest.TestCase):
         self.assertEqual((method, path), ("PATCH", "/crm/v3/objects/contacts/C7"))
         self.assertEqual(body["properties"]["salla_consent_status"], "false")
 
+    def test_unreadable_payload_is_held_not_created(self):
+        # [v2.10] a broken capture template must never yield a phone-only lead
+        s, hs = self.mk()
+        row = _cust_row(cid="781", phone="9665550005")
+        row["note"] = '{"id":"781","first_name":"N","is_notifications_enabled":"true}"'
+        with mock.patch("notify.send_alert", create=True):
+            state, note = s.handle_row(row)
+        self.assertEqual(state, "held")
+        self.assertEqual(note, row["note"])            # payload kept for repair
+        self.assertEqual(hs.writes, [])
+        row2 = _cust_row(cid="782", phone="9665550006", payload={"first_name": "X"})
+        with mock.patch("notify.send_alert", create=True):
+            state, _ = s.handle_row(row2)
+        self.assertEqual(state, "held")                # no id: not a customer
+        self.assertEqual(hs.writes, [])
+
     def test_missing_consent_flag_leaves_property_alone(self):
         s, hs = self.mk()
         s.handle_row(_cust_row())            # default payload has no flag
