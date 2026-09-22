@@ -66,7 +66,13 @@ LEDGER = Path("mirror/catalog_blocker_fixes.csv")
 
 # (salla_product_id, expected_sku, human label)
 APPROVE_EXISTING = [("2142608306", "C031", "فرشاة الشعر الكيرلي / Curly Hair Brush")]
-NEUTRALISE_STUB = [("2113977878", "CH12", "Clara Daily Hydrating Shampoo & Conditioner")]
+NEUTRALISE_STUB = [
+    ("2113977878", "CH12", "Clara Daily Hydrating Shampoo & Conditioner"),
+    # Relisted 21 Sep as a single product but tagged "bundle" in Salla, so the
+    # Make bundle branch creates an empty template for it on every edit and the
+    # gate holds its orders (te == 0, ta > 0). Standalone 434196269276 is approved.
+    ("1982906533", "", "المجفف متعدد الاستخدام / Multi Styler dryer (tagged bundle in Salla)"),
+]
 
 
 def ledger_write(rows):
@@ -163,6 +169,18 @@ def neutralise_stub(hs, pid, sku, label, apply_):
 
     old_key = p.get("bundle_template_key") or ""
     new_key = f"VOID-{old_key or tpl_id}"
+    # bundle_template_key is unique. A product neutralised once before already
+    # owns the plain sentinel (the Make bundle branch recreates a stray for any
+    # product still sitting in the Salla bundle category), so a later stray gets
+    # its own record id appended: VOID-<key>-<template id>.
+    taken = hs.search(
+        f"/crm/v3/objects/{backfill.OBJ_BUNDLE_TEMPLATE}/search",
+        {"filterGroups": [{"filters": [
+            {"propertyName": "bundle_template_key", "operator": "EQ", "value": new_key}]}],
+         "properties": ["hs_object_id"], "limit": 1},
+        "void sentinel already used?")
+    if taken.get("results"):
+        new_key = f"{new_key}-{tpl_id}"
     log.info("  %s pid %-12s %-6s template=%s  bundle_template_key %r -> %r",
              "PATCH" if apply_ else "WOULD PATCH", pid, sku, tpl_id, old_key, new_key)
     log.info("        (%s) -- record kept, key repointed, reversible", label)
