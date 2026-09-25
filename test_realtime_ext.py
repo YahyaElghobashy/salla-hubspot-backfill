@@ -85,8 +85,10 @@ class FakeGIO:
     def queue_read(self, qsid, start_row=2, tab=None):
         return []
 
-    def queue_mark(self, qsid, row, expect, status, attempts, note, tab=None):
+    def queue_mark(self, qsid, row, expect, status, attempts, note, tab=None,
+                   **kw):
         self.marks.append((row, status, note))
+        self.mark_kw = getattr(self, "mark_kw", []) + [kw]
         return True
 
     def queue_append_rows(self, qsid, rows, tab=None):
@@ -236,13 +238,15 @@ class TestCustomerSync(unittest.TestCase):
 
     def test_unreadable_payload_is_held_not_created(self):
         # [v2.10] a broken capture template must never yield a phone-only lead
+        # [v2.11] the note is now a short reason; the payload stays in H
+        # because held rows write their note to column I (see _mark).
         s, hs = self.mk()
         row = _cust_row(cid="781", phone="9665550005")
         row["note"] = '{"id":"781","first_name":"N","is_notifications_enabled":"true}"'
         with mock.patch("notify.send_alert", create=True):
             state, note = s.handle_row(row)
         self.assertEqual(state, "held")
-        self.assertEqual(note, row["note"])            # payload kept for repair
+        self.assertIn("no Salla lookup", note)
         self.assertEqual(hs.writes, [])
         row2 = _cust_row(cid="782", phone="9665550006", payload={"first_name": "X"})
         with mock.patch("notify.send_alert", create=True):

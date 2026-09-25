@@ -660,6 +660,33 @@ class Config:
     customer_sync_enabled: bool = True
     customer_queue_tab: str = "Customer Queue"
     customer_auto_merge: bool = True
+    # ---- v2.11 capture hardening -----------------------------------------
+    # Realtime consumers retry an `error` row at most this many times, then
+    # settle it (customers -> held, status -> error-final) so one permanent
+    # failure can never pin a consumer's cursor again.
+    realtime_max_attempts: int = 12
+    # Daily trim of the realtime queue tabs. Off until the one-off relief
+    # (tools/trim_queue.py) has run; the queue workbook shares Google's
+    # 10M-cell cap with the Live Queue.
+    realtime_trim_enabled: bool = False
+    realtime_trim_hour: int = 4
+    status_trim_days: int = 7
+    customer_trim_days: int = 30
+    # Customer sync falls back to one Salla read when the capture payload
+    # cannot be read or salvaged; one attempt, short timeout, never a stall.
+    customer_lookup_timeout_s: float = 20.0
+    # customer_sweep.py: daily gap sweep and consent filler.
+    customer_sweep_enabled: bool = False
+    customer_sweep_cap: int = 300
+    consent_filler_days: int = 3
+    consent_filler_cap: int = 400
+    # credit_watch retry-queue watch: {label: make scenario id}. Empty keeps
+    # the two relay scenarios. Items younger than dlq_min_age_minutes are left
+    # to Make's own automatic retry (it re-runs transient failures ~30 min on).
+    make_dlq_watch: dict = None
+    dlq_min_age_minutes: int = 45
+    # Workbook capacity guard (Google caps a workbook at 10,000,000 cells).
+    capacity_alert_pct: float = 80.0
     # ---- v2.9 gift address refresh (gift_refresh.py) --------------------
     # A gift order's receiver confirms their delivery address AFTER purchase;
     # nothing else in the engine re-reads an order once created, so a bounded
@@ -819,6 +846,38 @@ class RelayClient:
         data = parsed.get("data")
         if not isinstance(data, dict) or "status" not in data:
             raise RelayError(f"relay GET {path[:80]}: unexpected Salla payload")
+        return data
+
+    def get_path_once(self, path, timeout=20.0):
+        """[v2.11] One Salla GET through the relay with NO retries and a short
+        timeout, for callers on a hot loop (the customer sync) where the
+        normal 6x5-attempt ladder could stall a stream for hours. Returns the
+        Salla envelope ({"status", "success", "data"...}); raises RelayError on
+        any transport or relay failure so the caller can retry later."""
+        self._gap.wait()
+        body = json.dumps({"secret": self.secret, "path": path})
+        status, _, text = http_request("POST", self.cfg.relay_url,
+                                       headers={"Content-Type": "application/json"},
+                                       body=body, timeout=timeout)
+        if status != 200:
+            raise RelayError(f"relay GET {path[:80]}: HTTP {status}")
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError:
+            raise RelayError(f"relay GET {path[:80]}: non JSON reply")
+        if not parsed.get("ok"):
+            raise RelayError(f"relay GET {path[:80]}: ok=false")
+        data = parsed.get("data")
+        if data is None:
+            # The relay answers {"ok": true, "data": null} when Salla has no
+            # such record (verified 2026-09-26 with a made-up customer id). The
+            # same shape could in principle hide a transient Salla failure, so
+            # callers must treat it as "not found yet", never as deleted.
+            self._gap.on_success()
+            return {"status": 404, "success": False, "data": None}
+        if not isinstance(data, dict) or "status" not in data:
+            raise RelayError(f"relay GET {path[:80]}: unexpected Salla payload")
+        self._gap.on_success()
         return data
 
     def fetch_orders(self, ids):
@@ -1608,27 +1667,86 @@ class GoogleIO:
             })
         return out
 
+    def queue_read_all(self, qsid, tab=None, chunk=20000):
+        """queue_read for a whole tab in bounded pages: one values.get of a
+        166k-row tab is tens of megabytes and risks a timeout. Queue tabs are
+        append-only with no gaps, so a short page is the end."""
+        out, start = [], 2
+        while True:
+            tab_ = tab or self.cfg.live_queue_tab
+            resp = self._gexec(self.sheets.values().get(
+                spreadsheetId=qsid, range=f"'{tab_}'!A{start}:H{start + chunk - 1}",
+                valueRenderOption="UNFORMATTED_VALUE"),
+                "queue read page", self.sheets_rl)
+            page = resp.get("values", []) or []
+            for i, raw in enumerate(page):
+                raw = list(raw) + [""] * (8 - len(raw))
+                out.append({
+                    "row": start + i,
+                    "received_at": str(raw[0]),
+                    "order_id": self._norm_id(raw[1]),
+                    "reference_id": self._norm_id(raw[2]),
+                    "event": str(raw[3]),
+                    "status": str(raw[4]).strip().lower(),
+                    "attempts": int(raw[5] or 0) if str(raw[5]).strip().lstrip("-").isdigit() else 0,
+                    "source": str(raw[6]),
+                    "note": str(raw[7]),
+                })
+            if len(page) < chunk:
+                return out
+            start += chunk
+
     def queue_mark(self, qsid, row, expect_order_id, status, attempts, note,
-                   tab=None):
+                   tab=None, note_col="H", clear_col=None,
+                   expect_received_at=None):
         """Verify-then-write: re-read the row's order_id immediately before
         writing so a human sort/insert can never retarget a status update.
-        Returns True when the write landed on the intended row."""
+        Returns True when the write landed on the intended row.
+
+        v2.11: on tabs where column H carries the capture payload (Customer
+        Queue) a non-final outcome must not overwrite it. note_col="I" writes
+        state/attempts to E:F and the note to I, leaving H intact;
+        clear_col="I" (with the default note_col) writes the note to H and
+        empties I in the same call. expect_received_at additionally checks
+        column A, which tells twin rows of one id apart."""
         tab = tab or self.cfg.live_queue_tab
         resp = self._gexec(self.sheets.values().get(
-            spreadsheetId=qsid, range=f"'{tab}'!B{row}",
+            spreadsheetId=qsid, range=f"'{tab}'!A{row}:B{row}",
             valueRenderOption="UNFORMATTED_VALUE"),
             "queue verify", self.sheets_rl)
-        got = self._norm_id(((resp.get("values") or [[""]])[0] or [""])[0])
-        if got != str(expect_order_id):
-            log.error("QUEUE row %s moved (expected order %s, found %s) -- "
-                      "write refused; row will be reprocessed by rescan",
-                      row, expect_order_id, got)
+        cells = list(((resp.get("values") or [[]])[0]) or []) + ["", ""]
+        got = self._norm_id(cells[1])
+        moved = got != str(expect_order_id)
+        if not moved and expect_received_at is not None:
+            moved = str(cells[0]).strip() != str(expect_received_at).strip()
+        if moved:
+            log.error("QUEUE row %s moved (expected order %s received %s, found "
+                      "%s received %s) -- write refused; row will be reprocessed "
+                      "by rescan", row, expect_order_id,
+                      expect_received_at if expect_received_at is not None else "-",
+                      got, str(cells[0]).strip() or "-")
             return False
-        self._gexec(self.sheets.values().update(
-            spreadsheetId=qsid, range=f"'{tab}'!E{row}:H{row}",
-            valueInputOption="RAW",
-            body={"values": [[status, attempts, None, note]]}),
-            f"queue mark {status}", self.sheets_rl)
+        if note_col == "I":
+            self._gexec(self.sheets.values().batchUpdate(
+                spreadsheetId=qsid, body={
+                    "valueInputOption": "RAW",
+                    "data": [{"range": f"'{tab}'!E{row}:F{row}",
+                              "values": [[status, attempts]]},
+                             {"range": f"'{tab}'!I{row}",
+                              "values": [[note]]}]}),
+                f"queue mark {status}", self.sheets_rl)
+        elif clear_col == "I":
+            self._gexec(self.sheets.values().update(
+                spreadsheetId=qsid, range=f"'{tab}'!E{row}:I{row}",
+                valueInputOption="RAW",
+                body={"values": [[status, attempts, None, note, ""]]}),
+                f"queue mark {status}", self.sheets_rl)
+        else:
+            self._gexec(self.sheets.values().update(
+                spreadsheetId=qsid, range=f"'{tab}'!E{row}:H{row}",
+                valueInputOption="RAW",
+                body={"values": [[status, attempts, None, note]]}),
+                f"queue mark {status}", self.sheets_rl)
         return True
 
     def queue_mark_batch(self, qsid, marks, tab=None):
@@ -1689,31 +1807,82 @@ class GoogleIO:
             body={"values": [[f"{instance_id}|{int(time.time())}"]]}),
             "queue heartbeat write", self.sheets_rl)
 
-    def queue_trim(self, qsid, keep_predicate):
-        """Delete terminal rows failing keep_predicate(row_dict). Caller must
-        hold the claim pause (engine is the ONLY deleter). Deletes bottom-up
-        so indices stay valid."""
-        rows = self.queue_read(qsid)
+    def queue_trim(self, qsid, keep_predicate, tab=None,
+                   deletable=("done", "gone"), archive_dir="mirror/archive",
+                   dry_run=False, ranges_per_call=100):
+        """Delete rows whose status is in `deletable` and that fail
+        keep_predicate(row_dict). Returns the number of rows deleted (or that
+        would be, in a dry run).
+
+        Caller contract: it is the ONLY deleter of this tab, and it has
+        already reset its own read cursor (the rows below every deleted row
+        move up). Make only appends below the last row, so deleting bottom-up
+        keeps every remaining index valid between calls.
+
+        v2.11: any tab, any terminal set; consecutive rows are grouped into
+        range deletes and sent in chunks (the first Status Queue trim is
+        >100k rows); every deleted row is archived to a gzip CSV first; the
+        rows are re-read and compared by id just before deleting."""
+        tab = tab or self.cfg.live_queue_tab
+        rows = self.queue_read_all(qsid, tab=tab)
         # held rows are deliberately NEVER trimmed: they are the sweep's
         # memory that an order was seen and intentionally not created (catalog
         # gate). Deleting them would make every sweep re-hold the same order.
-        doomed = [r["row"] for r in rows
-                  if r["status"] in ("done", "gone") and not keep_predicate(r)]
-        if not doomed:
+        doomed = [r for r in rows
+                  if r["status"] in deletable and r["status"] != "held"
+                  and not keep_predicate(r)]
+        if not doomed or dry_run:
+            return len(doomed)
+        self._archive_rows(tab, doomed, archive_dir)
+        fresh = {r["row"]: r["order_id"] for r in self.queue_read_all(qsid, tab=tab)}
+        moved = [r["row"] for r in doomed if fresh.get(r["row"]) != r["order_id"]]
+        if moved:
+            log.error("TRIM %s aborted: %d row(s) moved since the read "
+                      "(first %s); nothing deleted", tab, len(moved), moved[:5])
             return 0
         meta = self._gexec(self.sheets.get(
             spreadsheetId=qsid, fields="sheets(properties(sheetId,title))"),
             "queue meta", self.sheets_rl)
         gid = next(p["properties"]["sheetId"] for p in meta["sheets"]
-                   if p["properties"]["title"] == self.cfg.live_queue_tab)
-        requests = [{"deleteDimension": {"range": {
-            "sheetId": gid, "dimension": "ROWS",
-            "startIndex": r - 1, "endIndex": r}}}
-            for r in sorted(doomed, reverse=True)]
-        self._gexec(self.sheets.batchUpdate(
-            spreadsheetId=qsid, body={"requests": requests}),
-            "queue trim", self.sheets_rl)
+                   if p["properties"]["title"] == tab)
+        spans = []                                   # [start_row, end_row]
+        for n in sorted(r["row"] for r in doomed):
+            if spans and n == spans[-1][1] + 1:
+                spans[-1][1] = n
+            else:
+                spans.append([n, n])
+        spans.reverse()                              # bottom-up
+        for i in range(0, len(spans), ranges_per_call):
+            requests = [{"deleteDimension": {"range": {
+                "sheetId": gid, "dimension": "ROWS",
+                "startIndex": a - 1, "endIndex": b}}}
+                for a, b in spans[i:i + ranges_per_call]]
+            self._gexec(self.sheets.batchUpdate(
+                spreadsheetId=qsid, body={"requests": requests}),
+                "queue trim", self.sheets_rl)
         return len(doomed)
+
+    @staticmethod
+    def _archive_rows(tab, rows, archive_dir):
+        """Write the rows about to be deleted to a gzip CSV and prove the file
+        holds all of them before anything is deleted."""
+        import gzip
+        Path(archive_dir).mkdir(parents=True, exist_ok=True)
+        slug = re.sub(r"[^a-z0-9]+", "-", tab.lower()).strip("-")
+        path = Path(archive_dir) / f"{slug}-{datetime.now():%Y%m%d-%H%M%S}.csv.gz"
+        cols = ["row", "received_at", "order_id", "reference_id", "event",
+                "status", "attempts", "source", "note"]
+        with gzip.open(path, "wt", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=cols)
+            w.writeheader()
+            for r in rows:
+                w.writerow({k: r.get(k, "") for k in cols})
+        with gzip.open(path, "rt", newline="", encoding="utf-8") as f:
+            written = sum(1 for _ in csv.DictReader(f))
+        if written != len(rows):
+            raise RuntimeError(f"archive {path} holds {written} of {len(rows)} rows")
+        log.info("TRIM archive %s (%d rows)", path, written)
+        return path
 
     def queue_append(self, values_by_idx):
         """[M224] Queue Log row."""

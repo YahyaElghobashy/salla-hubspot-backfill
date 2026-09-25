@@ -26,12 +26,45 @@ import os
 import socket
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 log = logging.getLogger("backfill")
 
 HEARTBEAT_STALE_S = 300
+TRIM_LOCK = Path("mirror/trim.lock")
+TRIM_LOCK_STALE_S = 2 * 3600
+
+
+def trim_lock_active():
+    """[v2.11] True while a queue trim is deleting rows. Tools that hold sheet
+    row numbers (drains, repairs, state setters) must not run meanwhile: the
+    rows under them move up. A lock older than two hours is treated as left
+    behind by a crash."""
+    try:
+        return time.time() - TRIM_LOCK.stat().st_mtime < TRIM_LOCK_STALE_S
+    except OSError:
+        return False
+
+
+class trim_lock:
+    """Context manager that holds TRIM_LOCK for the duration of a trim."""
+
+    def __init__(self, tab):
+        self.tab = tab
+
+    def __enter__(self):
+        TRIM_LOCK.parent.mkdir(exist_ok=True)
+        TRIM_LOCK.write_text(json.dumps({"tab": self.tab, "pid": os.getpid(),
+                                         "ts": datetime.now().isoformat(timespec="seconds")}))
+        return self
+
+    def __exit__(self, *exc):
+        try:
+            TRIM_LOCK.unlink()
+        except OSError:
+            pass
+        return False
 
 
 class TabLock:
@@ -69,6 +102,24 @@ class RealtimeConsumer:
     #: order (an order moving under_review -> completed). Getting this wrong
     #: silently discards real events, so subclasses declare it explicitly.
     collapse_twins = True
+    #: [v2.11] rows deliberately left for a human or a tool. The read cursor
+    #: walks past them like terminal rows (before v2.11 one held row pinned
+    #: the cursor and every poll re-read the tab from it), but they are never
+    #: claimed and never trimmed.
+    parked = ("held",)
+    #: [v2.11] where an `error` row settles once cfg.realtime_max_attempts is
+    #: reached, so a permanent failure cannot pin the cursor forever.
+    exhausted_state = "error-final"
+    #: [v2.11] True where column H carries the capture payload (Customer
+    #: Queue): a non-final outcome then writes its note to column I and keeps
+    #: H, and a final outcome replaces H with the note and clears I.
+    payload_in_h = False
+    #: [v2.11] daily trim: which states may be deleted, the Config attribute
+    #: holding the retention in days, and the hour offset from
+    #: cfg.realtime_trim_hour (streams trim at different hours).
+    trimmable = ("done", "gone", "superseded", "error-final")
+    trim_days_attr = ""
+    trim_hour_offset = 0
 
     def __init__(self, cfg, hs, gio, tab, live=True):
         self.cfg, self.hs, self.gio = cfg, hs, gio
@@ -82,6 +133,8 @@ class RealtimeConsumer:
         self._start_row = 2
         self._active_until = 0.0
         self._last_hb = 0.0
+        self._last_rewalk_day = None
+        self._last_trim_day = None
         self._load_state()
 
     # -- state -----------------------------------------------------------------
@@ -178,6 +231,98 @@ class RealtimeConsumer:
         """Process one row. Returns (state, note). Must be idempotent."""
         raise NotImplementedError
 
+    def on_exhausted(self, row, note):
+        """[v2.11] Called once when an `error` row hits the attempt cap.
+        Subclasses record it wherever a human will look."""
+
+    # -- v2.11 settle / mark / re-walk / trim -------------------------------------
+
+    def _settle(self, row, state, note):
+        """Cap retries: the cursor stops at `error` rows, so an error that
+        repeats forever would rebuild exactly the pin v2.11 removes."""
+        cap = int(getattr(self.cfg, "realtime_max_attempts", 0) or 0)
+        if state == "error" and cap and int(row.get("attempts") or 0) + 1 >= cap:
+            note = f"gave up after {int(row.get('attempts') or 0) + 1} attempts: {note}"[:180]
+            log.error("%s row %s id %s: %s", self.name, row.get("row"),
+                      row.get("order_id"), note)
+            try:
+                self.on_exhausted(row, note)
+            except Exception as e:
+                log.warning("%s on_exhausted failed: %s", self.name, e)
+            return self.exhausted_state, note
+        return state, note
+
+    def _mark(self, row, state, attempts, note):
+        """Write a row's outcome. On payload tabs a non-final outcome keeps
+        the payload in H (note to I); a final one replaces H and clears I."""
+        kw = {"tab": self.tab, "expect_received_at": row.get("received_at")}
+        if self.payload_in_h:
+            if state in self.terminal:
+                kw["clear_col"] = "I"
+            else:
+                kw["note_col"] = "I"
+        return self.gio.queue_mark(self.qsid, row["row"], row["order_id"],
+                                   state, attempts, note, **kw)
+
+    def _maybe_rewalk(self):
+        """Once a day walk the tab again from row 2, so a row someone puts
+        back to `queued` behind the cursor is still picked up. Tied to the
+        daily trim: before a tab is trimmed a walk from row 2 is a full read of
+        a very large tab."""
+        if not getattr(self.cfg, "realtime_trim_enabled", False):
+            return
+        now = datetime.now()
+        hour = int(getattr(self.cfg, "realtime_trim_hour", 4)) + self.trim_hour_offset
+        if self._last_rewalk_day == now.date() or now.hour < hour % 24:
+            return
+        self._last_rewalk_day = now.date()
+        if self._start_row != 2:
+            log.info("%s daily re-walk from row 2 (cursor was %d)",
+                     self.name.upper(), self._start_row)
+            self._start_row = 2
+            self._save_state()
+
+    def _maybe_trim(self):
+        """Daily trim of this stream's own tab (Google caps a workbook at 10M
+        cells and these tabs never shrank). The consumer is the only deleter
+        of its tab; its cursor is reset to row 2 BEFORE the delete and again
+        in `finally`, so an interrupted delete can never leave it pointing
+        past rows that moved up."""
+        if not getattr(self.cfg, "realtime_trim_enabled", False) or not self.live:
+            return
+        days = int(getattr(self.cfg, self.trim_days_attr, 0) or 0) if self.trim_days_attr else 0
+        now = datetime.now()
+        hour = (int(getattr(self.cfg, "realtime_trim_hour", 4)) + self.trim_hour_offset) % 24
+        if not days or now.hour != hour or self._last_trim_day == now.date():
+            return
+        self._last_trim_day = now.date()
+        cutoff = now - timedelta(days=days)
+        unparseable = [0]
+
+        def keep(r):
+            try:
+                return datetime.strptime(str(r["received_at"])[:19],
+                                         "%Y-%m-%d %H:%M:%S") >= cutoff
+            except ValueError:
+                unparseable[0] += 1
+                return True  # never guess-delete
+
+        self._start_row = 2
+        self._save_state()
+        n = 0
+        try:
+            with trim_lock(self.tab):
+                n = self.gio.queue_trim(self.qsid, keep, tab=self.tab,
+                                        deletable=self.trimmable)
+        except Exception as e:
+            log.exception("%s trim failed (nothing further deleted): %s", self.name, e)
+        finally:
+            self._start_row = 2
+            self._save_state()
+        log.info("%s TRIM removed %d row(s) older than %d day(s); %d row(s) "
+                 "kept because their date could not be read",
+                 self.name.upper(), n, days, unparseable[0])
+
     # -- main loop ---------------------------------------------------------------
 
     def run(self, once=False):
@@ -190,11 +335,12 @@ class RealtimeConsumer:
                 if not self._heartbeat_ok():
                     time.sleep(self.cfg.live_poll_s)
                     continue
+                self._maybe_rewalk()
                 rows = self.gio.queue_read(self.qsid,
                                            start_row=self._start_row,
                                            tab=self.tab)
                 for r in rows:
-                    if r["status"] in self.terminal:
+                    if r["status"] in self.terminal or r["status"] in self.parked:
                         self._start_row = r["row"] + 1
                     else:
                         break
@@ -233,21 +379,19 @@ class RealtimeConsumer:
                         log.exception("%s row %s failed: %s",
                                       self.name, r["row"], e)
                         state, note = "error", f"{type(e).__name__}: {e}"[:180]
+                    state, note = self._settle(r, state, note)
                     outcome[r["order_id"]] = (state, note)
                     if not self.live:
                         log.info("DRY RUN %s row %s id %s (%s) -> %s | %s",
                                  self.name, r["row"], r["order_id"],
                                  r["event"][:40], state, note[:90])
                         continue
-                    self.gio.queue_mark(self.qsid, r["row"], r["order_id"],
-                                        state, r["attempts"] + 1, note,
-                                        tab=self.tab)
+                    self._mark(r, state, r["attempts"] + 1, note)
                 for r in twins:
                     st, note = outcome.get(r["order_id"], (None, None))
                     if st and self.live:
-                        self.gio.queue_mark(self.qsid, r["row"], r["order_id"],
-                                            st, r["attempts"], f"twin: {note}",
-                                            tab=self.tab)
+                        self._mark(r, st, r["attempts"], f"twin: {note}")
+                self._maybe_trim()
                 if once:
                     break
             except Exception as e:

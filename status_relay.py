@@ -101,6 +101,17 @@ class StatusRelay(RealtimeConsumer):
     # completed). Collapsing them would apply only the first and silently
     # discard the rest; the ledger's event-ts guard already handles ordering.
     collapse_twins = False
+    # [v2.11] daily trim of the Status Queue: 7 days kept by default, an hour
+    # before the live engine's own trim so the two never delete at once.
+    trim_days_attr = "status_trim_days"
+    trim_hour_offset = -1
+
+    def on_exhausted(self, row, note):
+        """[v2.11] A status row that failed on every retry lands in the
+        Delivery Status Exceptions tab like every other give-up."""
+        slug, _ = self.parse_event(row["event"])
+        self._exception_row(row, slug, f"Retries exhausted: {note}"[:180],
+                            "Apply the stage by hand and check the order")
 
     def __init__(self, cfg, hs, gio, live=True):
         super().__init__(cfg, hs, gio, tab=cfg.status_queue_tab, live=live)
