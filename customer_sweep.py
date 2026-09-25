@@ -268,16 +268,19 @@ def fill_recent(cfg, relay, hs, live):
     cap = int(getattr(cfg, "consent_filler_cap", 400))
     since = int((datetime.now() - timedelta(days=days)).timestamp() * 1000)
     todo = contacts_without_flag(hs, since, cap)
-    pairs, unknown = [], 0
+    pairs, unknown, cache = [], 0, {}
     for contact_id, sid in todo:
-        try:
-            env = relay.get_path(f"customers/{sid}?{API_FIELDS}")
-        except Exception as e:
-            log.warning("consent lookup %s failed: %s", sid, e)
-            unknown += 1
-            continue
-        data = env.get("data") if env.get("status") == 200 else None
-        v = flag_text((data or {}).get("is_notifications_enabled"))
+        # salla_customer_id is not unique in HubSpot: duplicates of one
+        # customer share it, so each Salla id is looked up once per run
+        if sid not in cache:
+            try:
+                env = relay.get_path(f"customers/{sid}?{API_FIELDS}")
+                data = env.get("data") if env.get("status") == 200 else None
+                cache[sid] = flag_text((data or {}).get("is_notifications_enabled"))
+            except Exception as e:
+                log.warning("consent lookup %s failed: %s", sid, e)
+                cache[sid] = None
+        v = cache[sid]
         if v is None:
             unknown += 1
             continue
