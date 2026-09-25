@@ -1,0 +1,13 @@
+[Unit]
+Description=Customer gap sweep and consent filler, daily at 04:41
+
+[Timer]
+# 04:41 local: after the day has ended in Riyadh, off every other job's minute
+# (:09/:39 gift refresh, :17 drain, 03:xx status trim, 04:xx live trim,
+# 05:xx customer trim, 09:00 digest, 23:58 rollup, Sun 03:33 reconcile).
+OnCalendar=*-*-* 04:41:00
+Persistent=true
+RandomizedDelaySec=120
+
+[Install]
+WantedBy=timers.target

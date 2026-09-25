@@ -1,0 +1,24 @@
+# Daily customer gap sweep and consent filler (customer_sweep.py, v2.11).
+#
+# Why it exists: the Make capture is the only road a new Salla customer takes
+# into the Customer Queue, and a failed sheet append drops the event for good
+# (five losses between 5 and 22 Sep 2026). The sweep re-derives yesterday's
+# customers from Salla and queues anyone with no ledger row, no queue row and
+# no HubSpot contact. The consent filler writes salla_consent_status for
+# recent contacts whose creating event carried no flag (abandoned carts).
+# Idles unless customer_sweep_enabled is true in config.live.json; STOP.sweep
+# pauses it.
+[Unit]
+Description=Customer gap sweep and consent filler (daily)
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=integrations_claragroup_com
+WorkingDirectory=/home/integrations_claragroup_com/app
+ExecStart=/bin/bash -lc 'set -a; . /home/integrations_claragroup_com/app/.env; set +a; exec /home/integrations_claragroup_com/app/venv/bin/python3 customer_sweep.py --config config.live.json --live'
+Restart=no
+TimeoutStartSec=3600
+
+[Install]
+WantedBy=multi-user.target
