@@ -64,6 +64,9 @@ ASSOC_BUNDLE_PARENT = None
 ASSOC_BUNDLE_COMP   = None
 ORDER_PIPELINE_STAGE = None   # default creation stage id
 RACE_RETRY_WAIT_S = 5  # [M3-guardrail] wait before the post-failure re-search
+# [v2.11] HubSpot names the record that already holds a unique value:
+#   "... on 1374378254574. 1374395867335 already has that value."
+CONFLICT_HOLDER = re.compile(r"(\d{6,}) already has that value")
 
 # Creation stage follows the order's CURRENT Salla status, keyed on
 # status.slug (expanded payloads expose the parent-level status). Unmapped
@@ -1342,15 +1345,23 @@ class HubSpot:
         if status == 400 and ("already has that value" in text
                               or "hs_external_order_id" in text
                               or "DUPLICATE" in text.upper()):
-            log.warning("Order create rejected as duplicate for salla %s: "
-                        "re-searching in %ss (duplicate guardrail)",
-                        order.get("id"), RACE_RETRY_WAIT_S)
-            time.sleep(RACE_RETRY_WAIT_S)
-            try:
-                existing = self.find_order_by_salla_id(order.get("id"))
-            except Exception as e:
-                log.error("Duplicate guardrail re-search failed: %s", e)
+            # [v2.11] the 400 names the order that holds the value; confirm
+            # it with a GET (no search-index lag) before trusting it, and fall
+            # back to the search only when that fails. 2026-09-23: the search
+            # came back empty 5 s later and the order was left without items.
+            existing = self.existing_id_from_conflict(data, "salla_order_id")
+            if existing and not self._order_is(existing, order.get("id")):
                 existing = None
+            if not existing:
+                log.warning("Order create rejected as duplicate for salla %s: "
+                            "re-searching in %ss (duplicate guardrail)",
+                            order.get("id"), RACE_RETRY_WAIT_S)
+                time.sleep(RACE_RETRY_WAIT_S)
+                try:
+                    existing = self.find_order_by_salla_id(order.get("id"))
+                except Exception as e:
+                    log.error("Duplicate guardrail re-search failed: %s", e)
+                    existing = None
             if existing:
                 log.info("Duplicate guardrail resolved salla %s -> existing HS %s",
                          order.get("id"), existing)
@@ -1380,9 +1391,66 @@ class HubSpot:
         status, data = self._write("POST", "/crm/v3/objects/line_items",
                                    {"properties": props}, what)
         if status not in (200, 201):
+            # [v2.11] salla_order_item_id is unique: a 400 naming the holder
+            # means this exact item already exists (a lost 500 response, or a
+            # top-up of a partial order). Reuse it; the caller re-associates,
+            # which HubSpot treats as a no-op when the link already exists.
+            existing = self.existing_id_from_conflict(data, "salla_order_item_id")
+            if existing:
+                log.info("%s: line item for salla item %s already exists as %s -- reused",
+                         what, props.get("salla_order_item_id"), existing)
+                return existing
             log.error("%s failed (%s): %s", what, status, json.dumps(data)[:300])
             return None
         return data.get("id")
+
+    @staticmethod
+    def existing_id_from_conflict(data, prop):
+        """[v2.11] The id HubSpot names in a unique-value 400 for `prop`, else
+        None. Only trusted when the message is about that very property."""
+        text = json.dumps(data) if not isinstance(data, str) else data
+        if f"propertyName={prop}" not in text or "already has that value" not in text:
+            return None
+        m = CONFLICT_HOLDER.search(text)
+        return m.group(1) if m else None
+
+    def _order_is(self, hs_order_id, salla_order_id):
+        status, data = self._req("GET", f"/crm/v3/objects/orders/{hs_order_id}"
+                                 "?properties=salla_order_id", what="order confirm")
+        return (status == 200 and str(dig(data, "properties.salla_order_id"))
+                == str(salla_order_id))
+
+    def order_item_keys(self, order_id):
+        """[v2.11] salla_order_item_id of every line item on an order, via the
+        v4 association read (no search lag) and a batch read. None when any
+        read fails or any line item carries no key: then a keyed top-up cannot
+        tell which items are there and must not guess."""
+        ids, after = [], None
+        while True:
+            path = f"/crm/v4/objects/orders/{order_id}/associations/line_items?limit=100"
+            if after:
+                path += f"&after={after}"
+            status, data = self._req("GET", path, what="order LI keys")
+            if status != 200:
+                return None
+            ids += [str(r.get("toObjectId")) for r in data.get("results") or []]
+            after = ((data.get("paging") or {}).get("next") or {}).get("after")
+            if not after:
+                break
+        keys = set()
+        for i in range(0, len(ids), 100):
+            status, data = self._req("POST", "/crm/v3/objects/line_items/batch/read",
+                                     {"properties": ["salla_order_item_id"],
+                                      "inputs": [{"id": x} for x in ids[i:i + 100]]},
+                                     what="order LI keys read")
+            if status not in (200, 207):
+                return None
+            for r in data.get("results") or []:
+                k = str(dig(r, "properties.salla_order_item_id") or "").strip()
+                if not k:
+                    return None
+                keys.add(k)
+        return keys
 
     def patch_line_item(self, li_id, props, what):
         return self._write("PATCH", f"/crm/v3/objects/line_items/{li_id}",
@@ -2274,6 +2342,65 @@ class Engine:
         if self.hs.patch_contact(customer_id, props, "growth signals"):
             self._signal_stamped[str(customer_id)] = have | want
 
+    # [v2.11] growth signals collected while one order's items are processed.
+    # One attribute on the engine used to be shared by every worker lane and
+    # reset by whichever lane started an order, so a device or consumable
+    # flag could land on another buyer's contact. Per thread now; created
+    # lazily so engines built without __init__ (tests, tools) still work.
+    @property
+    def _order_signals(self):
+        tl = self.__dict__.get("_sig_tl")
+        if tl is None:
+            tl = self.__dict__.setdefault("_sig_tl", threading.local())
+        if not hasattr(tl, "value"):
+            tl.value = set()
+        return tl.value
+
+    @_order_signals.setter
+    def _order_signals(self, value):
+        tl = self.__dict__.get("_sig_tl")
+        if tl is None:
+            tl = self.__dict__.setdefault("_sig_tl", threading.local())
+        tl.value = value
+
+    def top_up_items(self, order, hs_order_id):
+        """[v2.11] Add the line items an EXISTING order is missing, keyed by
+        salla_order_item_id (unique in HubSpot, so nothing can double).
+        Returns (state, added) with state one of:
+          complete  every source item is on the order (added may be 0)
+          partial   items were attempted but some are still missing
+          unsafe    a line item on the order has no key (older writer), or
+                    the read failed: nothing is attempted, a human decides
+          held      the catalog gate does not pass: nothing is attempted
+        """
+        items = [it for it in (order.get("items") or []) if it.get("id") is not None]
+        present = self.hs.order_item_keys(hs_order_id)
+        if present is None:
+            return "unsafe", 0
+
+        def on_order(keys, it):
+            k = str(it.get("id"))
+            return any(p == k or p.startswith(k + "_") for p in keys)
+
+        missing = [it for it in items if not on_order(present, it)]
+        if not missing:
+            return "complete", 0
+        if self.gate_unverified_items(order):
+            return "held", 0
+        self._order_signals = set()
+        for it in missing:
+            try:
+                self.process_item(order, hs_order_id, it)
+            except Exception as e:
+                self.mirror.error(str(order.get("id")), f"topup item {it.get('id')}", e)
+                log.error("top-up item %s on order %s raised: %s",
+                          it.get("id"), order.get("id"), e)
+        after = self.hs.order_item_keys(hs_order_id) or set()
+        still = [it for it in items if not on_order(after, it)]
+        log.info("TOP-UP order %s (HS %s): %d missing, %d still missing after",
+                 order.get("id"), hs_order_id, len(missing), len(still))
+        return ("complete" if not still else "partial"), len(missing)
+
     def _finish_create(self, order, audit_row, customer_id, total):
         oid = str(order.get("id"))
         self._order_signals = set()
@@ -2286,10 +2413,22 @@ class Engine:
             return
         if not was_fresh:
             # v1.6: a concurrent or earlier writer created this order between
-            # our search and our create. Adding line items now would duplicate
-            # whatever that writer added. Do NOT touch items; leave it to the
-            # authoritative verify path (live: the queue row retries and
-            # _resolve_preexisting compares LI count vs source item count).
+            # our search and our create. v2.11: most often that writer is our
+            # own first POST whose response was lost (HubSpot 500, retried).
+            # Top up by item key -- line items are unique by
+            # salla_order_item_id, so nothing can be duplicated -- and finish
+            # like a fresh create when the order is then complete.
+            state, added = self.top_up_items(order, order_id)
+            if state == "complete":
+                self._bump("created")
+                self._outcome[oid] = ("created", order_id)
+                log.info("RECOVERED order %s -> existing HubSpot %s (%d item(s) "
+                         "topped up)", oid, order_id, added)
+                self.hs.patch_order(order_id, {"last_salla_sync_status": "synced"},
+                                    "set synced")
+                self.created_ledger.add(oid, order_id)
+                self._stamp_signals(customer_id)
+                return
             self.mirror.error(oid, "duplicate_create",
                               f"order create resolved to pre-existing HS {order_id}; "
                               "line items NOT added -- verify via retry / "
@@ -2482,11 +2621,14 @@ class Engine:
         }
         status, data = self.hs._write("POST", f"/crm/v3/objects/{OBJ_BUNDLE}",
                                       {"properties": bundle_props}, "create bundle")
-        if status not in (200, 201):
+        # [v2.11] bundle_instance_key is unique: an existing record for this
+        # exact order item is reused (top-up / lost-response retry)
+        bundle_id = (data.get("id") if status in (200, 201) else
+                     self.hs.existing_id_from_conflict(data, "bundle_instance_key"))
+        if not bundle_id:
             self.flag_partial(order_id, "Module 120: Create Bundle record",
                               json.dumps(data)[:200])
             return
-        bundle_id = data.get("id")
         self.hs.associate(OBJ_BUNDLE_TEMPLATE, OBJ_BUNDLE, tpl.get("id", ""), bundle_id,
                           ASSOC_TPL_BUNDLE, "USER_DEFINED", "assoc tpl bundle")   # [M121]
         self.hs.associate(OBJ_BUNDLE, "order", bundle_id, order_id,
@@ -2581,11 +2723,12 @@ class Engine:
         }
         status, data = self.hs._write("POST", f"/crm/v3/objects/{OBJ_BUNDLE}",
                                       {"properties": bundle_props}, "create bundle salla")
-        if status not in (200, 201):
+        bundle_id = (data.get("id") if status in (200, 201) else
+                     self.hs.existing_id_from_conflict(data, "bundle_instance_key"))
+        if not bundle_id:
             self.flag_partial(order_id, "Module 150: Create Bundle record (Salla-native)",
                               json.dumps(data)[:200])
             return
-        bundle_id = data.get("id")
         self.hs.associate(OBJ_BUNDLE, "order", bundle_id, order_id,
                           ASSOC_BUNDLE_ORDER, "USER_DEFINED", "assoc bundle order")  # [M151]
         # [M152] parent LI

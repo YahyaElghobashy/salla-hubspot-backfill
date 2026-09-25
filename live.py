@@ -48,6 +48,9 @@ from backfill import (Config, Cursor, Engine, GoogleIO, HubSpot, LocalMirror,
 
 log = logging.getLogger("backfill")  # share the engine's logger/format
 
+# [v2.11] partial orders topped up per poll cycle (the rest wait a cycle)
+TOPUPS_PER_CYCLE = 3
+
 STOP_FILE = Path("STOP.live")
 LOCK_FILE = Path("live.lock")
 STATE_FILE = Path("live_state.json")
@@ -108,6 +111,7 @@ class LiveEngine(Engine):
         self._next_sweep = time.monotonic() + 60
         self._poll_n = 0
         self._last_trim_day = None
+        self._topups_left = TOPUPS_PER_CYCLE
         self._start_row = 2
         self._load_state()
         # v2.2: outage detection. Optional -- if the modules or credentials are
@@ -281,6 +285,7 @@ class LiveEngine(Engine):
         # compare against the source item count (bundles expand one item into
         # several line items, so a complete order has li >= item count)
         expected = 1
+        fetched = None
         try:
             fetched = self.relay.fetch_orders([oid]).get(oid)
             if fetched is not None:
@@ -288,6 +293,28 @@ class LiveEngine(Engine):
         except Exception as e:
             log.warning("verify fetch failed for %s (%s); using >=1 LI test",
                         oid, e)
+        # [v2.11] with the source in hand, decide by item id (a count passes a
+        # bundle order that is still missing a standalone item) and top up
+        # what is missing, keyed by the unique salla_order_item_id. Capped per
+        # cycle so a backlog of partials cannot delay new orders; over the cap,
+        # or without the source, the count test below still applies.
+        if fetched is not None and self._topups_left > 0:
+            self._topups_left -= 1
+            state, added = self.top_up_items(fetched, hs_id)
+            if state == "complete":
+                self.created_ledger.add(oid, hs_id)
+                self._bump("skipped_existing")
+                log.info("existing %s verified by item id (HS %s)%s", oid, hs_id,
+                         f"; topped up {added} item(s)" if added else "")
+                return ("done", f"HS {hs_id} (verified by item id"
+                                f"{f'; topped up {added}' if added else ''})")
+            log.warning("existing %s (HS %s): top-up %s", oid, hs_id, state)
+            li = self.hs.order_line_item_count(hs_id)
+            # unsafe (keyless line items from an older writer) and held (the
+            # gate fails today) attempted nothing: judge them by count as
+            # before; only an attempted-but-still-short order is partial
+            if state == "partial":
+                li = min(li, expected - 1)
         if li >= expected:
             self.created_ledger.add(oid, hs_id)  # verified complete
             self._bump("skipped_existing")
@@ -533,6 +560,7 @@ class LiveEngine(Engine):
                     # marks are batched -- catch-up backlogs (sweeps after
                     # downtime) can be hundreds of skip rows
                     to_fetch, marks = [], []
+                    self._topups_left = TOPUPS_PER_CYCLE
                     for r in primaries:
                         res = self._resolve_preexisting(r)
                         if res:

@@ -151,10 +151,36 @@ def repair(oid, engine, hs, relay, ledger, apply_, allow_topup):
         return "held_by_gate"
 
     if li > 0 and not allow_topup:
-        log.warning("MIXED  %-12s HS %s has %d/%d LIs -- partial top-up would "
-                    "duplicate the %d already there; skipped (--allow-topup "
-                    "to force)", oid, hs_id, li, expected, li)
-        return "mixed_skipped"
+        # [v2.11] keyed top-up: line items are unique by salla_order_item_id,
+        # so adding only the missing keys cannot duplicate anything. Refused
+        # ("unsafe") when any line item on the order carries no key.
+        keys = hs.order_item_keys(hs_id)
+        if keys is None:
+            log.warning("MIXED  %-12s HS %s has %d/%d LIs and some carry no item key -- "
+                        "skipped (a human decides)", oid, hs_id, li, expected)
+            return "mixed_unsafe"
+        missing = [it for it in items
+                   if not any(k == str(it.get("id")) or k.startswith(f"{it.get('id')}_")
+                              for k in keys)]
+        if not missing:
+            log.info("OK     %-12s HS %s has every item by key (%d LIs)%s",
+                     oid, hs_id, li, "" if apply_ else " (would ledger)")
+            if apply_:
+                ledger.add(oid, hs_id)
+            return "already_complete"
+        if not apply_:
+            log.info("WOULD  %-12s HS %s top up %d missing item(s) by key: %s",
+                     oid, hs_id, len(missing), [it.get("id") for it in missing])
+            return "would_topup"
+        state, added = engine.top_up_items(fetched, hs_id)
+        if state != "complete":
+            log.error("PARTIAL %-11s HS %s keyed top-up ended %s -- NOT ledgered",
+                      oid, hs_id, state)
+            return "repair_incomplete"
+        hs.patch_order(hs_id, {"last_salla_sync_status": "synced"}, "recover set synced")
+        ledger.add(oid, hs_id)
+        log.info("TOPPED %-12s HS %s added %d missing item(s) by key", oid, hs_id, added)
+        return "topped_up"
 
     if not apply_:
         log.info("WOULD  %-12s HS %s attach %d line item(s)", oid, hs_id, expected)
