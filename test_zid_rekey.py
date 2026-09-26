@@ -199,6 +199,37 @@ class TestApply(unittest.TestCase):
         self.assertFalse(any(p.endswith("/void_reason") for _, p, _ in hs.writes))
 
 
+class TestSettleHeld(unittest.TestCase):
+    """[v2.12] live rows held or exhausted whose order now exists become done."""
+
+    def test_settles_only_rows_whose_order_exists(self):
+        import live
+        f = types.SimpleNamespace(live=True, qsid="Q")
+        f.cfg = backfill.Config()
+        f.cfg.live_max_attempts = 8
+        rows = [{"row": 5, "order_id": "1", "status": "held", "attempts": 0, "note": "catalog gate: X"},
+                {"row": 6, "order_id": "2", "status": "held", "attempts": 0, "note": "catalog gate: Y"},
+                {"row": 7, "order_id": "3", "status": "error", "attempts": 8, "note": "partial HS 9"},
+                {"row": 8, "order_id": "4", "status": "error", "attempts": 2, "note": "relay fetch miss"},
+                {"row": 9, "order_id": "5", "status": "done", "attempts": 1, "note": "HS 5"}]
+        f.gio = types.SimpleNamespace(queue_read_all=lambda q, tab=None: rows,
+                                      queue_mark_batch=mock.Mock(side_effect=lambda q, m: len(m)))
+        f.created_ledger = types.SimpleNamespace(get=lambda oid: {"1": "H1", "3": "H3", "4": "H4", "5": "H5"}.get(oid))
+        with mock.patch("realtime_base.trim_lock_active", return_value=False):
+            n = live.LiveEngine._maybe_settle_held(f)
+        self.assertEqual(n, 2)
+        marks = f.gio.queue_mark_batch.call_args[0][1]
+        self.assertEqual([(m[0], m[1], m[2]) for m in marks], [(5, "1", "done"), (7, "3", "done")])
+        self.assertIn("HS H1", marks[0][4])
+        # at most once an hour, never during a trim, never in a dry run
+        self.assertEqual(live.LiveEngine._maybe_settle_held(f), 0)
+        f._next_settle = 0
+        with mock.patch("realtime_base.trim_lock_active", return_value=True):
+            self.assertEqual(live.LiveEngine._maybe_settle_held(f), 0)
+        f._next_settle, f.live = 0, False
+        self.assertEqual(live.LiveEngine._maybe_settle_held(f), 0)
+
+
 class TestEngineHook(unittest.TestCase):
     def engine(self, live=True, switch=True):
         e = object.__new__(backfill.Engine)

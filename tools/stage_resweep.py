@@ -99,6 +99,22 @@ def collect(hs, cfg, before_ms):
     return out
 
 
+def collect_ids(hs, ids):
+    """[v2.12] Named orders, whatever their stage or age. An order that is
+    not in HubSpot (or only an imported Zid order holds the number) is
+    reported and skipped: there is nothing to move yet."""
+    out = {}
+    for sid in ids:
+        salla, zid = hs.orders_by_salla_id(sid)
+        if not salla:
+            print(f"  {sid}: not in HubSpot{' (number held by Zid order ' + zid + ')' if zid else ''}")
+            continue
+        st, o = hs._req("GET", f"/crm/v3/objects/orders/{salla}?properties=hs_pipeline_stage",
+                        what="resweep read")
+        out[sid] = {"hs_id": salla, "stage": dig(o, "properties.hs_pipeline_stage") if st == 200 else ""}
+    return out
+
+
 def _collect_bucket(hs, stage, after_ms, before_ms, out):
     """Page one (stage, date-window) bucket into `out`. The search API stops
     paging at 10k results per filter set; a bucket that reports >=10k on its
@@ -181,6 +197,9 @@ def main():
                     help="only orders created before this day (YYYY-MM-DD)")
     ap.add_argument("--live", action="store_true")
     ap.add_argument("--max-orders", type=int, default=None)
+    ap.add_argument("--ids", default="",
+                    help="[v2.12] comma-separated Salla order ids to resweep, any age, "
+                         "ledger not consulted (status events that gave up)")
     args = ap.parse_args()
 
     socket.setdefaulttimeout(180)
@@ -200,9 +219,13 @@ def main():
     relay = RelayClient(cfg, secret)
     done = load_ledger()
 
-    print("collecting non-terminal orders ...")
-    work = collect(hs, cfg, ms(args.before))
-    todo = [sid for sid in work if sid not in done]
+    if args.ids:
+        work = collect_ids(hs, [x.strip() for x in args.ids.split(",") if x.strip()])
+        todo = list(work)
+    else:
+        print("collecting non-terminal orders ...")
+        work = collect(hs, cfg, ms(args.before))
+        todo = [sid for sid in work if sid not in done]
     if args.max_orders:
         todo = todo[:args.max_orders]
     print(f"candidates {len(work)}, after ledger skip {len(todo)}")

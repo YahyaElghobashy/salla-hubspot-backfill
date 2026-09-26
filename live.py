@@ -523,6 +523,47 @@ class LiveEngine(Engine):
 
     # -- main loop ----------------------------------------------------------------
 
+    def _maybe_settle_held(self, every_s=3600):
+        """[v2.12] Settle rows whose order was created by another path.
+
+        A held row (catalog gate, Zid collision) or an error row that spent
+        its attempts is terminal for the engine, so nothing ever revisits it,
+        yet the order is usually created later: the hourly catalog drain, a
+        relaunch, a re-key, a recovery tool. On 2026-09-27 1,175 rows still
+        read "held" for orders that had existed in HubSpot for weeks, which
+        made the digest's held count and the status relay's classification
+        wrong. Once an hour every such row whose order is in the created
+        ledger is marked done, naming the HubSpot order. Never during a
+        trim (row numbers move); never in a dry run."""
+        if not self.live or time.monotonic() < getattr(self, "_next_settle", 0):
+            return 0
+        self._next_settle = time.monotonic() + every_s
+        from realtime_base import trim_lock_active
+        if trim_lock_active():
+            return 0
+        try:
+            rows = self.gio.queue_read_all(self.qsid, tab=self.cfg.live_queue_tab)
+        except Exception as e:
+            log.warning("SETTLE read failed: %s", e)
+            return 0
+        cap = self.cfg.live_max_attempts
+        marks = []
+        for r in rows:
+            st = r["status"]
+            if not (st == "held" or (st == "error" and r["attempts"] >= cap)):
+                continue
+            hs_id = self.created_ledger.get(r["order_id"])
+            if hs_id:
+                was = str(r.get("note") or st)[:70]
+                marks.append((r["row"], r["order_id"], "done", r["attempts"],
+                              f"HS {hs_id} (created later; was {st}: {was})"))
+        written = 0
+        for i in range(0, len(marks), 500):
+            written += self.gio.queue_mark_batch(self.qsid, marks[i:i + 500])
+        if marks:
+            log.info("SETTLE %d held/exhausted row(s) whose order now exists marked done", written)
+        return written
+
     def run_live(self, max_orders=None, once=False):
         log.info("LIVE SYNC start instance=%s queue=%s poll=%ss workers=%d live=%s",
                  self.instance_id, self.qsid, self.cfg.live_poll_s,
@@ -646,6 +687,7 @@ class LiveEngine(Engine):
                     except Exception as e:
                         log.error("SWEEP failed (will retry next cycle): %s", e)
                 self._maybe_trim(rows)
+                self._maybe_settle_held()
                 # v2.2: a clean cycle clears the outage state (and emits a
                 # "resolved" notice if we had been alerting) -- but only once
                 # the failure window is genuinely quiet; see relay_health.
