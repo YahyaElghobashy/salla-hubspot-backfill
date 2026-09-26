@@ -219,6 +219,9 @@ def main():
     ap.add_argument("--allow-topup", action="store_true",
                     help="also repair orders that already have SOME line "
                          "items -- may duplicate them")
+    ap.add_argument("--include-ledgered", action="store_true",
+                    help="[v2.12] also check named --order ids the created-ledger calls "
+                         "complete (an early engine ledgered orders whose items then failed)")
     ap.add_argument("--verbose", action="store_true")
     args = ap.parse_args()
 
@@ -255,7 +258,7 @@ def main():
 
     counts = {}
     for oid in oids:
-        if ledger.get(oid):
+        if ledger.get(oid) and not (args.include_ledgered and args.order):
             log.info("SKIP   %-12s already in the created-ledger", oid)
             counts["already_ledgered"] = counts.get("already_ledgered", 0) + 1
             continue
