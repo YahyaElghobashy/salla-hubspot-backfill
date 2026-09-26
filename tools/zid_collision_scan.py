@@ -45,7 +45,7 @@ from backfill import (ZID_ITEM_KEY, Config, HubSpot, apply_portal_config, dig,
 log = logging.getLogger("backfill")
 OUT = Path("mirror/zid_collision_scan.csv")
 HS_ID = re.compile(r"HS (\d{6,})")
-PROPS = ["salla_order_id", "salla_store", "hs_order_name", "hs_pipeline_stage",
+PROPS = ["salla_order_id", "salla_store", "hs_source_store", "hs_order_name", "hs_pipeline_stage",
          "hs_external_created_date", "hs_lastmodifieddate"]
 
 

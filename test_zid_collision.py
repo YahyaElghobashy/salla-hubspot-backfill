@@ -33,8 +33,10 @@ def hs_with(results):
     return hs
 
 
-ZID = {"id": "1337741441227", "properties": {"salla_store": "Zid"}}
-SALLA = {"id": "1378000000009", "properties": {"salla_store": "Salla"}}
+ZID = {"id": "1337741441227", "properties": {"salla_store": "Zid", "hs_source_store": "Zid"}}
+SALLA = {"id": "1378000000009", "properties": {"salla_store": "Salla", "hs_source_store": "Salla"}}
+# a genuine Salla order that zed_create_missing relabelled on 2026-09-16
+MERGED = {"id": "1284409404634", "properties": {"salla_store": "Zid", "hs_source_store": "Salla"}}
 
 
 class TestLookups(unittest.TestCase):
@@ -54,6 +56,9 @@ class TestLookups(unittest.TestCase):
         self.assertEqual(legacy.find_order_by_salla_id("8"), "55")
         copy = hs_with([{"id": "56", "properties": {"salla_store": "Zid (copy)"}}])
         self.assertEqual(copy.find_order_by_salla_id("9"), "56")
+        merged = hs_with([MERGED])      # relabelled Salla order: still the Salla order
+        self.assertEqual(merged.orders_by_salla_id("57671183"), ("1284409404634", None))
+        self.assertIn("hs_source_store", merged.search.call_args[0][1]["properties"])
 
     def test_zid_item_keys_make_the_order_unsafe(self):
         hs = hs_with([])
@@ -71,7 +76,8 @@ class TestCreate(unittest.TestCase):
         hs = hs_with([])
         hs._write = lambda m, p, b, w: (400, CONFLICT)
         hs._req = lambda method, path, body=None, is_search=False, what="": (
-            200, {"properties": {"salla_order_id": "4938528", "salla_store": "Zid"}})
+            200, {"properties": {"salla_order_id": "4938528", "salla_store": "Zid",
+                                 "hs_source_store": "Zid"}})
         with mock.patch("time.sleep"), self.assertRaises(backfill.ZidCollision) as cm:
             hs.create_order(ORDER, None, "Asia/Riyadh")
         self.assertEqual(cm.exception.zid_hs_id, "1337741441227")
@@ -168,6 +174,9 @@ class TestStatusRelay(unittest.TestCase):
         f = types.SimpleNamespace(hs=hs_with([ZID, SALLA]))
         self.assertEqual(status_relay.StatusRelay._find_order(f, "4938528", "4938528")["id"],
                          "1378000000009")
+        f = types.SimpleNamespace(hs=hs_with([MERGED]))
+        self.assertEqual(status_relay.StatusRelay._find_order(f, "57671183", "244866476")["id"],
+                         "1284409404634")
 
 
 if __name__ == "__main__":

@@ -151,7 +151,8 @@ class StatusRelay(RealtimeConsumer):
                 {"filters": [{"propertyName": "salla_order_reference",
                               "operator": "EQ",
                               "value": str(reference_id or order_id)}]}],
-            "properties": ["hs_object_id", "hs_pipeline_stage", "salla_store"],
+            "properties": ["hs_object_id", "hs_pipeline_stage", "salla_store",
+                           "hs_source_store"],
             "limit": 10}, "status find order")
         res = d.get("results") or []
         # [v2.12] a Zid-import order carries a Zid order number in

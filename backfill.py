@@ -71,16 +71,20 @@ CONFLICT_HOLDER = re.compile(r"(\d{6,}) already has that value")
 # salla_order_id, which is unique on orders, and keyed its line items
 # "Z<number>-<n>". Salla order ids share that number space: a new Salla order
 # whose id equals a Zid order number finds the Zid order by search, and the
-# unique constraint refuses to create the Salla order. A record whose
-# salla_store is "Zid" is therefore never the Salla order of that id.
+# unique constraint refuses to create the Salla order. A Zid-import order is
+# marked by hs_source_store "Zid" (974,052 records, exactly the import).
+# salla_store is NOT the marker: tools/zed_create_missing.py (2026-09-16)
+# merged 52 Zid orders into the Salla orders holding their numbers and set
+# salla_store "Zid" on those genuine Salla orders (hs_source_store "Salla").
 ZID_STORE = "Zid"
 ZID_ITEM_KEY = re.compile(r"^Z\d+-\d+$")
 ZID_LOCK = threading.Lock()
+ORDER_STORE_PROPS = ["salla_store", "hs_source_store"]
 
 
 def is_zid_order(props):
     """[v2.12] True for a Zid-import order record (see ZID_STORE)."""
-    return str((props or {}).get("salla_store") or "").strip() == ZID_STORE
+    return str((props or {}).get("hs_source_store") or "").strip() == ZID_STORE
 
 
 class ZidCollision(RuntimeError):
@@ -1057,7 +1061,7 @@ class HubSpot:
             "filterGroups": [{"filters": [{"propertyName": "salla_order_id",
                                            "operator": "EQ",
                                            "value": str(salla_order_id)}]}],
-            "properties": ["hs_object_id", "salla_store"], "limit": 10},
+            "properties": ["hs_object_id"] + ORDER_STORE_PROPS, "limit": 10},
             f"find {salla_order_id}")
         salla = zid = None
         for r in data.get("results", []):
@@ -1468,7 +1472,7 @@ class HubSpot:
         that id, "zid" when it is the Zid-import order carrying the same
         number, None when it is neither or the read fails."""
         status, data = self._req("GET", f"/crm/v3/objects/orders/{hs_order_id}"
-                                 "?properties=salla_order_id,salla_store",
+                                 "?properties=salla_order_id,salla_store,hs_source_store",
                                  what="order confirm")
         if status != 200 or (str(dig(data, "properties.salla_order_id"))
                              != str(salla_order_id)):
