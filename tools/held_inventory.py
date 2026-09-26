@@ -49,7 +49,7 @@ OUT = Path("mirror/held_inventory.json")
 RIYADH = timezone(timedelta(hours=3))
 WARRANTY = "2-252148104"
 DELIVERED, COMPLETED = "3725360f-519b-4b18-a593-494d60a29c9f", "5656450292"
-CANCELLED, RETURNED = "3c85a297-e9c3-4f63-a8d5-b0a4b3c9e4d1", "5656470775"
+CANCELLED, RETURNED = "3c85a297-e9ce-400b-b42e-9f16853d69d6", "5656470775"
 W_ACTIVE, W_EXPIRING = "5913821399", "5913821400"
 FINAL = {"done", "gone", "superseded", "error-final"}
 
