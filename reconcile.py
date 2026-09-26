@@ -23,7 +23,12 @@ Phases, in the order the checks earn trust:
                     population sums, pre-cutover dupe guard.
   D  pipeline       queue rows stuck beyond a week (with blocker names),
                     dead-timer sensors (a dead gift/drain timer is a finding
-                    nothing else reports), unresolved Make DLQ items.
+                    nothing else reports), and, as its own "make queue"
+                    section, unresolved Make retry-queue (DLQ) items per
+                    watched scenario older than dlq_min_age_minutes, read
+                    with credit_watch.scan_dlq. Nothing repairs from that
+                    section, so an unreadable Make API shows NOT RECORDED but
+                    never trips the insanity ceiling.
   E  certificate    ONE Slack message per run, always -- green reads as a
                     single sentence; detail lives in the thread. State to
                     mirror/reconcile_state.json for the daily digest's
@@ -493,6 +498,46 @@ def phase_pipeline(cfg, now=None):
                    detail, {"stuck": len(stuck)})
 
 
+# [v2.12] Sections nothing repairs from. Unmeasurable still renders NOT
+# RECORDED, but it is no reason to withhold the repairs the data phases
+# earned: a Make API blip on Sunday must not cost a week of stage patches.
+ADVISORY_PHASES = ("make queue",)
+
+
+def phase_make_queue(cfg, get=None, now=None):
+    """[v2.12] Unresolved Make retry-queue items per watched scenario, older
+    than dlq_min_age_minutes (Make still owns younger ones: it retries
+    transient failures itself ~30 min on). The very read credit_watch alerts
+    from, so the certificate and the 12h alert can never disagree. One line
+    per scenario: clear, stuck (count, oldest age, replay note, link), or
+    not checked. Every read failing is NOT RECORDED, never 0."""
+    import credit_watch
+    rows = credit_watch.scan_dlq(cfg, get=get, now=now)
+    mins = int(getattr(cfg, "dlq_min_age_minutes", 45) or 0)
+    stuck = [r for r in rows if r["count"]]
+    unread = [r for r in rows if r["count"] is None]
+    total = sum(r["count"] for r in stuck)
+    detail = [credit_watch.dlq_line(r) for r in rows]
+    data = {"total": total, "by_scenario": credit_watch.dlq_state(rows)}
+    if not rows:
+        return Finding("make queue", True, True, "no Make scenarios watched",
+                       [], data)
+    if len(unread) == len(rows):
+        return Finding("make queue", False, False,
+                       "Make retry queues not recorded (Make API unreadable)",
+                       detail, data)
+    if stuck:
+        summary = (f"{total} unresolved Make item(s) older than {mins} min "
+                   f"in {len(stuck)} of {len(rows)} scenario(s)")
+    else:
+        summary = (f"no Make retry-queue items older than {mins} min in "
+                   f"{len(rows) - len(unread)} scenario(s)")
+    if unread:
+        summary += f"; {len(unread)} scenario(s) not checked"
+    return Finding("make queue", True, not stuck and not unread, summary,
+                   detail, data)
+
+
 # --------------------------------------------------------------------------
 # certificate + state
 # --------------------------------------------------------------------------
@@ -536,7 +581,8 @@ def write_state(findings, repairs=None):
 
 def insane(findings, cfg):
     """True when the world (or the measurement) cannot be trusted."""
-    if any(not f.measured for f in findings):
+    if any(not f.measured for f in findings
+           if f.phase not in ADVISORY_PHASES):          # [v2.12]
         return "a phase was unmeasurable"
     counts = next((f for f in findings if f.phase == "counts"), None)
     if counts:
@@ -711,7 +757,8 @@ def main():
     for name, fn in [("counts", lambda: phase_counts(src, cfg)),
                      ("samples", lambda: phase_samples(src, cfg, cache)),
                      ("properties", lambda: phase_properties(src, cfg, cache)),
-                     ("pipeline", lambda: phase_pipeline(cfg))]:
+                     ("pipeline", lambda: phase_pipeline(cfg)),
+                     ("make queue", lambda: phase_make_queue(cfg))]:
         _check_stop()
         prev = manifest["phases"].get(name)
         if prev and prev.get("done"):

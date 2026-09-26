@@ -19,6 +19,10 @@ What it watches (one read-only GET /organizations/{id} per tick):
     by ROLE (fetch relay / live intake / other). Deliberately not "backfill vs
     live": both engines call the same fetch-relay scenario, so splitting it
     between them would be invented (see scenario_breakdown)
+  * GET /dlqs?scenarioId=... -> unresolved retry-queue items per watched
+    scenario (v2.12: Config.make_dlq_watch, six scenarios by default, only
+    items older than dlq_min_age_minutes, paged). scan_dlq is shared with
+    reconcile.py so the Sunday certificate and this alert count the same way
 
 What it says (via notify.py -- Slack + email, never through Make itself):
   * threshold alerts as the balance crosses 50k / 10k / 1k (configurable)
@@ -41,7 +45,7 @@ import os
 import sys
 import time
 import urllib.request
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
@@ -69,6 +73,194 @@ def _get(path):
         headers={"Authorization": f"Token {token}", "User-Agent": UA})
     with urllib.request.urlopen(req, timeout=30) as resp:
         return json.loads(resp.read().decode())
+
+
+def _safe_err(e):
+    """Exception text fit for a log line. The token travels in a header and
+    no known error echoes it, but scrub it anyway before truncating, so a
+    library that ever did could not leak half of it."""
+    msg = f"{type(e).__name__}: {e}"
+    tok = os.environ.get("MAKE_API_TOKEN", "").strip()
+    if tok:
+        msg = msg.replace(tok, "***")
+    return msg[:200]
+
+
+# ------------- Make retry queue (DLQ) scan (v2.12) -------------
+#
+# Shared by CreditWatch.check_relay_dlq (the 12h alert) and reconcile.py (the
+# Sunday certificate), so the two can never disagree about what counts.
+
+DLQ_PAGE = 100          # Make's pg[limit] ceiling
+DLQ_MAX_ITEMS = 500     # per scenario per scan; a capped count is a floor
+
+# [v2.12] Replay notes go to Slack as written: plain sentences, no dashes.
+# Replaying is NOT safe everywhere, so each scenario says what a replay does.
+REPLAY_ORDER = ("Replaying re-sends the order to the engine. Safe: the "
+                "engine skips orders it already has.")
+REPLAY_CAPTURE = ("Replaying adds the event to the queue sheet again. Safe: "
+                  "the consumer skips the twin.")
+REPLAY_DIRECT = ("Replaying writes straight to HubSpot. Check the contact "
+                 "first.")
+REPLAY_UNKNOWN = "Check what this scenario writes before replaying."
+
+# The fixed part of the default watch. The two order relays are read from
+# their own Config ids (make_intake_scenario_id, make_backfill_scenario_id)
+# so a re-created relay is watched without editing this list. Ids per
+# blueprints/baseline-2026-09-26/README.md.
+DEFAULT_DLQ_WATCH = (
+    {"id": "6892982", "label": "customer capture",
+     "replay_note": REPLAY_CAPTURE},
+    {"id": "6893541", "label": "status capture",
+     "replay_note": REPLAY_CAPTURE},
+    {"id": "5563154", "label": "customer updated",
+     "replay_note": REPLAY_DIRECT},
+    {"id": "5780791", "label": "abandoned cart",
+     "replay_note": REPLAY_DIRECT},
+)
+
+
+def dlq_watch_list(cfg):
+    """[v2.12] The watched scenarios as [{id, label, replay_note}].
+
+    Config.make_dlq_watch overrides the default: a list of {id, label,
+    replay_note} entries (a {label: id} mapping is accepted too). Unset or
+    empty means the two order relays plus DEFAULT_DLQ_WATCH. Blank ids are
+    skipped and a scenario listed twice is watched once."""
+    raw = getattr(cfg, "make_dlq_watch", None)
+    if isinstance(raw, dict):
+        raw = [{"id": v, "label": k} for k, v in raw.items()]
+    if not raw:
+        raw = [{"id": getattr(cfg, "make_intake_scenario_id", ""),
+                "label": "live intake", "replay_note": REPLAY_ORDER},
+               {"id": getattr(cfg, "make_backfill_scenario_id", ""),
+                "label": "backfill relay", "replay_note": REPLAY_ORDER},
+               *DEFAULT_DLQ_WATCH]
+    out, seen = [], set()
+    for e in raw:
+        if not isinstance(e, dict):
+            e = {"id": e}
+        sid = str(e.get("id") or "").strip()
+        if not sid or sid in seen:
+            continue
+        seen.add(sid)
+        out.append({"id": sid,
+                    "label": str(e.get("label") or f"scenario {sid}"),
+                    "replay_note": str(e.get("replay_note") or REPLAY_UNKNOWN)})
+    return out
+
+
+def _parse_make_ts(s):
+    """Make's ISO timestamp ('2026-09-13T08:15:22.123Z') as aware UTC."""
+    s = str(s or "").strip()
+    if not s:
+        return None
+    try:
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+
+def _dlq_items(get, sid):
+    """Every retry-queue record for one scenario, paged. Returns (items,
+    capped). Stops on a short page or at DLQ_MAX_ITEMS."""
+    items, offset = [], 0
+    while True:
+        d = get(f"/dlqs?scenarioId={sid}"
+                f"&pg[limit]={DLQ_PAGE}&pg[offset]={offset}") or {}
+        page = d.get("dlqs") or []
+        items.extend(x for x in page if isinstance(x, dict))
+        if len(page) < DLQ_PAGE:
+            return items, False
+        if len(items) >= DLQ_MAX_ITEMS:
+            return items[:DLQ_MAX_ITEMS], True
+        offset += DLQ_PAGE
+
+
+def scenario_link(cfg, sid):
+    team = str(getattr(cfg, "make_team_id", "") or "")
+    if not team:
+        return f"scenario {sid}"
+    return f"https://eu1.make.com/{team}/scenarios/{sid}"
+
+
+def scan_dlq(cfg, get=None, now=None):
+    """[v2.12] Unresolved retry-queue items per watched scenario.
+
+    Make parks a failed execution in the scenario's retry queue (the API calls
+    it a DLQ) and re-runs transient failures on its own ~30 min later, keeping
+    the record with resolved=true. So only UNRESOLVED items older than
+    Config.dlq_min_age_minutes are lost work; anything younger is still
+    Make's to retry and must not alert.
+
+    Returns one dict per watched scenario: id, label, replay_note, link,
+    count (None when the read failed, never a fake 0), capped, oldest (ISO)
+    and oldest_age_min. Read-only. A failed call is logged at WARNING with
+    the scenario label (never the token) and never raises."""
+    get = get or _get
+    now = now or datetime.now(timezone.utc)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    min_age = timedelta(minutes=float(
+        getattr(cfg, "dlq_min_age_minutes", 45) or 0))
+    out = []
+    for w in dlq_watch_list(cfg):
+        row = dict(w, link=scenario_link(cfg, w["id"]), count=None,
+                   capped=False, oldest="", oldest_age_min=None, error="")
+        out.append(row)
+        try:
+            items, row["capped"] = _dlq_items(get, w["id"])
+        except Exception as e:
+            row["error"] = _safe_err(e)
+            log.warning("make retry queue read failed for %s: %s",
+                        w["label"], row["error"])
+            continue
+        n, oldest = 0, None
+        for x in items:
+            if x.get("resolved"):
+                continue
+            ts = _parse_make_ts(x.get("created"))
+            # an unreadable timestamp cannot prove the item is young: count it
+            if ts is not None and now - ts < min_age:
+                continue
+            n += 1
+            if ts is not None and (oldest is None or ts < oldest):
+                oldest = ts
+        row["count"] = n
+        if oldest is not None:
+            row["oldest"] = oldest.isoformat()
+            row["oldest_age_min"] = int((now - oldest).total_seconds() // 60)
+    return out
+
+
+def fmt_age(minutes):
+    if minutes is None:
+        return "unknown"
+    m = int(minutes)
+    if m < 120:
+        return f"{m} min"
+    if m < 48 * 60:
+        return f"{m // 60} hours"
+    return f"{m // 1440} days"
+
+
+def dlq_line(row):
+    """One plain line per scenario, shared by the alert and the certificate."""
+    if row["count"] is None:
+        return f"{row['label']}: not checked (the Make API read failed)"
+    if not row["count"]:
+        return f"{row['label']}: clear"
+    n = f"{row['count']}{'+' if row['capped'] else ''}"
+    return (f"{row['label']}: {n} stuck, oldest {fmt_age(row['oldest_age_min'])}"
+            f" old. {row['replay_note']} {row['link']}")
+
+
+def dlq_state(rows):
+    """Per-scenario counts for credit_state.json (relay_dlq_by_scenario)."""
+    return {r["id"]: {"label": r["label"], "count": r["count"],
+                      "capped": r["capped"], "oldest": r["oldest"]}
+            for r in rows}
 
 
 class CreditWatch:
@@ -269,52 +461,51 @@ class CreditWatch:
             log.warning("credit alert dispatch failed: %s", e)
         log.error("ALERT: %s", subject)
 
-    # ------------- relay DLQ watch (v2.8) -------------
+    # ------------- retry-queue watch (v2.8, widened v2.12) -------------
 
-    def check_relay_dlq(self):
-        """Incomplete executions parked on the relay scenarios = order events
-        that DIED before reaching the engine. Three sat unnoticed for weeks in
-        September (Salla 502s during capture); each one is a permanently
-        missing order until someone replays it. One Make API call per relay
-        per tick; alert at most every 12h while anything is parked."""
-        team = str(getattr(self.cfg, "make_team_id", "") or "")
-        scen = {"live intake": str(getattr(self.cfg, "make_intake_scenario_id", "") or ""),
-                "backfill relay": str(getattr(self.cfg, "make_backfill_scenario_id", "") or "")}
-        found = []
-        for label, sid in scen.items():
-            if not sid:
-                continue
-            try:
-                d = _get(f"/dlqs?scenarioId={sid}&pg[limit]=10")
-                # the endpoint returns HANDLED items too ("resolved": true --
-                # Make auto-reprocesses ~30min after a transient failure and
-                # keeps the record). Only unresolved ones are lost events.
-                items = [x for x in (d.get("dlqs") or [])
-                         if not x.get("resolved")]
-                if items:
-                    oldest = min(str(x.get("created") or "") for x in items)
-                    found.append((label, sid, len(items), oldest[:10]))
-            except Exception as e:
-                log.debug("dlq check %s skipped: %s", label, e)
-        self.state["relay_dlq"] = sum(n for _, _, n, _ in found)
+    def check_relay_dlq(self, get=None, now=None):
+        """Incomplete executions parked in a Make retry queue = work that DIED
+        before it landed. Three order events sat unnoticed for weeks in
+        September (Salla 502s during capture); each stays lost until someone
+        replays it.
+
+        [v2.12] Watches every scenario in Config.make_dlq_watch (six by
+        default, not just the two order relays), counts only unresolved items
+        older than dlq_min_age_minutes so Make's own ~30 min retry never
+        alerts, and pages the full queue. Replaying is not safe everywhere, so
+        each alert line carries that scenario's replay note. Alert at most
+        every 12h while anything is parked; state keys relay_dlq and
+        dlq_alerted_at are unchanged, per-scenario counts are added under
+        relay_dlq_by_scenario."""
+        rows = scan_dlq(self.cfg, get=get, now=now)
+        found = [r for r in rows if r["count"]]
+        unread = [r for r in rows if r["count"] is None]
+        total = sum(r["count"] for r in found)
+        self.state["relay_dlq"] = total
+        self.state["relay_dlq_by_scenario"] = dlq_state(rows)
         if not found:
-            self.state.pop("dlq_alerted_at", None)
+            # re-arm only when every queue was actually read: a failed read
+            # proves nothing, and must not reset the cooldown into a re-alert
+            if not unread:
+                self.state.pop("dlq_alerted_at", None)
             return
         last = float(self.state.get("dlq_alerted_at") or 0)
         if time.time() - last < 12 * 3600:
             return
         self.state["dlq_alerted_at"] = time.time()
-        lines = [f"• {label}: {n} stuck (oldest {oldest}) — "
-                 f"https://eu1.make.com/{getattr(self.cfg, 'make_team_id', '')}"
-                 f"/scenarios/{sid}"
-                 for label, sid, n, oldest in found]
-        total = sum(n for _, _, n, _ in found)
+        lines = ["• " + dlq_line(r) for r in found]
+        if unread:
+            lines.append("Not checked this time: "
+                         + ", ".join(r["label"] for r in unread) + ".")
+        subject = (f"🟠 {total} failed Make run is stuck in the retry queue."
+                   if total == 1 else
+                   f"🟠 {total} failed Make runs are stuck in the retry queue.")
         self._alert(
-            f"🟠 {total} webhook delivery(ies) stuck in Make's retry queue",
-            "Each of these is an order event that never reached the engine, "
-            "so its order is missing from HubSpot until the execution is "
-            "replayed (Make: scenario → Incomplete executions → Retry). "
-            "Replaying is safe: the engine ignores duplicates.\n"
+            subject,
+            "Make has not been able to finish these runs on its own. Each "
+            "one stays undone until it is replayed in Make: open "
+            "the scenario, then Incomplete executions, then Retry. Read the "
+            "note on each line before you replay.\n"
             + "\n".join(lines))
 
     # ------------- the tick -------------
@@ -336,7 +527,7 @@ class CreditWatch:
         try:
             self.check_relay_dlq()
         except Exception as e:
-            log.debug("relay dlq watch skipped: %s", e)
+            log.warning("retry-queue watch skipped: %s", _safe_err(e))
 
         prev = self.state.get("org") or {}
         remaining = org["remaining"]
