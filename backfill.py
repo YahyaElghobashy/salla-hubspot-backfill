@@ -729,6 +729,16 @@ class Config:
     dlq_min_age_minutes: int = 45
     # Workbook capacity guard (Google caps a workbook at 10,000,000 cells).
     capacity_alert_pct: float = 80.0
+    # ---- v2.12 audit append hardening (GoogleIO.audit_append) -----------
+    # A Sheets 500/502/timeout on the arrival append used to fire the fallback
+    # append at once, into the same outage (13 times; 2 rows lost). The
+    # fallback now waits these many seconds before each attempt, and first
+    # reads column A of at least the tab's last audit_dedup_rows rows: an
+    # append that landed despite its error is reused, never doubled. Every
+    # fallback outcome is one row in audit_fallback_ledger ("" disables it).
+    audit_fallback_backoff_s: tuple = (3.0, 10.0)
+    audit_dedup_rows: int = 50
+    audit_fallback_ledger: str = "mirror/audit_fallback.csv"
     # ---- v2.9 gift address refresh (gift_refresh.py) --------------------
     # A gift order's receiver confirms their delivery address AFTER purchase;
     # nothing else in the engine re-reads an order once created, so a bounded
@@ -1583,6 +1593,10 @@ class GoogleIO:
         self.enabled = enabled
         self._creds_json = None   # v1.5: per-thread services built from this
         self._tl = threading.local()
+        # [v2.12] highest audit row this process has seen an append land on:
+        # the fallback's duplicate check reads column A from just above it.
+        self._audit_last_row = 0
+        self.audit_fallback_counts = {}   # outcome -> count, this process
         util = cfg.adaptive_target_util
         # v1.4 adaptive pacing. Documented quotas (verified 2026-07-12):
         #   - Sheets API v4: 60 write requests/min/user (fixed ~60s refill
@@ -1696,44 +1710,167 @@ class GoogleIO:
             log.error("Drive upload failed for %s: %s", filename, e)
             return ""
 
+    AUDIT_FALLBACK_TEXT = "JSON exceeded limit - use Order Ops > Backfill JSON from Salla"
+    AUDIT_TAIL_PAGE = 1000       # rows per column-A read when walking up the tab
+    AUDIT_TAIL_MAX_PAGES = 5
+    _ledger_lock = threading.Lock()   # lanes share one fallback ledger
+
     def audit_append(self, values_by_idx):
-        """[M203] append one sparse row, return the sheet row number for updates."""
-        row = [""] * AUDIT_WIDTH
-        for idx, val in values_by_idx.items():
-            row[idx] = val
+        """[M203] append one sparse row, return the sheet row number for updates.
+
+        [v2.12] When the append raises (Sheets 500/502/timeout), the fallback
+        no longer fires straight into the same outage. Before each fallback
+        attempt it waits (cfg.audit_fallback_backoff_s, 3 s then 10 s), then
+        reads column A of the tab's last rows: a first append that landed
+        despite its error is found there and its row returned, so no twin row
+        is written (a row the same order got moments earlier, e.g. on a retry,
+        is reused the same way: its updates land on that row). Each outcome (found / fallback / lost) is recorded in
+        cfg.audit_fallback_ledger. A lost row (-1) is recoverable later with
+        tools/audit_replay.py from mirror/audit_mirror.csv."""
         if not self.enabled:
             return -1
         log.debug("PHASE sheet append")  # v1.2 observability
         try:
-            resp = self._gexec(self.sheets.values().append(
-                spreadsheetId=self.cfg.spreadsheet_id,
-                range=f"'{self.cfg.audit_tab}'!A:AE",
-                valueInputOption="USER_ENTERED",
-                insertDataOption="INSERT_ROWS",
-                body={"values": [row]}), "audit append", self.sheets_rl)
-            rng = resp.get("updates", {}).get("updatedRange", "")
-            m = re.search(r"![A-Z]+(\d+)", rng)
-            return int(m.group(1)) if m else -1
+            return self._audit_append_row(values_by_idx, "audit append")
         except Exception as e:  # [oe203] fallback row semantics
             log.error("Audit append failed, writing fallback row: %s", e)
-            fb = dict(values_by_idx)
-            fb[27] = "JSON exceeded limit - use Order Ops > Backfill JSON from Salla"
+            return self._audit_fallback(values_by_idx, e)
+
+    def _audit_append_row(self, values_by_idx, what):
+        row = [""] * AUDIT_WIDTH
+        for idx, val in values_by_idx.items():
+            row[idx] = val
+        resp = self._gexec(self.sheets.values().append(
+            spreadsheetId=self.cfg.spreadsheet_id,
+            range=f"'{self.cfg.audit_tab}'!A:AE",
+            valueInputOption="USER_ENTERED",
+            insertDataOption="INSERT_ROWS",
+            body={"values": [row]}), what, self.sheets_rl)
+        rng = (resp or {}).get("updates", {}).get("updatedRange", "")
+        m = re.search(r"![A-Z]+(\d+)", rng)
+        n = int(m.group(1)) if m else -1
+        if n > getattr(self, "_audit_last_row", 0):
+            self._audit_last_row = n
+        return n
+
+    def _audit_fallback(self, values_by_idx, first_error):
+        """[v2.12] Wait, look for the row, then append the fallback row."""
+        oid = self._norm_id(values_by_idx.get(0, ""))
+        fb = dict(values_by_idx)
+        fb[27] = self.AUDIT_FALLBACK_TEXT
+        delays = [float(d) for d in (getattr(self.cfg, "audit_fallback_backoff_s", None)
+                                     or ())] or [0.0]
+        last_error = first_error
+        for attempt, delay in enumerate(delays, 1):
+            checked = False
+            log.warning("Audit fallback for order %s: waiting %.0fs (attempt %d/%d)",
+                        oid or "?", delay, attempt, len(delays))
+            time.sleep(delay)
+            if oid:
+                try:
+                    found = self._audit_find(oid)
+                    checked = True
+                except Exception as e:
+                    found = None
+                    log.warning("Audit tail read failed for order %s, appending "
+                                "without the duplicate check: %s", oid, e)
+                if found:
+                    log.warning("Audit append for order %s landed at row %d despite "
+                                "the error; no second row written", oid, found)
+                    self._audit_outcome(oid, "found", found, attempt, first_error)
+                    return found
             try:
-                row = [""] * AUDIT_WIDTH
-                for idx, val in fb.items():
-                    row[idx] = val
-                resp = self._gexec(self.sheets.values().append(
-                    spreadsheetId=self.cfg.spreadsheet_id,
-                    range=f"'{self.cfg.audit_tab}'!A:AE",
-                    valueInputOption="USER_ENTERED",
-                    insertDataOption="INSERT_ROWS",
-                    body={"values": [row]}), "audit fallback append", self.sheets_rl)
-                rng = resp.get("updates", {}).get("updatedRange", "")
-                m = re.search(r"![A-Z]+(\d+)", rng)
-                return int(m.group(1)) if m else -1
-            except Exception as e2:
-                log.error("Audit fallback append also failed: %s", e2)
-                return -1
+                n = self._audit_append_row(fb, "audit fallback append")
+            except Exception as e:
+                last_error = e
+                log.error("Audit fallback append failed for order %s (attempt %d/%d): %s",
+                          oid or "?", attempt, len(delays), e)
+                continue
+            self._audit_outcome(oid, "fallback" if checked or not oid
+                                else "fallback_unchecked", n, attempt, first_error)
+            return n
+        log.error("Audit fallback append also failed: %s", last_error)
+        self._audit_outcome(oid, "lost", -1, len(delays), last_error)
+        return -1
+
+    def _audit_col_a(self, start, end=None):
+        """[(sheet row, order id)] for column A from `start` (to `end`, or to
+        the last filled row when None)."""
+        rng = f"'{self.cfg.audit_tab}'!A{start}:A{end if end else ''}"
+        resp = self._gexec(self.sheets.values().get(
+            spreadsheetId=self.cfg.spreadsheet_id, range=rng,
+            valueRenderOption="UNFORMATTED_VALUE"),
+            "audit column A read", self.sheets_rl)
+        return [(start + i, self._norm_id(v[0] if v else ""))
+                for i, v in enumerate((resp or {}).get("values") or [])]
+
+    def _audit_tail(self, n):
+        """[v2.12] Column A of at least the last n filled rows of the audit tab.
+
+        With a row this process has seen land, one open-ended read from n rows
+        above it covers the tail plus anything other writers added since.
+        Without one (or when that read finds nothing, e.g. rows were deleted),
+        the grid size locates the bottom and the read walks up in pages: a
+        tab keeps its initial blank rows below the data."""
+        hint = getattr(self, "_audit_last_row", 0)
+        if hint > 0:
+            got = self._audit_col_a(max(2, hint - n))
+            if any(oid for _, oid in got):
+                return got
+        meta = self._gexec(self.sheets.get(
+            spreadsheetId=self.cfg.spreadsheet_id,
+            fields="sheets(properties(title,gridProperties(rowCount)))"),
+            "audit tail meta", self.sheets_rl)
+        end = next((int(s["properties"].get("gridProperties", {}).get("rowCount", 0))
+                    for s in (meta or {}).get("sheets", [])
+                    if s.get("properties", {}).get("title") == self.cfg.audit_tab), 0)
+        out, pages = [], 0
+        while (end >= 2 and pages < self.AUDIT_TAIL_MAX_PAGES
+               and sum(1 for _, oid in out if oid) < n):
+            start = max(2, end - self.AUDIT_TAIL_PAGE + 1)
+            out = self._audit_col_a(start, end) + out
+            end, pages = start - 1, pages + 1
+        return out
+
+    def audit_ids(self):
+        """[v2.12] {salla order id: LAST audit sheet row}, one read of column A
+        (tools/audit_replay.py)."""
+        out = {}
+        for row, oid in self._audit_col_a(2):
+            if oid:
+                out[oid] = row  # later rows overwrite: last occurrence wins
+        return out
+
+    def _audit_find(self, oid):
+        """Last audit row among the tail rows whose column A is `oid`, or None."""
+        n = max(1, int(getattr(self.cfg, "audit_dedup_rows", 50) or 50))
+        rows = [r for r, got in self._audit_tail(n) if got == str(oid)]
+        return rows[-1] if rows else None
+
+    def _audit_outcome(self, oid, outcome, sheet_row, attempts, error):
+        """Count the fallback outcome and append it to the local ledger (the
+        error is the first append's, or the last one's for "lost"). A ledger
+        failure is logged and never breaks the order path."""
+        counts = getattr(self, "audit_fallback_counts", None)
+        if counts is not None:
+            counts[outcome] = counts.get(outcome, 0) + 1
+        path = str(getattr(self.cfg, "audit_fallback_ledger", "") or "")
+        if not path:
+            return
+        try:
+            with GoogleIO._ledger_lock:
+                p = Path(path)
+                p.parent.mkdir(parents=True, exist_ok=True)
+                new = not p.exists()
+                with open(p, "a", newline="") as f:
+                    w = csv.writer(f)
+                    if new:
+                        w.writerow(["ts", "salla_order_id", "outcome", "sheet_row",
+                                    "attempts", "error"])
+                    w.writerow([now_str(), oid, outcome, sheet_row, attempts,
+                                str(error)[:300]])
+        except Exception as e:
+            log.error("Audit fallback ledger write failed: %s", e)
 
     def audit_update(self, row_number, values_by_idx, what):
         """[M240]/[M244] sparse cell updates on the audit row, contiguous runs
@@ -2057,9 +2194,20 @@ class GoogleIO:
             log.error("Queue Log append failed: %s", e)
 
 
+AUDIT_MIRROR_HEADER = (["ts", "event", "sheet_row"]
+                       + [f"c{i}" for i in range(AUDIT_WIDTH)] + ["order_id"])
+
+
 class LocalMirror:
     """CSV mirrors of every sheet write plus an error ledger. Always on: this is
-    the reconciliation and debugging backbone independent of Google state."""
+    the reconciliation and debugging backbone independent of Google state.
+
+    [v2.12] audit_mirror.csv rows end with an order_id column. Update events
+    carry no column A value, so before v2.12 an update whose sheet row was -1
+    could not be tied to its order. The column is appended at the end so
+    readers that zip the header with each row are unaffected. A file started
+    before v2.12 keeps its old header (several services append to it
+    concurrently, so it is never rewritten); read_audit() maps both."""
 
     def __init__(self, outdir):
         self.dir = Path(outdir)
@@ -2068,7 +2216,7 @@ class LocalMirror:
         self.queue = self.dir / "queue_mirror.csv"
         self.errors = self.dir / "errors.csv"
         self._lock = threading.Lock()  # v1.5: lanes append concurrently
-        for p, hdr in ((self.audit, ["ts", "event", "sheet_row"] + [f"c{i}" for i in range(AUDIT_WIDTH)]),
+        for p, hdr in ((self.audit, AUDIT_MIRROR_HEADER),
                        (self.queue, ["ts"] + [f"c{i}" for i in range(14)]),
                        (self.errors, ["ts", "salla_order_id", "stage", "detail"])):
             if not p.exists():
@@ -2079,11 +2227,30 @@ class LocalMirror:
         with self._lock, open(path, "a", newline="") as f:
             csv.writer(f).writerow(row)
 
-    def audit_event(self, event, sheet_row, values_by_idx):
+    def audit_event(self, event, sheet_row, values_by_idx, order_id=None):
         row = [""] * AUDIT_WIDTH
         for i, v in values_by_idx.items():
             row[i] = v
-        self._write(self.audit, [now_str(), event, sheet_row] + row)
+        oid = order_id if order_id not in (None, "") else values_by_idx.get(0, "")
+        self._write(self.audit, [now_str(), event, sheet_row] + row + [str(oid)])
+
+    @staticmethod
+    def read_audit(path):
+        """[v2.12] Yield audit_mirror.csv rows as dicts keyed like
+        AUDIT_MIRROR_HEADER, whichever header the file started with. order_id
+        is read by position; rows written before v2.12 fall back to c0, which
+        only arrived_append rows fill."""
+        width = len(AUDIT_MIRROR_HEADER) - 1
+        with open(path, newline="") as f:
+            rd = csv.reader(f)
+            next(rd, None)
+            for r in rd:
+                if len(r) < 3:
+                    continue
+                d = dict(zip(AUDIT_MIRROR_HEADER[:width], r[:width]))
+                d["order_id"] = ((r[width] if len(r) > width else "")
+                                 or d.get("c0", "")).strip()
+                yield d
 
     def queue_event(self, values_by_idx):
         row = [""] * 14
@@ -2305,7 +2472,8 @@ class Engine:
         upd = {11: "Held for Review", 12: "Items not yet approved in catalog",
                13: "FALSE", 19: "N/A", 20: "N/A", 21: "N/A", 22: "N/A", 23: "N/A",
                24: "Queued", 25: now_str()}
-        self.mirror.audit_event("queued_update", audit_row, upd)
+        self.mirror.audit_event("queued_update", audit_row, upd,
+                                order_id=str(order.get("id")))  # [v2.12]
         if self.live:
             self.gio.audit_update(audit_row, upd, "queued")
         names = ", ".join(u["name"] for u in unverified)
@@ -2601,7 +2769,8 @@ class Engine:
                19: "Pending Verification", 20: "Pending Verification",
                21: "Pending Verification", 22: "Pending Verification",
                23: "Pending Verification", 24: "Synced", 25: now_str()}
-        self.mirror.audit_event("processed_update", audit_row, upd)
+        self.mirror.audit_event("processed_update", audit_row, upd,
+                                order_id=oid)  # [v2.12]
         if self.live:
             self.gio.audit_update(audit_row, upd, "processed")
 
@@ -2983,7 +3152,7 @@ class Engine:
                27: link if link else "Drive upload failed",
                29: now_str(), 30: "No" if self.is_live_sync else "Yes"}
         audit_row = self.gio.audit_append(add) if self.live else -1
-        self.mirror.audit_event("arrived_append", audit_row, add)
+        self.mirror.audit_event("arrived_append", audit_row, add, order_id=oid)
 
         # gate [M209..M215] then router [M216]
         unverified = self.gate_unverified_items(order)
