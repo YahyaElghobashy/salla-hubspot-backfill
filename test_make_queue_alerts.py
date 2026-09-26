@@ -244,9 +244,9 @@ class Scan(unittest.TestCase):
         self.assertEqual(len(fake.paths), 4)
         for p in fake.paths:
             self.assertIn("status=unresolved", p)
-            self.assertIn("pg[sortBy]=created", p)
+            self.assertNotIn("pg[sortBy]", p)          # refused by Make (400)
             self.assertIn("pg[sortDir]=desc", p)
-            self.assertIn("pg[limit]=100", p)
+            self.assertIn("pg[limit]=50", p)           # Make's ceiling
 
     def test_age_gate_and_resolved(self):
         fake = FakeMake({"6568689": [item(10), item(44), item(46),
@@ -284,15 +284,15 @@ class Scan(unittest.TestCase):
                            get=fake, now=NOW)
         self.assertEqual(rows[0]["count"], 230)
         self.assertFalse(rows[0]["capped"])
-        self.assertEqual(len(fake.paths), 3)
-        self.assertTrue(all("pg[limit]=100" in p for p in fake.paths))
-        self.assertEqual(offsets(fake), ["0", "100", "200"])
+        self.assertEqual(len(fake.paths), 5)
+        self.assertTrue(all("pg[limit]=50" in p for p in fake.paths))
+        self.assertEqual(offsets(fake), ["0", "50", "100", "150", "200"])
 
     def test_exact_full_page_asks_once_more(self):
-        fake = FakeMake({"6568689": [item(60, i=i) for i in range(100)]})
+        fake = FakeMake({"6568689": [item(60, i=i) for i in range(50)]})
         rows = cw.scan_dlq(cfg(make_dlq_watch=[{"id": "6568689"}]),
                            get=fake, now=NOW)
-        self.assertEqual(rows[0]["count"], 100)
+        self.assertEqual(rows[0]["count"], 50)
         self.assertEqual(len(fake.paths), 2)
 
     def test_caps_at_500(self):
@@ -301,7 +301,7 @@ class Scan(unittest.TestCase):
                            get=fake, now=NOW)
         self.assertEqual(rows[0]["count"], 500)
         self.assertTrue(rows[0]["capped"])
-        self.assertEqual(len(fake.paths), 5)
+        self.assertEqual(len(fake.paths), 10)
         self.assertIn("500+ stuck, oldest read", cw.dlq_line(rows[0]))
 
     def test_capped_with_nothing_unresolved_is_not_measured(self):
@@ -341,10 +341,10 @@ class Scan(unittest.TestCase):
             rows = cw.scan_dlq(cfg(make_dlq_watch=[{"id": "6568689"}]),
                                get=fake, now=NOW)
         self.assertEqual(len(fake.paths), 2)          # not 5 copies of page 1
-        self.assertEqual(offsets(fake), ["0", "100"])
-        self.assertEqual(rows[0]["count"], 100)
+        self.assertEqual(offsets(fake), ["0", "50"])
+        self.assertEqual(rows[0]["count"], 50)
         self.assertTrue(rows[0]["capped"])
-        self.assertIn("100+ stuck", cw.dlq_line(rows[0]))
+        self.assertIn("50+ stuck", cw.dlq_line(rows[0]))
         self.assertIn("added no new items", "\n".join(cm.output))
 
     def test_offset_ignoring_api_with_nothing_unresolved_is_not_measured(self):
@@ -355,7 +355,7 @@ class Scan(unittest.TestCase):
                            get=fake, now=NOW)
         self.assertIsNone(rows[0]["count"])
         self.assertEqual(cw.dlq_line(rows[0]),
-                         "live: not measured (100+ records, none unresolved "
+                         "live: not measured (50+ records, none unresolved "
                          "on the pages read)")
 
     def test_unwatchable_scenarios_are_not_read(self):
@@ -645,7 +645,7 @@ class Alert(unittest.TestCase):
         w.state["dlq_read_fail"] = {"5563154": {
             "label": "customer updated", "ticks": 40,
             "since": time.time() - 30 * 3600,
-            "last": time.time() - 3 * w.poll_s - 60}}
+            "last": time.time() - max(3 * w.poll_s, 1800) - 60}}   # past the 30 min floor
         with self.assertLogs("backfill", level="WARNING") as cm:
             w.check_relay_dlq(get=down, now=NOW)
         self.assertTrue(any("customer updated cannot be read" in l for l in cm.output))
@@ -889,3 +889,27 @@ class Certificate(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestLiveApiShape(unittest.TestCase):
+    """[v2.12] Shapes observed on the live /dlqs API on 2026-09-26."""
+
+    def test_query_uses_accepted_params_only(self):
+        seen = []
+
+        def get(path):
+            seen.append(path)
+            return {"dlqs": []}
+        cw._dlq_items(get, "5563154")
+        self.assertIn("pg[limit]=50", seen[0])
+        self.assertNotIn("sortBy", seen[0])
+        self.assertIn("status=unresolved", seen[0])
+
+    def test_make_retry_fields_mean_not_stuck(self):
+        from datetime import datetime, timedelta, timezone
+        soon = (datetime.now(timezone.utc) + timedelta(minutes=20)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+        past = "2026-09-22T16:47:00.000Z"
+        self.assertFalse(cw._dlq_open({"resolved": False, "isBeingReprocessed": True}))
+        self.assertFalse(cw._dlq_open({"resolved": False, "nextReprocessTimestamp": soon}))
+        self.assertTrue(cw._dlq_open({"resolved": False, "nextReprocessTimestamp": past}))
+        self.assertTrue(cw._dlq_open({"resolved": False, "nextReprocessTimestamp": None}))

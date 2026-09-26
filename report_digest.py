@@ -220,6 +220,17 @@ def aggregate(period):
 # rendering
 # --------------------------------------------------------------------------
 
+def _engine_config_path():
+    """[v2.12] The engine config the digest reads: ENGINE_CONFIG when set,
+    else config.live.json (what every engine service runs on) when present,
+    else config.json. On the VM config.json carries no queue_spreadsheet_id,
+    so reading it made the queue lines fall back to stale figures."""
+    env = os.environ.get("ENGINE_CONFIG")
+    if env:
+        return env
+    return "config.live.json" if Path("config.live.json").exists() else "config.json"
+
+
 def _live_held():
     """Outstanding catalog-held orders, measured LIVE from the Live Queue tab.
 
@@ -232,7 +243,7 @@ def _live_held():
     """
     try:
         from backfill import Config, GoogleIO
-        cfg = Config.load(os.environ.get("ENGINE_CONFIG", "config.json"))
+        cfg = Config.load(_engine_config_path())
         gio = GoogleIO(cfg, enabled=True)
         rows = gio.queue_read(cfg.queue_spreadsheet_id, start_row=2,
                               tab=getattr(cfg, "live_queue_tab", "Live Queue"))
@@ -465,7 +476,7 @@ def _engine():
     cfg = gio = None
     try:
         from backfill import Config, GoogleIO
-        cfg = Config.load(os.environ.get("ENGINE_CONFIG", "config.json"))
+        cfg = Config.load(_engine_config_path())
         gio = GoogleIO(cfg, enabled=True)
     except Exception as e:
         log.warning("digest: engine config or Google access unavailable; "

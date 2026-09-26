@@ -495,6 +495,7 @@ class RealtimeConsumer:
             return      # [v2.12] no trim ran: no "removed 0" line (finally still resets)
         except Exception as e:
             log.exception("%s trim failed (nothing further deleted): %s", self.name, e)
+            return      # the count would be wrong; finally still resets the cursor
         finally:
             self._start_row = 2
             self._save_state()

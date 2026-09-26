@@ -94,7 +94,9 @@ def _safe_err(e):
 # Shared by CreditWatch.check_relay_dlq (the 12h alert) and reconcile.py (the
 # Sunday certificate), so the two can never disagree about what counts.
 
-DLQ_PAGE = 100          # Make's pg[limit] ceiling
+# Make's /dlqs pg[limit] ceiling is 50 (100 and 200 return HTTP 400, and
+# pg[sortBy]=created is refused too; verified against the live API 2026-09-26)
+DLQ_PAGE = 50
 DLQ_MAX_ITEMS = 500     # per scenario per scan; a capped count is a floor
 DLQ_MIN_AGE_DEFAULT = 45
 # [v2.12] Make retries an incomplete execution on its own backoff (1, 10, 10,
@@ -269,6 +271,13 @@ def _dlq_open(x):
     scheduled for (or in the middle of) one of Make's own retries."""
     if x.get("resolved"):
         return False
+    # the fields /dlqs items really carry (2026-09-26): isBeingReprocessed,
+    # and nextReprocessTimestamp while one of Make's own retries is pending
+    if x.get("isBeingReprocessed"):
+        return False
+    nxt = _parse_make_ts(x.get("nextReprocessTimestamp"))
+    if nxt is not None and nxt > datetime.now(timezone.utc):
+        return False
     status = re.sub(r"[^a-z]", "", str(x.get("status") or "").lower())
     return status not in DLQ_NOT_STUCK
 
@@ -284,8 +293,7 @@ def _dlq_items(get, sid):
     page or at DLQ_MAX_ITEMS."""
     items, seen, offset = [], set(), 0
     while True:
-        d = get(f"/dlqs?scenarioId={sid}&status=unresolved"
-                f"&pg[sortBy]=created&pg[sortDir]=desc"
+        d = get(f"/dlqs?scenarioId={sid}&status=unresolved&pg[sortDir]=desc"
                 f"&pg[limit]={DLQ_PAGE}&pg[offset]={offset}") or {}
         raw = d.get("dlqs") or []
         fresh = []
@@ -739,7 +747,9 @@ class CreditWatch:
             since = float(p.get("since") if p.get("since") is not None else last)
         except (TypeError, ValueError, OverflowError):
             return None
-        gap = DLQ_FAIL_GAP_POLLS * float(self.poll_s)
+        # a slow tick (Slack retries, 30 s Make timeouts) must not look like
+        # a gap, so never less than 30 minutes
+        gap = max(DLQ_FAIL_GAP_POLLS * float(self.poll_s), 1800.0)
         if not (math.isfinite(last) and math.isfinite(since)) or t - last > gap:
             return None
         return ticks, since
