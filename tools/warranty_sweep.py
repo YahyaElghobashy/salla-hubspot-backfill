@@ -19,8 +19,10 @@ dates, same stage. Two passes:
   stale     warranties still Active or Expiring Soon on an order that is
             now Cancelled or Returned: voided with the matching reason
 
-Orders without a delivery_date are skipped and counted (the action would
-fall back to the last-modified date, which for an old order is wrong).
+An order without a delivery_date is dated from its stage history (the day
+it entered Delivered or Completed in HubSpot) before the action runs: the
+action would otherwise fall back to the last-modified date, which for an old
+order is wrong. One with no such history entry is skipped and counted.
 Imported Zid orders are skipped by the action itself.
 
 Dry run by default: every write the action would make is intercepted and
@@ -199,12 +201,46 @@ def ledger(rows):
             w.writerow([now_str()] + r)
 
 
+def delivered_on(hs, cfg, hs_id):
+    """The day the order entered Delivered or Completed in HubSpot, from its
+    stage history (the earliest such entry), as YYYY-MM-DD in Riyadh time.
+    For an order created already delivered that is its creation day."""
+    stage_map = cfg.status_stage_map or {}
+    done = {stage_map.get("delivered"), stage_map.get("completed")}
+    st, o = hs._req("GET", f"/crm/v3/objects/orders/{hs_id}?propertiesWithHistory=hs_pipeline_stage",
+                    what="warranty sweep history")
+    hist = dig(o, "propertiesWithHistory.hs_pipeline_stage") or [] if st == 200 else []
+    when = sorted(h.get("timestamp", "") for h in hist if h.get("value") in done and h.get("timestamp"))
+    if not when:
+        return None
+    t = datetime.fromisoformat(when[0].replace("Z", "+00:00")).astimezone(RIYADH)
+    return t.strftime("%Y-%m-%d")
+
+
 def sweep_missing(hs, cfg, mod, live, days, ids, workers):
     todo = candidates(hs, cfg, days, ids)
-    no_date = [r for r in todo if not dig(r, "properties.delivery_date")]
     run = [r for r in todo if dig(r, "properties.delivery_date")]
-    log.info("WARRANTY missing: %d delivered/completed order(s) without a warranty; %d skipped "
-             "(no delivery_date); running the action on %d", len(todo), len(no_date), len(run))
+    no_date, dated = [], []
+    for r in todo:
+        if dig(r, "properties.delivery_date"):
+            continue
+        # the action would fall back to the last-modified date, which for an
+        # old order is wrong: date it from the stage history instead
+        day = delivered_on(hs, cfg, r["id"])
+        if not day:
+            no_date.append(r)
+            continue
+        if live:
+            st, d = hs._write("PATCH", f"/crm/v3/objects/orders/{r['id']}",
+                              {"properties": {"delivery_date": day}}, "warranty sweep delivery_date")
+            if st not in (200, 201):
+                no_date.append(r)
+                continue
+        dated.append((str(r["id"]), day))
+        run.append(r)
+    log.info("WARRANTY missing: %d delivered/completed order(s) without a warranty; %d dated from "
+             "their stage history; %d skipped (no date found); running the action on %d",
+             len(todo), len(dated), len(no_date), len(run))
     outcome, rows, lock = Counter(), [], threading.Lock()
 
     def one(r):
@@ -225,9 +261,11 @@ def sweep_missing(hs, cfg, mod, live, days, ids, workers):
         list(pool.map(one, run))
     rows += [["missing", str(r["id"]), dig(r, "properties.salla_order_id"), "skipped_no_delivery_date", 0, ""]
              for r in no_date]
+    rows += [["dated", oid, "", "delivery_date from stage history", 0, day] for oid, day in dated]
     if live:
         ledger(rows)
-    return {"orders": len(todo), "no_delivery_date": len(no_date), **dict(outcome)}
+    return {"orders": len(todo), "dated_from_history": len(dated), "no_delivery_date": len(no_date),
+            **dict(outcome)}
 
 
 def sweep_stale(hs, cfg, live, days):

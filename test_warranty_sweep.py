@@ -115,14 +115,27 @@ class TestPasses(unittest.TestCase):
         self.assertEqual([r["id"] for r in ws.candidates(hs, cfg(), 3, [])], ["1"])
         self.assertEqual([r["id"] for r in ws.candidates(hs, cfg(), 3, ["1", "3", "4"])], ["1"])
 
-    def test_missing_pass_runs_the_action_and_skips_undated(self):
+    def test_missing_pass_dates_undated_orders_from_stage_history(self):
         orders = {"1": {"hs_pipeline_stage": "D", "hs_source_store": "Salla", "delivery_date": "2026-09-20",
                         "salla_order_id": "S1"},
-                  "2": {"hs_pipeline_stage": "D", "hs_source_store": "Salla", "salla_order_id": "S2"}}
+                  "2": {"hs_pipeline_stage": "D", "hs_source_store": "Salla", "salla_order_id": "S2"},
+                  "3": {"hs_pipeline_stage": "C", "hs_source_store": "Salla", "salla_order_id": "S3"}}
+        hs = FakeHS(orders, {})
+        real = hs._req
+        hist = {"2": [{"value": "D", "timestamp": "2026-09-10T22:30:00Z"}, {"value": "S", "timestamp": "2026-09-08T10:00:00Z"}],
+                "3": [{"value": "S", "timestamp": "2026-09-01T10:00:00Z"}]}
+
+        def req(method, path, body=None, is_search=False, what=""):
+            if "propertiesWithHistory" in path:
+                oid = path.split("/orders/")[1].split("?")[0]
+                return 200, {"propertiesWithHistory": {"hs_pipeline_stage": hist[oid]}}
+            return real(method, path, body, is_search, what)
+        hs._req = req
         mod = types.SimpleNamespace(main=mock.Mock(return_value={"outputFields": {"status": "ok", "warranties_created": 2}}))
-        out = ws.sweep_missing(FakeHS(orders, {}), cfg(), mod, live=True, days=3, ids=[], workers=2)
-        self.assertEqual((out["orders"], out["no_delivery_date"], out["ok"], out["warranties"]), (2, 1, 1, 2))
-        mod.main.assert_called_once_with({"object": {"objectId": "1"}})
+        out = ws.sweep_missing(hs, cfg(), mod, live=True, days=3, ids=[], workers=2)
+        self.assertEqual((out["orders"], out["dated_from_history"], out["no_delivery_date"], out["ok"]), (3, 1, 1, 2))
+        self.assertEqual(hs.writes, [("/crm/v3/objects/orders/2", {"properties": {"delivery_date": "2026-09-11"}})])
+        self.assertEqual(sorted(c.args[0]["object"]["objectId"] for c in mod.main.call_args_list), ["1", "2"])
         self.assertTrue(Path("mirror/warranty_sweep.csv").exists())
 
     def test_stale_pass_voids_active_warranties_with_the_reason(self):
