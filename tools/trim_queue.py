@@ -14,7 +14,8 @@ Queued, blank, deferred, error and held rows are always kept, whatever age.
 
 Order of operations, on --apply:
   1. refuse unless the tab's consumer is stopped (its J1 heartbeat is stale)
-  2. take the trim lock (tools that hold row numbers refuse to run)
+  2. take the trim lock (tools that hold row numbers refuse to run); a lock
+     held by another live process is never taken, the tool exits instead
   3. write the consumer's state start_row=2 BEFORE deleting
   4. archive the rows to mirror/archive/<tab>-<ts>.csv.gz and check the count
   5. re-read and compare ids, then delete bottom-up in grouped ranges
@@ -39,7 +40,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from backfill import Config, GoogleIO, setup_logging
-from realtime_base import trim_lock, trim_lock_active
+from realtime_base import TrimLockHeld, trim_lock, trim_lock_active
+from tools.sheet_capacity import measure_workbook
 
 log = logging.getLogger("backfill")
 
@@ -50,15 +52,6 @@ STREAMS = {
                        "deletable": ("done", "superseded")},
 }
 HEARTBEAT_QUIET_S = 150      # the consumer writes J1 every ~60 s while running
-
-
-def workbook_cells(gio, qsid):
-    meta = gio.sheets.get(spreadsheetId=qsid, fields="sheets.properties").execute()
-    total = 0
-    for s in meta.get("sheets", []):
-        g = s["properties"].get("gridProperties", {})
-        total += g.get("rowCount", 0) * g.get("columnCount", 0)
-    return total
 
 
 def write_state(name, start_row):
@@ -99,10 +92,10 @@ def main():
     rows = gio.queue_read_all(qsid, tab=args.tab)
     states = collections.Counter(r["status"] for r in rows)
     doomed = [r for r in rows if r["status"] in stream["deletable"] and not keep(r)]
-    meta = gio.sheets.get(spreadsheetId=qsid, fields="sheets.properties").execute()
-    cols = next(s["properties"]["gridProperties"]["columnCount"] for s in meta["sheets"]
-                if s["properties"]["title"] == args.tab)
-    before = workbook_cells(gio, qsid)
+    # [v2.12] one cell-count implementation: tools/sheet_capacity.py
+    wb = measure_workbook(gio, qsid, "Queue workbook")
+    cols = next(t["cols"] for t in wb["tabs"] if t["tab"] == args.tab)
+    before = wb["cells"]
     log.info("%s: %d rows %s; would delete %d (older than %s, states %s); "
              "%d unparseable dates kept; ~%s cells freed; workbook %s cells now",
              args.tab, len(rows), dict(states), len(doomed), cutoff.strftime("%Y-%m-%d %H:%M"),
@@ -124,13 +117,16 @@ def main():
     if trim_lock_active():
         sys.exit("another trim holds mirror/trim.lock")
 
-    with trim_lock(args.tab):
-        write_state(stream["name"], 2)
-        try:
-            n = gio.queue_trim(qsid, keep, tab=args.tab, deletable=stream["deletable"])
-        finally:
+    try:
+        with trim_lock(args.tab):
             write_state(stream["name"], 2)
-    after = workbook_cells(gio, qsid)
+            try:
+                n = gio.queue_trim(qsid, keep, tab=args.tab, deletable=stream["deletable"])
+            finally:
+                write_state(stream["name"], 2)
+    except TrimLockHeld as e:       # [v2.12] a live trim took the lock after the check
+        sys.exit(str(e))
+    after = measure_workbook(gio, qsid)["cells"]
     log.info("DONE %s: deleted %d rows; workbook %s -> %s cells. Start %s again.",
              args.tab, n, f"{before:,}", f"{after:,}", stream["service"])
 

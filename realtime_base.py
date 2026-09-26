@@ -20,6 +20,7 @@ Subclasses implement handle_row(row) -> (state, note) and may override
 claimable() filtering. Everything else is here.
 """
 
+import contextlib
 import json
 import logging
 import os
@@ -36,34 +37,168 @@ TRIM_LOCK = Path("mirror/trim.lock")
 TRIM_LOCK_STALE_S = 2 * 3600
 
 
+class TrimLockHeld(RuntimeError):
+    """[v2.12] trim_lock refused: another live process holds TRIM_LOCK."""
+
+
+def trim_lock_holder():
+    """[v2.12] Who holds TRIM_LOCK: {"pid", "tab", "ts", "mtime"} or None when
+    there is no lock file. The file holds one line "<pid> <tab> <ts>" (tab
+    names contain spaces, ts does not). A v2.11 JSON lock is read too, so a
+    lock left by the previous version is still understood. pid is None when
+    the file cannot be parsed (for example read between create and write)."""
+    try:
+        mtime = TRIM_LOCK.stat().st_mtime
+        text = TRIM_LOCK.read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        return None
+    except OSError:
+        return {"pid": None, "tab": "", "ts": "", "mtime": time.time()}
+    pid, tab, ts = None, "", ""
+    if text.startswith("{"):
+        try:
+            d = json.loads(text)
+            pid, tab, ts = int(d.get("pid")), str(d.get("tab", "")), str(d.get("ts", ""))
+        except (ValueError, TypeError):
+            pass
+    else:
+        head, _, rest = text.partition(" ")
+        if head.isdigit():
+            pid = int(head)
+        tab, _, ts = rest.rpartition(" ")
+    return {"pid": pid, "tab": tab, "ts": ts, "mtime": mtime}
+
+
+def _pid_alive(pid):
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True            # exists, owned by another user
+    except OSError:
+        return False
+    return True
+
+
+def _pid_started_at(pid):
+    """Epoch start time of `pid` from /proc (Linux), or None elsewhere."""
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text()
+        ticks = int(stat.rsplit(")", 1)[1].split()[19])     # field 22, starttime
+        btime = next(int(line.split()[1]) for line in
+                     Path("/proc/stat").read_text().splitlines()
+                     if line.startswith("btime "))
+        return btime + ticks / os.sysconf("SC_CLK_TCK")
+    except (OSError, ValueError, IndexError, StopIteration):
+        return None
+
+
+def _holder_live(h):
+    """A holder is live while its pid runs and that process is the one that
+    wrote the lock. A pid that started after the lock was written is a reused
+    pid (crash, reboot), not the holder. With no readable pid, fall back to
+    the v2.11 age rule so a half-written lock is not taken over."""
+    if not isinstance(h["pid"], int) or h["pid"] <= 0:
+        return time.time() - h["mtime"] < TRIM_LOCK_STALE_S
+    if not _pid_alive(h["pid"]):
+        return False
+    started = _pid_started_at(h["pid"])
+    return started is None or started <= h["mtime"] + 2      # 2 s: btime rounding
+
+
+@contextlib.contextmanager
+def _takeover_guard():
+    """flock around a stale-lock check-and-unlink: two processes that find the
+    same stale lock cannot remove each other's fresh one. Creation itself is
+    O_EXCL and needs no guard."""
+    fh = open(TRIM_LOCK.with_name(TRIM_LOCK.name + ".guard"), "a")
+    try:
+        try:
+            import fcntl
+            fcntl.flock(fh, fcntl.LOCK_EX)
+        except ImportError:
+            pass
+        yield
+    finally:
+        fh.close()
+
+
 def trim_lock_active():
     """[v2.11] True while a queue trim is deleting rows. Tools that hold sheet
     row numbers (drains, repairs, state setters) must not run meanwhile: the
-    rows under them move up. A lock older than two hours is treated as left
-    behind by a crash."""
-    try:
-        return time.time() - TRIM_LOCK.stat().st_mtime < TRIM_LOCK_STALE_S
-    except OSError:
-        return False
+    rows under them move up.
+
+    [v2.12] True while any LIVE holder exists, however long its trim takes.
+    A lock whose pid is dead (a crash) is not active; before v2.12 such a
+    lock blocked the tools for two hours. The two-hour rule is kept only for
+    a lock whose pid cannot be read."""
+    h = trim_lock_holder()
+    return bool(h) and _holder_live(h)
 
 
 class trim_lock:
-    """Context manager that holds TRIM_LOCK for the duration of a trim."""
+    """Context manager that holds TRIM_LOCK for the duration of a trim.
+
+    [v2.12] Owner-aware. Enter creates the file exclusively and writes
+    "<pid> <tab> <ts>". A lock held by a live process is never overwritten:
+    enter raises TrimLockHeld (a RuntimeError) and the caller skips its
+    trim. A lock left by a dead pid is taken over with a WARNING. Exit
+    unlinks the file only while it still holds our pid, so a trim never
+    removes a lock that another process took after it."""
 
     def __init__(self, tab):
         self.tab = tab
+        self._held = False
 
     def __enter__(self):
         TRIM_LOCK.parent.mkdir(exist_ok=True)
-        TRIM_LOCK.write_text(json.dumps({"tab": self.tab, "pid": os.getpid(),
-                                         "ts": datetime.now().isoformat(timespec="seconds")}))
-        return self
+        line = f"{os.getpid()} {self.tab} {datetime.now().isoformat(timespec='seconds')}\n"
+        for _ in range(3):
+            try:
+                fd = os.open(TRIM_LOCK, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+            except FileExistsError:
+                h = trim_lock_holder()
+                if h is None:
+                    continue                          # released meanwhile: retry
+                if _holder_live(h):
+                    raise TrimLockHeld(
+                        f"trim lock {TRIM_LOCK} is held by pid {h['pid'] or '?'} "
+                        f"({h['tab'] or '?'} since {h['ts'] or '?'}); "
+                        f"not trimming {self.tab!r}")
+                with _takeover_guard():
+                    # unlink only the stale lock we judged, never a fresh one
+                    # that another process created after taking it over
+                    now = trim_lock_holder()
+                    if now and (now["pid"], now["mtime"]) == (h["pid"], h["mtime"]):
+                        log.warning("TRIM LOCK taking over a stale lock from pid %s "
+                                    "(%s since %s): that process is no longer running",
+                                    h["pid"] or "?", h["tab"] or "?", h["ts"] or "?")
+                        try:
+                            TRIM_LOCK.unlink()
+                        except FileNotFoundError:
+                            pass
+                continue
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(line)
+            self._held = True
+            return self
+        raise TrimLockHeld(f"trim lock {TRIM_LOCK} could not be taken for "
+                           f"{self.tab!r} (another trim raced for it)")
 
     def __exit__(self, *exc):
-        try:
-            TRIM_LOCK.unlink()
-        except OSError:
-            pass
+        if not self._held:
+            return False
+        self._held = False
+        h = trim_lock_holder()
+        if h and h["pid"] == os.getpid():
+            try:
+                TRIM_LOCK.unlink()
+            except OSError:
+                pass
+        elif h:
+            log.warning("TRIM LOCK now held by pid %s (%s), not by us; left in place",
+                        h["pid"] or "?", h["tab"] or "?")
         return False
 
 
@@ -287,7 +422,8 @@ class RealtimeConsumer:
         cells and these tabs never shrank). The consumer is the only deleter
         of its tab; its cursor is reset to row 2 BEFORE the delete and again
         in `finally`, so an interrupted delete can never leave it pointing
-        past rows that moved up."""
+        past rows that moved up. [v2.12] When another live process holds the
+        trim lock the trim is skipped for the day (WARNING), never forced."""
         if not getattr(self.cfg, "realtime_trim_enabled", False) or not self.live:
             return
         days = int(getattr(self.cfg, self.trim_days_attr, 0) or 0) if self.trim_days_attr else 0
@@ -314,6 +450,8 @@ class RealtimeConsumer:
             with trim_lock(self.tab):
                 n = self.gio.queue_trim(self.qsid, keep, tab=self.tab,
                                         deletable=self.trimmable)
+        except TrimLockHeld as e:
+            log.warning("%s trim skipped today, nothing deleted: %s", self.name, e)
         except Exception as e:
             log.exception("%s trim failed (nothing further deleted): %s", self.name, e)
         finally:

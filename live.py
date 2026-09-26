@@ -45,7 +45,7 @@ from pathlib import Path
 import backfill
 from backfill import (Config, Cursor, Engine, GoogleIO, HubSpot, LocalMirror,
                       RelayClient, RelayError, dig, now_str, install_dns_cache)
-from realtime_base import trim_lock
+from realtime_base import TrimLockHeld, trim_lock
 
 log = logging.getLogger("backfill")  # share the engine's logger/format
 
@@ -482,7 +482,9 @@ class LiveEngine(Engine):
         from a row number that now pointed past rows that had moved up. The
         trim lock is held for the delete so tools that hold row numbers
         refuse to run meanwhile. A dry run never trims, and a failed trim is
-        logged and not retried until the next day (as in realtime_base)."""
+        logged and not retried until the next day (as in realtime_base).
+        A lock held by another live process is never overwritten: the trim
+        is skipped for the day with a WARNING."""
         if not self.live:
             return
         today = datetime.now().date()
@@ -505,6 +507,8 @@ class LiveEngine(Engine):
         try:
             with trim_lock(self.cfg.live_queue_tab):
                 n = self.gio.queue_trim(self.qsid, keep)
+        except TrimLockHeld as e:        # [v2.12] another live trim holds the lock
+            log.warning("TRIM skipped today, nothing deleted: %s", e)
         except Exception as e:
             log.exception("TRIM failed (nothing further deleted): %s", e)
         finally:
