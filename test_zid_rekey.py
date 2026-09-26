@@ -135,7 +135,8 @@ class TestApply(unittest.TestCase):
                                  f"/crm/v3/properties/{zr.WARRANTY_OBJ}/void_reason",  # option added once
                                  f"/crm/v3/objects/{zr.WARRANTY_OBJ}/batch/update"])
         self.assertNotIn("hs_pipeline_stage", hs.writes[0][2]["properties"])          # no stage restore by default
-        self.assertEqual(hs.writes[2][2]["inputs"], [{"from": {"id": Z}, "to": {"id": "487000000001"}}])
+        self.assertEqual(hs.writes[2][2]["inputs"], [{"from": {"id": Z}, "to": [{"id": "487000000001"}]}])
+        self.assertEqual(hs.writes[3][2]["inputs"], [{"from": {"id": "W1"}, "to": [{"id": Z}]}])
         self.assertEqual({o["value"] for o in hs.writes[4][2]["options"]}, {"returned", "wrong_order"})
         upd = {x["id"]: x["properties"] for x in hs.writes[5][2]["inputs"]}
         self.assertEqual(upd["W3"]["hs_pipeline_stage"], zr.W_STAGE["voided"])
@@ -146,6 +147,43 @@ class TestApply(unittest.TestCase):
         self.assertIn(("order", "salla_order_id", N, "Z4938528"),
                       {(r["object"], r["field"], r["old"], r["new"]) for r in rows})
         self.assertTrue(any(r["object"] == "created_ledger" and r["note"] == "revoked" for r in rows))
+
+    def test_resume_after_a_failure_finishes_the_rest(self):
+        """The order and its Zid item were moved by an earlier run that then
+        failed: a repeat must not touch them again, must still detach the
+        Salla item, and must not queue a twin."""
+        hs = FakeHS()
+        hs.order.update({"salla_order_id": "Z4938528", "salla_order_reference": "Z4938528",
+                         "hs_external_order_id": "Z4938528", "last_salla_sync_status": "synced"})
+        hs.lis["481431164103"]["salla_order_id"] = "Z4938528"
+        hs.orders_by_salla_id = mock.Mock(side_effect=AssertionError("must not search for Z-key on resume"))
+        plan = zr.ZidRekey(hs, live=True, today=date(2026, 9, 27)).rekey(Z, N)
+        self.assertTrue(plan["resumed"])
+        self.assertEqual(plan["order_props"], {})
+        self.assertEqual(plan["zid_items"], [])
+        paths = [p for _, p, _ in hs.writes]
+        self.assertNotIn(f"/crm/v3/objects/orders/{Z}", paths)
+        self.assertNotIn("/crm/v3/objects/line_items/batch/update", paths)
+        self.assertIn("/crm/v4/associations/orders/line_items/batch/archive", paths)
+        rows = list(csv.DictReader(open("mirror/zid_rekeys.csv")))
+        self.assertTrue(all(r["object"] != "order" for r in rows))
+
+    def test_ledger_rows_land_step_by_step(self):
+        hs = FakeHS()
+        calls = []
+        real = hs._write
+
+        def failing(method, path, body, what):
+            calls.append(path)
+            if "line_items/batch/archive" in path:
+                return 400, {"message": "boom"}
+            return real(method, path, body, what)
+        hs._write = failing
+        with self.assertRaises(RuntimeError):
+            zr.ZidRekey(hs, live=True).rekey(Z, N)
+        rows = list(csv.DictReader(open("mirror/zid_rekeys.csv")))
+        self.assertEqual({r["object"] for r in rows}, {"order", "line_item"})   # what landed is ledgered
+        self.assertEqual(backfill.CreatedLedger("mirror").get(N), Z)             # not yet revoked
 
     def test_stage_restore_only_on_request(self):
         hs = FakeHS()

@@ -139,17 +139,20 @@ class ZidRekey:
         if not is_zid_order(p):
             raise RuntimeError(f"order {zid_hs_id} is not a Zid-import order (hs_source_store="
                                f"{p.get('hs_source_store')!r}); nothing to move")
-        if str(p.get("salla_order_id")) != n:
-            raise RuntimeError(f"order {zid_hs_id} holds salla_order_id {p.get('salla_order_id')!r}, "
-                               f"not {n}")
-        taken = self.hs.orders_by_salla_id(zid_key(n))
-        if taken != (None, None):
-            raise RuntimeError(f"{zid_key(n)} is already held by HS {taken}")
+        held = str(p.get("salla_order_id"))
+        resumed = held == zid_key(n)          # an earlier apply moved the order, then failed
+        if held != n and not resumed:
+            raise RuntimeError(f"order {zid_hs_id} holds salla_order_id {held!r}, not {n}")
+        if not resumed:
+            taken = self.hs.orders_by_salla_id(zid_key(n))
+            if taken != (None, None):
+                raise RuntimeError(f"{zid_key(n)} is already held by HS {taken}")
         hist = dig(o, "propertiesWithHistory.hs_pipeline_stage") or []
         original_stage = str(hist[-1].get("value")) if hist else str(p.get("hs_pipeline_stage") or "")
         plan = {"n": n, "zid_hs_id": zid_hs_id, "name": p.get("hs_order_name", ""),
-                "order_props": {"salla_order_id": zid_key(n)},
-                "order_old": {"salla_order_id": n},
+                "order_props": {} if resumed else {"salla_order_id": zid_key(n)},
+                "order_old": {} if resumed else {"salla_order_id": n},
+                "resumed": resumed,
                 "stage_current": str(p.get("hs_pipeline_stage") or ""),
                 "stage_original": original_stage, "stage_changes": len(hist) - 1 if hist else 0,
                 "zid_items": [], "salla_items": [], "warranties": []}
@@ -165,7 +168,8 @@ class ZidRekey:
         for lid, q in self._batch_read("line_items", li_ids, ["salla_order_item_id", "salla_order_id"]).items():
             key = str(q.get("salla_order_item_id") or "")
             if ZID_ITEM_KEY.match(key):
-                plan["zid_items"].append({"id": lid, "key": key, "old": q.get("salla_order_id")})
+                if str(q.get("salla_order_id")) == n:      # not yet moved (resume-safe)
+                    plan["zid_items"].append({"id": lid, "key": key, "old": q.get("salla_order_id")})
             else:
                 plan["salla_items"].append({"id": lid, "key": key})
         # warranties
@@ -234,36 +238,47 @@ class ZidRekey:
         log.info("void_reason option %s added", VOID_OPTION["value"])
 
     def apply(self, plan, restore_stages=False):
-        """Execute a plan in a safe order; returns the ledger rows written."""
+        """Execute a plan in a safe order. Every step is ledgered the moment
+        it lands, and every step is a no-op when already done, so a run that
+        failed half way can simply be repeated. Returns the ledger rows."""
         n, z = plan["n"], plan["zid_hs_id"]
         rows = []
+
+        def land(step_rows):
+            if step_rows:
+                self._ledger(step_rows)
+                rows.extend(step_rows)
+
         # 1. the order itself (frees the number)
-        self._write("PATCH", f"/crm/v3/objects/orders/{z}", {"properties": plan["order_props"]},
-                    "zid order rekey")
-        for k, v in plan["order_props"].items():
-            rows.append([n, z, "order", z, k, plan["order_old"].get(k, ""), v, "rekey"])
+        if plan["order_props"]:
+            self._write("PATCH", f"/crm/v3/objects/orders/{z}", {"properties": plan["order_props"]},
+                        "zid order rekey")
+            land([[n, z, "order", z, k, plan["order_old"].get(k, ""), v, "rekey"]
+                  for k, v in plan["order_props"].items()])
         # 2. Zid line items follow their order
         if plan["zid_items"]:
             self._write("POST", "/crm/v3/objects/line_items/batch/update",
                         {"inputs": [{"id": it["id"], "properties": {"salla_order_id": zid_key(n)}}
                                     for it in plan["zid_items"]]}, "zid items rekey")
-            rows += [[n, z, "line_item", it["id"], "salla_order_id", it["old"], zid_key(n), it["key"]]
-                     for it in plan["zid_items"]]
-        # 3. Salla line items leave the Zid order (the engine reuses them by key)
+            land([[n, z, "line_item", it["id"], "salla_order_id", it["old"], zid_key(n), it["key"]]
+                  for it in plan["zid_items"]])
+        # 3. Salla line items leave the Zid order (the engine reuses them by key).
+        #    HubSpot's batch archive takes one `from` with a LIST of `to`.
         if plan["salla_items"]:
             self._write("POST", "/crm/v4/associations/orders/line_items/batch/archive",
-                        {"inputs": [{"from": {"id": z}, "to": {"id": it["id"]}}
-                                    for it in plan["salla_items"]]}, "salla items detach")
-            rows += [[n, z, "assoc_order_line_item", it["id"], "association", z, "", f"detached {it['key']}"]
-                     for it in plan["salla_items"]]
+                        {"inputs": [{"from": {"id": z},
+                                     "to": [{"id": it["id"]} for it in plan["salla_items"]]}]},
+                        "salla items detach")
+            land([[n, z, "assoc_order_line_item", it["id"], "association", z, "", f"detached {it['key']}"]
+                  for it in plan["salla_items"]])
         # 4. warranties
         detach = [w for w in plan["warranties"] if w["action"] == "detach"]
         if detach:
             self._write("POST", f"/crm/v4/associations/{WARRANTY_OBJ}/orders/batch/archive",
-                        {"inputs": [{"from": {"id": w["id"]}, "to": {"id": z}} for w in detach]},
+                        {"inputs": [{"from": {"id": w["id"]}, "to": [{"id": z}]} for w in detach]},
                         "warranties detach")
-            rows += [[n, z, "assoc_warranty_order", w["id"], "association", z, "", f"detached {w['key']}"]
-                     for w in detach]
+            land([[n, z, "assoc_warranty_order", w["id"], "association", z, "", f"detached {w['key']}"]
+                  for w in detach])
         upd = [w for w in plan["warranties"] if w["action"] in ("rekey", "redate", "void")]
         if any(w["action"] == "void" for w in upd):
             self._ensure_void_option()
@@ -271,23 +286,24 @@ class ZidRekey:
             self._write("POST", f"/crm/v3/objects/{WARRANTY_OBJ}/batch/update",
                         {"inputs": [{"id": w["id"], "properties": w["props"]} for w in upd]},
                         "warranties update")
+            step = []
             for w in upd:
                 for k, v in w["props"].items():
                     old = w["key"] if k == "warranty_key" else w.get("stage") if k == "hs_pipeline_stage" else ""
-                    rows.append([n, z, "warranty", w["id"], k, old, v, w["action"]])
+                    step.append([n, z, "warranty", w["id"], k, old, v, w["action"]])
+            land(step)
         # 5. stage, only when the caller says the warranty engine is safe
         if restore_stages and plan["stage_original"] and plan["stage_current"] != plan["stage_original"]:
             self._write("PATCH", f"/crm/v3/objects/orders/{z}",
                         {"properties": {"hs_pipeline_stage": plan["stage_original"]}}, "zid stage restore")
-            rows.append([n, z, "order", z, "hs_pipeline_stage", plan["stage_current"],
-                         plan["stage_original"], "restored from history"])
+            land([[n, z, "order", z, "hs_pipeline_stage", plan["stage_current"],
+                   plan["stage_original"], "restored from history"]])
         # 6. local ledgers
         led = CreatedLedger(str(self.mirror))
         if led.get(n):
-            rows.append([n, z, "created_ledger", n, "hubspot_order_id", led.get(n), "", "revoked"])
+            land([[n, z, "created_ledger", n, "hubspot_order_id", led.get(n), "", "revoked"]])
             led.revoke(n)
         self._mark_resolved(n)
-        self._ledger(rows)
         return rows
 
     def _mark_resolved(self, n):
@@ -319,7 +335,8 @@ def describe(plan, out=print):
     acts = {}
     for w in plan["warranties"]:
         acts[w["action"]] = acts.get(w["action"], 0) + 1
-    out(f"ZID REKEY plan salla {n}: HS {z} {plan['name'][:40]!r}: order {sorted(plan['order_props'])}, "
+    out(f"ZID REKEY plan salla {n}: HS {z} {plan['name'][:40]!r}: {'RESUME, ' if plan.get('resumed') else ''}"
+        f"order {sorted(plan['order_props'])}, "
         f"{len(plan['zid_items'])} Zid item(s) rekeyed, {len(plan['salla_items'])} Salla item(s) detached, "
         f"warranties {acts or 'none'}, stage {plan['stage_current'][:12]} (original "
         f"{plan['stage_original'][:12]}, {plan['stage_changes']} change(s))")
@@ -394,11 +411,15 @@ def main():
             log.error("  %s: %s", n, e)
     log.info("done: %d re-keyed, %d failed%s", len(done), len(failed), f" {failed}" if failed else "")
     if args.apply and args.requeue and done:
+        # only numbers with no Salla order yet: a repeated run must not queue twins
+        todo = [n for n in done if not hs.orders_by_salla_id(n)[0]]
         gio = GoogleIO(cfg, enabled=True)
         rows = [[now_str(), n, "", "requeue", "queued", 0, "zid_rekey",
-                 f"Salla order after Zid re-key (Zid HS {pairs[n]})"] for n in done]
-        gio.queue_append_rows(cfg.queue_spreadsheet_id, rows)
-        log.info("queued %d order(s) on the Live Queue", len(rows))
+                 f"Salla order after Zid re-key (Zid HS {pairs[n]})"] for n in todo]
+        if rows:
+            gio.queue_append_rows(cfg.queue_spreadsheet_id, rows)
+        log.info("queued %d order(s) on the Live Queue (%d already have a Salla order)",
+                 len(rows), len(done) - len(rows))
 
 
 if __name__ == "__main__":
