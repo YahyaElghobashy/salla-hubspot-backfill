@@ -1,0 +1,24 @@
+# One-time consent flag history fill (customer_sweep.py --consent-history).
+#
+# Why it exists: 199,397 contacts created from Salla customers before the
+# consent mapping went live (22 Sep 2026) carry no salla_consent_status.
+# The Merchant API returns the flag on its day lists, sixty customers per
+# call, so the whole Salla era (Dec 2025 onward) costs about 3,700 relay
+# calls, roughly 15,000 Make credits. Yahya chose to run it after the
+# 4 Oct 2026 credit reset; the timer fires once, on a fixed date, and
+# Persistent runs it later if the machine was down at that moment.
+# Idles unless customer_sweep_enabled is true in config.live.json.
+[Unit]
+Description=Consent flag history fill, one time (Dec 2025 to 4 Oct 2026)
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=integrations_claragroup_com
+WorkingDirectory=/home/integrations_claragroup_com/app
+ExecStart=/bin/bash -lc 'set -a; . /home/integrations_claragroup_com/app/.env; set +a; exec /home/integrations_claragroup_com/app/venv/bin/python3 customer_sweep.py --config config.live.json --live --consent-history 2025-12-01 2026-10-04'
+Restart=no
+TimeoutStartSec=21600
+
+[Install]
+WantedBy=multi-user.target

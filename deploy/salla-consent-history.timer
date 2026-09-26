@@ -1,0 +1,11 @@
+[Unit]
+Description=Consent flag history fill, once, the morning after the 4 Oct 2026 credit reset
+
+[Timer]
+# A fixed date fires exactly once. 04:10 Riyadh sits between the trims and
+# the 04:41 daily sweep; Persistent catches a machine that was down.
+OnCalendar=2026-10-05 04:10:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target
