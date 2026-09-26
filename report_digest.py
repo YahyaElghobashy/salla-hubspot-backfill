@@ -21,7 +21,7 @@ Three design rules that matter more than they look:
 
 v2.12: the daily digest also reports the Customer and Status Queue states,
 how yesterday's customer payloads were read, the last customer sweep, consent
-coverage, workbook capacity and audit events that never got a sheet row. Each
+coverage, workbook capacity and orders that got no audit sheet row. Each
 of those values is computed on its own: one that fails logs a WARNING and
 only its line is left out.
 
@@ -340,13 +340,16 @@ CUSTOMER_LOGS = ("customer_sync.log.1", "customer_sync.log")  # rotated first
 _TS_B = re.compile(rb"(?m)^(\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2})")
 _TS_LINE = re.compile(r"^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}")
 
-# customer_sync.log markers (customer_sync.handle_row / read_payload, and the
-# realtime_base give-up line). A JSON payload logs no marker of its own: it is
-# counted from the "CUSTOMER created/updated" line of a customer that carries
-# no other marker that day (a superseded JSON row logs nothing at all). A
-# failed lookup reaches the log only when its row gives up; the retries before
-# that show as the Customer Queue's `error` count. An explicit
-# "CUSTOMER payload lookup_failed <id>" marker is counted if the sync logs one.
+# customer_sync.log markers (customer_sync.handle_row, and the realtime_base
+# give-up line). handle_row logs "CUSTOMER payload <path> <id>" for every row
+# it could read: json, salvaged or looked up. Only those markers are counted.
+# Log days from before the json marker existed have none, so for a window with
+# no "CUSTOMER payload json" line the JSON count falls back to the old
+# inference: "CUSTOMER created/updated" lines of customers with no other
+# marker that day. A failed lookup reaches the log only when its row gives up
+# (the retries before that show as the Customer Queue's `error` count); an
+# explicit "CUSTOMER payload lookup_failed <id>" marker is counted if the sync
+# ever logs one. A row with nothing to read logs "CUSTOMER row ... -- held".
 _CUST_TS = r"^(\d{4}-\d{2}-\d{2}) \d{2}:\d{2}:\d{2}"
 _CUST_PATH = re.compile(_CUST_TS + r".*?\bCUSTOMER payload "
                         r"(json|salvaged|looked up|lookup_failed) (\S+)")
@@ -355,8 +358,9 @@ _CUST_HELD = re.compile(_CUST_TS + r".*?\bCUSTOMER row \S+ \(([^)]*)\): .* -- he
 _CUST_GAVE_UP = re.compile(_CUST_TS + r".*?\bid (\w+)\b.*?payload unreadable; Salla "
                            r"(?:lookup failed|returned no customer)")
 
-_AUDIT_EVENTS = {"arrived_append": "arrivals", "queued_update": "queue updates",
-                 "processed_update": "processing updates"}
+# the capacity module's own place (tools/sheet_capacity.py); an ImportError
+# naming anything else is a broken module, not an absent one
+_CAPACITY_MODULES = ("tools.sheet_capacity", "tools", "sheet_capacity")
 
 
 def _safe(label, fn, *args, **kw):
@@ -429,9 +433,16 @@ def _tail_since(path, since, block=None):
     return [ln.rstrip("\r") for ln in lines if ln.strip()]
 
 
-def _csv_rows(path):
+def _csv_since(path, since):
+    """Rows (dicts by header) of an append-only ledger CSV whose first column
+    is a "YYYY-MM-DD HH:MM:SS" ts, from `since` onward: the header line, then
+    only the tail _tail_since reads, never the whole history. Older rows may
+    come back too; callers filter by ts."""
     with open(path, newline="", encoding="utf-8", errors="replace") as f:
-        return list(csv.DictReader(f))
+        head = next(csv.reader(f), [])
+    lines = _tail_since(path, since)
+    k = next((i for i, ln in enumerate(lines) if _TS_LINE.match(ln)), len(lines))
+    return [dict(zip(head, row)) for row in csv.reader(lines[k:])]
 
 
 def _hs_post(path, body, timeout=20):
@@ -486,17 +497,22 @@ def _queue_state(gio, cfg, tab, now):
 
 def _customer_paths(start, end):
     """How the day's customer rows were read, from customer_sync.log (and its
-    rotated .1): distinct customer ids per path. None when there is no log."""
+    rotated .1): distinct customer ids per path, counted from the markers.
+    None when there is no log; {"recorded": False} when the log has no
+    timestamped line in the window (a sync that logged nothing that day is
+    not a day of zeros). json_marker is False when the JSON count had to be
+    inferred (log days from before the "CUSTOMER payload json" marker)."""
     files = [ROOT / p for p in CUSTOMER_LOGS if (ROOT / p).exists()]
     if not files:
         return None
     seen = {k: set() for k in ("json", "salvaged", "looked up",
                                "lookup_failed", "held")}
-    wrote = set()
+    wrote, logged = set(), False
     for p in files:
         for line in _tail_since(p, start):
-            if not start <= line[:10] <= end:
+            if not _TS_LINE.match(line) or not start <= line[:10] <= end:
                 continue
+            logged = True
             m = _CUST_PATH.match(line)
             if m:
                 seen[m.group(2)].add(m.group(3))
@@ -512,15 +528,26 @@ def _customer_paths(start, end):
             m = _CUST_GAVE_UP.match(line)
             if m:
                 seen["lookup_failed"].add(m.group(2))
-    seen["json"] |= wrote - set().union(*seen.values())
-    return {k: len(v) for k, v in seen.items()}
+    if not logged:
+        return {"recorded": False}
+    marker = bool(seen["json"])
+    if not marker:
+        # a log day from before the json marker: infer JSON from contacts
+        # written by customers that carry no other marker
+        seen["json"] = wrote - set().union(*seen.values())
+    out = {k: len(v) for k, v in seen.items()}
+    out.update(recorded=True, json_marker=marker)
+    return out
 
 
-def _sweep_finds(now):
+def _sweep_finds(now, cfg=None):
     """The last customer sweep run (customer_sweep.py writes its state only
     on a live run): days checked, customers, missing, queued, the queued ids
     from mirror/customer_sweep.csv, and the flags the consent filler wrote in
-    the same run (mirror/consent_filled.csv). None when it never ran here."""
+    the same run (mirror/consent_filled.csv). None when it never ran here.
+    `stale` (no run for 48h) stays False when customer_sweep_enabled is off:
+    a sweep switched off is meant to be quiet. Without a config it is kept,
+    since the state file shows the sweep did run here."""
     p = ROOT / "mirror/customer_sweep_state.json"
     if not p.exists():
         return None
@@ -541,7 +568,7 @@ def _sweep_finds(now):
         if not path.exists():
             return None
         out = []
-        for r in _csv_rows(path):
+        for r in _csv_since(path, first.strftime("%Y-%m-%d %H:%M:%S")):
             t = _when(r.get("ts"))
             if t is not None and first <= t <= upto:
                 out.append(str(r.get(field) or "") if field else r)
@@ -550,13 +577,15 @@ def _sweep_finds(now):
     ids = in_run(ROOT / "mirror/customer_sweep.csv", "salla_customer_id") or []
     consent = in_run(ROOT / "mirror/consent_filled.csv")
     age = now - last
+    enabled = (True if cfg is None
+               else bool(getattr(cfg, "customer_sweep_enabled", False)))
     return {"ts": last, "days": sorted(day for day, _ in cur),
             "customers": sum(int(r.get("customers") or 0) for _, r in cur),
             "missing": sum(int(r.get("missing") or 0) for _, r in cur),
             "queued": sum(int(r.get("queued") or 0) for _, r in cur),
             "ids": [i for i in ids if i],
             "consent": len(consent) if consent is not None else None,
-            "stale": age > timedelta(hours=48), "age_days": age.days}
+            "stale": enabled and age > timedelta(hours=48), "age_days": age.days}
 
 
 def _consent_gap(now, days):
@@ -587,7 +616,7 @@ def _consent_coverage(now, cfg=None):
     written, yes, no = None, 0, 0
     if p.exists():
         since, written = now - timedelta(hours=24), 0
-        for r in _csv_rows(p):
+        for r in _csv_since(p, since.strftime("%Y-%m-%d %H:%M:%S")):
             t = _when(r.get("ts"))
             if t is None or not since <= t <= now:
                 continue
@@ -602,18 +631,42 @@ def _consent_coverage(now, cfg=None):
 
 
 def _capacity_fn():
-    """sheet_capacity.capacity(gio, cfg), wherever the module lives, or None."""
-    import importlib
-    for name in ("sheet_capacity", "tools.sheet_capacity"):
-        try:
-            fn = getattr(importlib.import_module(name), "capacity", None)
-        except ImportError as e:
-            log.debug("capacity module %s not importable: %s", name, e)
-            continue
-        if callable(fn):
-            return fn
-    log.info("workbook capacity module not present; line omitted")
-    return None
+    """tools.sheet_capacity.capacity(gio, cfg), or None. Only a missing
+    module (tools/sheet_capacity.py not deployed) is quiet; any other import
+    failure, such as a dependency the module needs or a module without
+    capacity(), logs a WARNING before the line is left out."""
+    try:
+        from tools.sheet_capacity import capacity
+    except ModuleNotFoundError as e:
+        if e.name not in _CAPACITY_MODULES:
+            log.warning("workbook capacity module failed to import: %s", e)
+            return None
+        log.info("workbook capacity module not present; line omitted")
+        return None
+    except ImportError as e:
+        log.warning("workbook capacity module failed to import: %s", e)
+        return None
+    if not callable(capacity):
+        log.warning("workbook capacity module has no callable capacity()")
+        return None
+    return capacity
+
+
+def _workbook_label(e, cfg):
+    """A short workbook name for the digest: "queue" and "audit" for the two
+    workbooks Config names (matched by spreadsheet id), else the module's own
+    label lowercased without a trailing " workbook" ("Queue workbook" ->
+    "queue"), so "<label> workbook" never says workbook twice."""
+    sid = str(e.get("spreadsheet_id") or "").strip()
+    if sid:
+        if sid == str(getattr(cfg, "queue_spreadsheet_id", "") or "").strip():
+            return "queue"
+        if sid == str(getattr(cfg, "spreadsheet_id", "") or "").strip():
+            return "audit"
+    label = " ".join(str(e.get("workbook") or "").lower().split())
+    if label == "workbook" or label.endswith(" workbook"):
+        label = label[:-len("workbook")].strip()
+    return label or sid or "unnamed"
 
 
 def _capacity(gio, cfg):
@@ -625,8 +678,7 @@ def _capacity(gio, cfg):
     for e in fn(gio, cfg) or []:
         cells = int(e.get("cells") or 0)
         pct = e.get("pct")
-        entries.append({"workbook": str(e.get("workbook") or e.get("spreadsheet_id")
-                                        or "workbook"),
+        entries.append({"workbook": _workbook_label(e, cfg),
                         "cells": cells,
                         "pct": (float(pct) if pct is not None
                                 else 100.0 * cells / CELL_CAP)})
@@ -636,32 +688,44 @@ def _capacity(gio, cfg):
             "alert_pct": float(getattr(cfg, "capacity_alert_pct", 80.0) or 80.0)}
 
 
+def _sheet_row(value):
+    """An audit mirror sheet_row as an int, or None when it is not a number."""
+    try:
+        return int(float(str(value or "").strip()))
+    except (ValueError, OverflowError):
+        return None
+
+
 def _audit_misses(now):
-    """Audit events in the last 24 hours that never got a sheet row: the
-    engine mirrors every audit write to mirror/audit_mirror.csv (LocalMirror)
-    with sheet_row -1 when the sheet append failed."""
+    """Orders from the last 24 hours that have no audit sheet row. The engine
+    mirrors every audit write to mirror/audit_mirror.csv (LocalMirror), with
+    sheet_row -1 when there is no row: a failed append, but also a dry run or
+    a run without Google. Counted per order id (an arrival's c0), and only
+    when no later arrival of the same order in the window got a real row: a
+    retry that landed heals the miss, an earlier row does not (a reprocess
+    whose append failed lost its status updates too). Queue and processing
+    updates carry no order id and reuse their arrival's row, so an update
+    with -1 is that same miss and is not counted twice."""
     p = ROOT / "mirror/audit_mirror.csv"
     if not p.exists():
         return None
-    with open(p, newline="", encoding="utf-8", errors="replace") as f:
-        head = next(csv.reader(f), [])
-    i_ts, i_ev, i_row = head.index("ts"), head.index("event"), head.index("sheet_row")
     since = (now - timedelta(hours=24)).strftime("%Y-%m-%d %H:%M:%S")
     until = now.strftime("%Y-%m-%d %H:%M:%S")
-    lines = _tail_since(p, since)
-    k = next((i for i, ln in enumerate(lines) if _TS_LINE.match(ln)), len(lines))
-    total, by = 0, {}
-    for row in csv.reader(lines[k:]):
-        if len(row) <= max(i_ts, i_ev, i_row):
+    missed, blank = {}, 0                 # order id -> None, in arrival order
+    for r in _csv_since(p, since):
+        if not since <= str(r.get("ts") or "")[:19] <= until:
             continue
-        if not since <= row[i_ts][:19] <= until:
+        if str(r.get("event") or "").strip() != "arrived_append":
             continue
-        if row[i_row].strip() not in ("-1", "-1.0"):
-            continue
-        total += 1
-        ev = row[i_ev].strip() or "unknown"
-        by[ev] = by.get(ev, 0) + 1
-    return {"total": total, "by_event": by}
+        oid, row = str(r.get("c0") or "").strip(), _sheet_row(r.get("sheet_row"))
+        if row == -1:
+            if oid:
+                missed[oid] = None
+            else:
+                blank += 1                # no id to heal it by: counted as is
+        elif row is not None and row > 0:
+            missed.pop(oid, None)         # a later real row heals the miss
+    return {"total": len(missed) + blank, "ids": list(missed)}
 
 
 def _ops_watch(start, end, now=None, engine=None):
@@ -679,7 +743,7 @@ def _ops_watch(start, end, now=None, engine=None):
         ops["capacity"] = _safe("workbook capacity", _capacity, gio, cfg)
     ops["customer_paths"] = _safe("customer payload paths", _customer_paths,
                                   start, end)
-    ops["sweep"] = _safe("customer sweep", _sweep_finds, now)
+    ops["sweep"] = _safe("customer sweep", _sweep_finds, now, cfg)
     ops["consent"] = _safe("consent coverage", _consent_coverage, now, cfg)
     ops["audit_misses"] = _safe("audit sheet misses", _audit_misses, now)
     return ops
@@ -706,11 +770,18 @@ def _queue_line(q):
 
 
 def _paths_line(p):
-    line = (f"• Customer payloads yesterday: {p['json']:,} JSON, "
-            f"{p['salvaged']:,} salvaged, {p['looked up']:,} looked up, "
-            f"{p['lookup_failed']:,} lookup failed")
+    if not p.get("recorded", True):
+        return ("• Customer payloads yesterday: not recorded (customer_sync.log "
+                "has no lines for the day)")
+    json_part = f"{p['json']:,} plain JSON"
+    if not p.get("json_marker", True):
+        json_part += " (inferred from contacts written, the log has no JSON marker)"
+    line = (f"• Customer payloads yesterday (distinct customers by how the row "
+            f"was read): {json_part}, {p['salvaged']:,} salvaged from the "
+            f"capture text, {p['looked up']:,} fetched from Salla, "
+            f"{p['lookup_failed']:,} gave up after Salla lookups failed")
     if p.get("held"):
-        line += f", {p['held']:,} held"
+        line += f", {p['held']:,} held with nothing to read"
     return line
 
 
@@ -742,10 +813,15 @@ def _consent_line(c):
 def _audit_line(m):
     if not m["total"]:
         return None                      # a quiet sheet needs no line
-    parts = ", ".join(f"{_AUDIT_EVENTS.get(ev, ev)} {c:,}" for ev, c in
-                      sorted(m["by_event"].items(), key=lambda kv: -kv[1]))
-    return (f"• Audit sheet: {m['total']:,} event(s) in the last 24h got no "
-            f"sheet row ({parts}). The local mirror has them.")
+    line = f"• Audit sheet: {m['total']:,} order(s) from the last 24h have no sheet row"
+    ids = m.get("ids") or []
+    if ids:
+        line += " (" + ", ".join(ids[:5])
+        if len(ids) > 5:
+            line += f" and {len(ids) - 5} more"
+        line += ")"
+    return (line + ". Dry runs and runs without Google count here too. "
+            "The local mirror has them.")
 
 
 def _capacity_line(cap):

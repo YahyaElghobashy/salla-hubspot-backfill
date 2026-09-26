@@ -3,13 +3,14 @@
 Customer and Status Queue states, customer payload paths from
 customer_sync.log (markers checked against the real CustomerSync code),
 sweep finds, consent coverage with its one HubSpot count, workbook capacity
-through either sheet_capacity location, and audit events that never got a
-sheet row. Every line is measured on its own: a failing one logs a WARNING
+from tools.sheet_capacity, and orders that got no audit sheet row. Every line is measured on its own: a failing one logs a WARNING
 and only that line is left out.
 
 Offline, against fakes. Run: python3 -m unittest test_digest_lines -v
 """
 import csv
+import importlib.abc
+import importlib.util
 import json
 import logging
 import os
@@ -23,6 +24,7 @@ from unittest import mock
 import backfill
 from backfill import RelayError
 import report_digest as rd
+import tools                             # the real package, imported before any chdir
 from test_realtime_ext import FakeGIO as SyncGIO, FakeHS, _cfg, _chdir_tmp
 
 NOW = datetime(2026, 9, 26, 9, 0, 0)
@@ -68,10 +70,28 @@ def capacity_module(name, entries=None, exc=None):
     return mod
 
 
-ENTRIES = [{"workbook": "queue", "spreadsheet_id": "QS", "cells": 6_100_000,
-            "pct": 61.0, "tabs": {}},
-           {"workbook": "audit", "spreadsheet_id": "AUDIT", "cells": 7_600_000,
-            "pct": 76.0, "tabs": {}}]
+# exactly what tools/sheet_capacity.capacity returns (its WORKBOOKS labels)
+ENTRIES = [{"workbook": "Queue workbook", "spreadsheet_id": "QS", "cells": 6_100_000,
+            "pct": 61.0, "tabs": []},
+           {"workbook": "Audit workbook", "spreadsheet_id": "AUDIT", "cells": 7_600_000,
+            "pct": 76.0, "tabs": []}]
+
+
+class BrokenCapacity(importlib.abc.MetaPathFinder, importlib.abc.Loader):
+    """tools.sheet_capacity is on disk but its own import raises `exc`."""
+
+    def __init__(self, exc):
+        self.exc = exc
+
+    def find_spec(self, name, path=None, target=None):
+        return (importlib.util.spec_from_loader(name, self)
+                if name == "tools.sheet_capacity" else None)
+
+    def create_module(self, spec):
+        return None
+
+    def exec_module(self, module):
+        raise self.exc
 
 
 class Base(unittest.TestCase):
@@ -81,9 +101,8 @@ class Base(unittest.TestCase):
                   mock.patch.dict(os.environ),
                   # never HubSpot from a test; tests that need a reply repatch
                   mock.patch.object(rd, "_hs_post", return_value=None),
-                  # no real sheet_capacity module (another change adds one)
-                  mock.patch.dict(sys.modules, {"sheet_capacity": None,
-                                                "tools.sheet_capacity": None})):
+                  # no real capacity module (another change adds one)
+                  mock.patch.dict(sys.modules, {"tools.sheet_capacity": None})):
             p.start()
             self.addCleanup(p.stop)
         os.environ.pop("HUBSPOT_ACCESS_TOKEN", None)
@@ -190,16 +209,64 @@ class _FixedTime(logging.Formatter):
         return "2026-09-25 10:00:00,000"
 
 
+# the same day once customer_sync logs "CUSTOMER payload json <cid>" [v2.12]
+LOG_MARKED = """\
+2026-09-24 23:59:58,001 INFO    [MainThread] CUSTOMER payload json 900
+2026-09-25 00:00:01,000 INFO    [MainThread] CUSTOMER payload json 101
+2026-09-25 00:00:01,001 INFO    [MainThread] CUSTOMER created 101 -> contact 5101
+2026-09-25 01:00:00,000 INFO    [MainThread] CUSTOMER payload json 102
+2026-09-25 01:00:00,001 INFO    [MainThread] CUSTOMER updated 102 -> contact 5102
+2026-09-25 01:30:00,000 INFO    [MainThread] CUSTOMER payload json 109
+2026-09-25 02:00:00,000 INFO    [MainThread] CUSTOMER payload salvaged 103
+2026-09-25 02:00:00,500 INFO    [MainThread] CUSTOMER created 103 -> contact 5103
+2026-09-25 03:00:00,000 INFO    [MainThread] CUSTOMER created 110 -> contact 5110
+2026-09-25 07:00:00,000 INFO    [MainThread] CUSTOMER payload json 101
+2026-09-26 00:00:01,000 INFO    [MainThread] CUSTOMER payload json 108
+"""
+
+
 class CustomerPaths(Base):
-    EXPECT = {"json": 2, "salvaged": 1, "looked up": 1, "lookup_failed": 2, "held": 1}
+    # LOG predates the json marker: JSON is inferred and the line says so
+    EXPECT = {"json": 2, "salvaged": 1, "looked up": 1, "lookup_failed": 2, "held": 1,
+              "recorded": True, "json_marker": False}
 
     def test_counts_distinct_customers_per_path_for_the_day(self):
         Path("customer_sync.log").write_text(LOG)
         p = self.ops()["customer_paths"]
         self.assertEqual(p, self.EXPECT)
         self.assertEqual(rd._paths_line(p),
-                         "• Customer payloads yesterday: 2 JSON, 1 salvaged, "
-                         "1 looked up, 2 lookup failed, 1 held")
+                         "• Customer payloads yesterday (distinct customers by how the "
+                         "row was read): 2 plain JSON (inferred from contacts written, "
+                         "the log has no JSON marker), 1 salvaged from the capture text, "
+                         "1 fetched from Salla, 2 gave up after Salla lookups failed, "
+                         "1 held with nothing to read")
+
+    def test_json_marker_is_counted_and_nothing_is_inferred(self):
+        """With a json marker in the window only markers count: 110 was
+        written with no marker and is not JSON; 109 (superseded, no write) is;
+        101 twice is one customer; 900 and 108 are other days."""
+        Path("customer_sync.log").write_text(LOG_MARKED)
+        p = self.ops()["customer_paths"]
+        self.assertEqual(p, {"json": 3, "salvaged": 1, "looked up": 0, "lookup_failed": 0,
+                             "held": 0, "recorded": True, "json_marker": True})
+        self.assertEqual(rd._paths_line(p),
+                         "• Customer payloads yesterday (distinct customers by how the "
+                         "row was read): 3 plain JSON, 1 salvaged from the capture text, "
+                         "0 fetched from Salla, 0 gave up after Salla lookups failed")
+
+    def test_no_line_in_the_window_is_not_recorded_never_zeros(self):
+        Path("customer_sync.log.1").write_text(LOG.splitlines(keepends=True)[0])
+        Path("customer_sync.log").write_text(
+            "  File \"customer_sync.py\", line 1, in <module>\n"
+            "2026-09-26 00:00:01,000 INFO    [MainThread] CUSTOMER payload json 108\n")
+        p = self.ops()["customer_paths"]
+        self.assertEqual(p, {"recorded": False})
+        line = rd._paths_line(p)
+        self.assertEqual(line, "• Customer payloads yesterday: not recorded "
+                               "(customer_sync.log has no lines for the day)")
+        self.assertNotIn("0", line)
+        Path("customer_sync.log").write_text("")             # rotated, still empty
+        self.assertEqual(self.ops()["customer_paths"], {"recorded": False})
 
     def test_small_blocks_and_rotated_log(self):
         lines = LOG.splitlines(keepends=True)
@@ -246,9 +313,12 @@ class CustomerPaths(Base):
             s.relay = None
             s.handle_row(crow(cid="504", note="garbage"))                    # held
         h.flush()
+        with open("customer_sync.log", encoding="utf-8") as f:
+            self.assertIn("CUSTOMER payload json 601", f.read())
         self.assertEqual(rd._customer_paths(DAY, DAY),
                          {"json": 1, "salvaged": 1, "looked up": 1,
-                          "lookup_failed": 1, "held": 1})
+                          "lookup_failed": 1, "held": 1,
+                          "recorded": True, "json_marker": True})
 
 
 # ----------------------------------------------------------------------------
@@ -292,11 +362,43 @@ class SweepFinds(Base):
         with open(self.tmp / "mirror/customer_sweep.csv", "a", newline="") as f:
             csv.writer(f).writerows([["2026-09-26 04:43:05", "2026-09-25", str(900 + i)]
                                      for i in range(4)])
-        s = self.ops(now=NOW + timedelta(days=3))["sweep"]
+        s = self.ops(cfg=_cfg(customer_sweep_enabled=True),
+                     now=NOW + timedelta(days=3))["sweep"]
         self.assertTrue(s["stale"])
         line = rd._sweep_line(s)
         self.assertIn("801, 802, 803, 900, 901 and 2 more.", line)
         self.assertIn("⚠️ no run for 3 days", line)
+
+    def test_sweep_switched_off_is_never_stale(self):
+        write_sweep(self.tmp)
+        later = NOW + timedelta(days=10)
+        s = self.ops(cfg=_cfg(customer_sweep_enabled=False), now=later)["sweep"]
+        self.assertFalse(s["stale"])
+        self.assertNotIn("⚠️", rd._sweep_line(s))
+        # no config at all: the state file shows it ran here, so the warning stays
+        self.assertTrue(rd._sweep_finds(later, None)["stale"])
+
+    def test_ledgers_are_read_from_the_window_only(self):
+        """consent_filled.csv and customer_sweep.csv go through _tail_since:
+        small blocks give the same answers, and the rows from long before the
+        window are not parsed (at most the few in the block that stops the
+        backwards read)."""
+        write_sweep(self.tmp)
+        full = self.ops()
+        for name, old in (("customer_sweep.csv", "2026-01-01 00:00:00,2025-12-31,1\n"),
+                          ("consent_filled.csv", "2026-01-01 00:00:00,c0,true\n")):
+            p = self.tmp / "mirror" / name
+            head, *rows = p.read_text().splitlines(keepends=True)
+            p.write_text(head + old * 50 + "".join(rows))
+        parsed, real = [], rd._when
+        with mock.patch.object(rd, "TAIL_BLOCK", 64), \
+                mock.patch.object(rd, "_when",
+                                  side_effect=lambda v: parsed.append(v) or real(v)):
+            small = self.ops()
+        self.assertEqual(small["sweep"], full["sweep"])
+        self.assertEqual(small["consent"], full["consent"])
+        old = sum(str(v).startswith("2026-01-01") for v in parsed)
+        self.assertLess(old, 15)                        # of 150 old row reads
 
     def test_never_ran_is_none_and_no_consent_ledger(self):
         self.assertIsNone(self.ops()["sweep"])
@@ -385,35 +487,76 @@ class ConsentCoverage(Base):
 # ----------------------------------------------------------------------------
 
 class Capacity(Base):
-    def test_top_level_module_and_format(self):
-        with mock.patch.dict(sys.modules, {"sheet_capacity": capacity_module(
-                "sheet_capacity", ENTRIES)}):
-            cap = self.ops()["capacity"]
+    def cap(self, entries=ENTRIES, **cfg_kw):
+        mod = capacity_module("tools.sheet_capacity", entries)
+        with mock.patch.dict(sys.modules, {"tools.sheet_capacity": mod}):
+            return self.ops(cfg=_cfg(**cfg_kw))["capacity"]
+
+    def test_module_labels_become_queue_and_audit(self):
+        """The module's own labels ("Queue workbook", "Audit workbook"): the
+        line and the verdict say "workbook" once."""
+        cap = self.cap()
+        self.assertEqual([e["workbook"] for e in cap["entries"]], ["queue", "audit"])
         self.assertEqual(rd._capacity_line(cap),
                          "• Workbooks: queue 6.1M of 10M cells (61%), audit 7.6M (76%)")
         self.assertEqual(rd._capacity_breaches({"ops": {"capacity": cap}}), [])
 
-    def test_tools_module_and_alert_above_threshold(self):
-        mod = capacity_module("tools.sheet_capacity", ENTRIES)
-        with mock.patch.dict(sys.modules, {"tools.sheet_capacity": mod}):
-            cap = self.ops(cfg=_cfg(capacity_alert_pct=70.0))["capacity"]
+    def test_alert_above_threshold_says_workbook_once(self):
+        cap = self.cap(capacity_alert_pct=70.0)
         self.assertEqual(rd._capacity_line(cap),
                          "• Workbooks: queue 6.1M of 10M cells (61%), audit 7.6M (76%) ⚠️")
+        breaches = rd._capacity_breaches({"ops": {"capacity": cap}})
+        self.assertEqual(breaches, ["audit workbook at 76% of its cell limit"])
+        self.assertEqual(breaches[0].count("workbook"), 1)
+
+    def test_label_fallback_when_the_id_is_not_configured(self):
+        cap = self.cap([
+            {"workbook": "Queue workbook", "spreadsheet_id": "OTHER-Q", "cells": 100_000,
+             "pct": 1.0, "tabs": []},
+            {"workbook": "Warranty  Workbook", "spreadsheet_id": "W1", "cells": 9_100_000,
+             "pct": 91.0, "tabs": []},
+            {"workbook": "", "spreadsheet_id": "S9", "cells": 0, "pct": 0.0, "tabs": []}])
+        self.assertEqual([e["workbook"] for e in cap["entries"]], ["queue", "warranty", "S9"])
         self.assertEqual(rd._capacity_breaches({"ops": {"capacity": cap}}),
-                         ["audit workbook at 76% of its cell limit"])
+                         ["warranty workbook at 91% of its cell limit"])
 
     def test_pct_missing_is_derived_from_cells(self):
-        mod = capacity_module("sheet_capacity", [{"workbook": "queue", "cells": 850_000}])
-        with mock.patch.dict(sys.modules, {"sheet_capacity": mod}):
-            cap = self.ops()["capacity"]
+        cap = self.cap([{"workbook": "Queue workbook", "cells": 850_000}])
         self.assertEqual(rd._capacity_line(cap), "• Workbooks: queue 850k of 10M cells (8%)")
 
-    def test_no_module_is_no_line(self):
-        self.assertIsNone(self.ops()["capacity"])
+    def test_no_module_is_no_line_and_no_warning(self):
+        with self.assertNoLogs("digest", "WARNING"):
+            self.assertIsNone(self.ops()["capacity"])
+        with mock.patch.dict(sys.modules), \
+                mock.patch.object(sys, "meta_path", [BrokenCapacity(ModuleNotFoundError(
+                    "No module named 'tools'", name="tools"))] + sys.meta_path):
+            sys.modules.pop("tools.sheet_capacity", None)
+            with self.assertNoLogs("digest", "WARNING"):
+                self.assertIsNone(self.ops()["capacity"])
+
+    def test_broken_module_warns(self):
+        """Present but not importable: a dependency it needs, or no capacity()."""
+        for exc in (ModuleNotFoundError("No module named 'googleapiclient'",
+                                        name="googleapiclient"),
+                    ImportError("cannot import name 'gexec' from 'backfill'",
+                                name="backfill")):
+            with self.subTest(exc=exc), mock.patch.dict(sys.modules), \
+                    mock.patch.object(sys, "meta_path",
+                                      [BrokenCapacity(exc)] + sys.meta_path):
+                sys.modules.pop("tools.sheet_capacity", None)
+                with self.assertLogs("digest", "WARNING") as cm:
+                    self.assertIsNone(self.ops()["capacity"])
+                self.assertTrue(any("failed to import" in m and str(exc) in m
+                                    for m in cm.output), cm.output)
+        no_fn = types.ModuleType("tools.sheet_capacity")
+        with mock.patch.dict(sys.modules, {"tools.sheet_capacity": no_fn}):
+            with self.assertLogs("digest", "WARNING") as cm:
+                self.assertIsNone(self.ops()["capacity"])
+        self.assertTrue(any("capacity" in m for m in cm.output))
 
     def test_failing_capacity_warns_and_omits(self):
-        mod = capacity_module("sheet_capacity", exc=RuntimeError("quota"))
-        with mock.patch.dict(sys.modules, {"sheet_capacity": mod}):
+        mod = capacity_module("tools.sheet_capacity", exc=RuntimeError("quota"))
+        with mock.patch.dict(sys.modules, {"tools.sheet_capacity": mod}):
             with self.assertLogs("digest", "WARNING") as cm:
                 ops = self.ops()
         self.assertIsNone(ops["capacity"])
@@ -421,36 +564,50 @@ class Capacity(Base):
 
 
 # ----------------------------------------------------------------------------
-# 6. Audit events with no sheet row
+# 6. Orders with no audit sheet row
 # ----------------------------------------------------------------------------
 
 class AuditMisses(Base):
-    def write(self):
+    def write(self, extra=()):
         m = backfill.LocalMirror(self.tmp / "mirror")
         for ts, ev, row, vals in (
                 ("2026-09-25 08:00:00", "arrived_append", -1, {0: "1"}),      # too old
                 ("2026-09-25 10:00:00", "arrived_append", -1, {0: "2"}),
                 ("2026-09-25 11:00:00", "arrived_append", 1234, {0: "3"}),    # has a row
-                ("2026-09-26 01:00:00", "processed_update", -1, {0: "4"}),
+                ("2026-09-25 12:00:00", "arrived_append", -1, {0: "7"}),      # a dry run,
+                ("2026-09-25 13:00:00", "arrived_append", 1300, {0: "7"}),    # then live
+                ("2026-09-25 14:00:00", "arrived_append", 1400, {0: "8"}),    # live, then a
+                ("2026-09-25 15:00:00", "arrived_append", -1, {0: "8"}),      # failed reprocess
+                ("2026-09-25 16:00:00", "arrived_append", -1, {0: "2"}),      # same order again
+                ("2026-09-26 01:00:00", "processed_update", -1, {11: "Order Approved"}),
                 ("2026-09-26 02:00:00", "arrived_append", -1,
                  {0: "5", 10: 'Serum, "Gold"\nEdition'}),
-                ("2026-09-26 09:30:00", "arrived_append", -1, {0: "6"})):     # after now
+                ("2026-09-26 09:30:00", "arrived_append", -1, {0: "6"}),      # after now
+                *extra):
             with mock.patch.object(backfill, "now_str", return_value=ts):
                 m.audit_event(ev, row, vals)
 
-    def test_counts_sheet_row_minus_one_in_last_24h(self):
+    def test_orders_with_no_row_and_no_later_real_row(self):
         self.write()
         a = self.ops()["audit_misses"]
-        self.assertEqual(a, {"total": 3, "by_event": {"arrived_append": 2,
-                                                      "processed_update": 1}})
+        self.assertEqual(a, {"total": 3, "ids": ["2", "8", "5"]})
         self.assertEqual(rd._audit_line(a),
-                         "• Audit sheet: 3 event(s) in the last 24h got no sheet row "
-                         "(arrivals 2, processing updates 1). The local mirror has them.")
+                         "• Audit sheet: 3 order(s) from the last 24h have no sheet row "
+                         "(2, 8, 5). Dry runs and runs without Google count here too. "
+                         "The local mirror has them.")
 
     def test_small_blocks_give_the_same_answer(self):
         self.write()
         with mock.patch.object(rd, "TAIL_BLOCK", 64):
-            self.assertEqual(self.ops()["audit_misses"]["total"], 3)
+            self.assertEqual(self.ops()["audit_misses"], {"total": 3, "ids": ["2", "8", "5"]})
+
+    def test_long_id_list_and_an_arrival_with_no_id(self):
+        self.write(extra=[("2026-09-26 03:00:00", "arrived_append", -1, {0: str(20 + i)})
+                          for i in range(4)]
+                   + [("2026-09-26 04:00:00", "arrived_append", -1, {9: "2"})])
+        a = self.ops()["audit_misses"]
+        self.assertEqual(a["total"], 8)
+        self.assertIn("(2, 8, 5, 20, 21 and 2 more)", rd._audit_line(a))
 
     def test_quiet_sheet_and_missing_mirror(self):
         self.assertIsNone(self.ops()["audit_misses"])
@@ -496,8 +653,8 @@ class Render(Base):
         Path("customer_sync.log").write_text(LOG)
         gio = QueueGIO({"Customer Queue": [qrow(2, "queued"), qrow(3, "held")],
                         "Status Queue": [qrow(2, "error")]})
-        with mock.patch.dict(sys.modules, {"sheet_capacity": capacity_module(
-                "sheet_capacity", ENTRIES)}), \
+        with mock.patch.dict(sys.modules, {"tools.sheet_capacity": capacity_module(
+                "tools.sheet_capacity", ENTRIES)}), \
                 mock.patch.object(rd, "_hs_post", return_value={"total": 12}):
             return self.ops(cfg=_cfg(capacity_alert_pct=alert_pct), gio=gio)
 
@@ -513,7 +670,9 @@ class Render(Base):
         self.assertEqual(len(block), 1)
         lines = block[0].split("\n")[1:]
         self.assertEqual([ln.split(":")[0] for ln in lines],
-                         ["• Customer Queue", "• Status Queue", "• Customer payloads yesterday",
+                         ["• Customer Queue", "• Status Queue",
+                          "• Customer payloads yesterday (distinct customers by how the "
+                          "row was read)",
                           "• Customer sweep (last run 26 Sep 04", "• Consent flags written in the last 24h"])
         v212 = "\n".join(lines + [rd._capacity_line(self.full_ops()["capacity"])])
         self.assertNotIn("—", v212)                     # no em dashes in new text

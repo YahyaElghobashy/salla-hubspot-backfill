@@ -249,8 +249,9 @@ class CustomerSync(RealtimeConsumer):
             log.error("CUSTOMER row %s (%s): %s -- held", row.get("row"), cid, why)
             self._held_alert(cid, why)
             return "held", why
-        if path != "json":
-            log.info("CUSTOMER payload %s %s", path, cid)
+        # [v2.12] every path logs its marker, "CUSTOMER payload json <cid>"
+        # included: the daily digest counts these lines per path
+        log.info("CUSTOMER payload %s %s", path, cid)
         tag = "" if path == "json" else f" ({path})"
         phone = row["reference_id"] or phone_of(c)
         mobile = str(c.get("mobile") or "")
