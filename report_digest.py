@@ -19,6 +19,12 @@ Three design rules that matter more than they look:
    Make credit outage. The day the platform is down is the day the report
    matters most.
 
+v2.12: the daily digest also reports the Customer and Status Queue states,
+how yesterday's customer payloads were read, the last customer sweep, consent
+coverage, workbook capacity and audit events that never got a sheet row. Each
+of those values is computed on its own: one that fails logs a WARNING and
+only its line is left out.
+
 Usage:
     python3 report_digest.py --period daily
     python3 report_digest.py --period weekly  --channel C0AQMMS4TRD
@@ -31,6 +37,7 @@ import csv
 import json
 import logging
 import os
+import re
 import sys
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -189,6 +196,9 @@ def aggregate(period):
         "live_held": _live_held() if period == "daily" else None,
         "gift_watch": _gift_watch() if period == "daily" else None,
         "reconcile": _reconcile_watch() if period == "daily" else None,
+        # [v2.12] realtime queues, customers, capacity, audit misses (daily)
+        "ops": (_safe("realtime lines", _ops_watch, start, end)
+                if period == "daily" else None),
         "backfill_stalled": stalled,
         "period": period, "start": start, "end": end, "label": label,
         "days_recorded": len(days), "days_expected": span,
@@ -314,6 +324,469 @@ def _reconcile_watch():
         return None
 
 
+# --------------------------------------------------------------------------
+# [v2.12] realtime queues, customer payload paths, sweep finds, consent
+# coverage, workbook capacity and audit-sheet misses (daily digest only).
+# _ops_watch computes each value on its own: one that fails logs a WARNING
+# and comes back None, its line is left out, and every other line renders.
+# A broken sensor costs one line, never the report.
+# --------------------------------------------------------------------------
+
+HS_BASE = "https://api.hubapi.com"
+CELL_CAP = 10_000_000              # Google's cell limit per workbook
+TAIL_BLOCK = 1 << 20               # backwards read step for append-only files
+CUSTOMER_LOGS = ("customer_sync.log.1", "customer_sync.log")  # rotated first
+
+_TS_B = re.compile(rb"(?m)^(\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2})")
+_TS_LINE = re.compile(r"^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}")
+
+# customer_sync.log markers (customer_sync.handle_row / read_payload, and the
+# realtime_base give-up line). A JSON payload logs no marker of its own: it is
+# counted from the "CUSTOMER created/updated" line of a customer that carries
+# no other marker that day (a superseded JSON row logs nothing at all). A
+# failed lookup reaches the log only when its row gives up; the retries before
+# that show as the Customer Queue's `error` count. An explicit
+# "CUSTOMER payload lookup_failed <id>" marker is counted if the sync logs one.
+_CUST_TS = r"^(\d{4}-\d{2}-\d{2}) \d{2}:\d{2}:\d{2}"
+_CUST_PATH = re.compile(_CUST_TS + r".*?\bCUSTOMER payload "
+                        r"(json|salvaged|looked up|lookup_failed) (\S+)")
+_CUST_WROTE = re.compile(_CUST_TS + r".*?\bCUSTOMER (?:created|updated) (\S+) -> contact")
+_CUST_HELD = re.compile(_CUST_TS + r".*?\bCUSTOMER row \S+ \(([^)]*)\): .* -- held")
+_CUST_GAVE_UP = re.compile(_CUST_TS + r".*?\bid (\w+)\b.*?payload unreadable; Salla "
+                           r"(?:lookup failed|returned no customer)")
+
+_AUDIT_EVENTS = {"arrived_append": "arrivals", "queued_update": "queue updates",
+                 "processed_update": "processing updates"}
+
+
+def _safe(label, fn, *args, **kw):
+    """Run one digest measurement; a failure logs a WARNING and returns None."""
+    try:
+        return fn(*args, **kw)
+    except Exception as e:
+        log.warning("digest line %s unavailable: %s", label, e)
+        return None
+
+
+def _render_safe(label, fn, value):
+    """Render one digest line; a failure logs a WARNING and returns None."""
+    if value is None:
+        return None
+    try:
+        return fn(value)
+    except Exception as e:
+        log.warning("digest line %s not rendered: %s", label, e)
+        return None
+
+
+def _when(value):
+    """A queue or ledger timestamp as a naive local datetime, or None.
+    Accepts "YYYY-MM-DD HH:MM:SS", the ISO "T" form, a bare date, and the
+    Sheets date serial UNFORMATTED_VALUE returns for a date-typed cell."""
+    s = str(value or "").strip()
+    if not s:
+        return None
+    try:
+        x = float(s)
+    except ValueError:
+        x = None
+    if x is not None:
+        # 20000..100000 days after 1899-12-30 is 1954..2173: a date serial
+        return (datetime(1899, 12, 30) + timedelta(days=x)
+                if 20000 < x < 100000 else None)
+    for fmt, k in (("%Y-%m-%d %H:%M:%S", 19), ("%Y-%m-%dT%H:%M:%S", 19),
+                   ("%Y-%m-%d", 10)):
+        try:
+            return datetime.strptime(s[:k], fmt)
+        except ValueError:
+            continue
+    return None
+
+
+def _tail_since(path, since, block=None):
+    """Lines of an append-only, time-ordered file (an engine log, a mirror
+    CSV) from `since` ("YYYY-MM-DD" or "YYYY-MM-DD HH:MM:SS") onward, read
+    backwards in blocks: customer_sync.log and audit_mirror.csv only grow,
+    and the digest needs their last day, not their whole history. Older
+    lines may come back too (callers filter by date); no newer line is lost.
+    The line cut by the first block edge is dropped."""
+    block = block or TAIL_BLOCK
+    want = since.encode()
+    with open(path, "rb") as f:
+        f.seek(0, os.SEEK_END)
+        pos, buf = f.tell(), b""
+        while pos > 0:
+            step = min(block, pos)
+            pos -= step
+            f.seek(pos)
+            buf = f.read(step) + buf
+            m = _TS_B.search(buf, buf.find(b"\n") + 1 if pos else 0)
+            if m and m.group(1).replace(b"T", b" ") < want:
+                break
+    lines = buf.decode("utf-8", errors="replace").split("\n")
+    if pos:
+        lines = lines[1:]
+    return [ln.rstrip("\r") for ln in lines if ln.strip()]
+
+
+def _csv_rows(path):
+    with open(path, newline="", encoding="utf-8", errors="replace") as f:
+        return list(csv.DictReader(f))
+
+
+def _hs_post(path, body, timeout=20):
+    """One HubSpot POST (a CRM search) with the private-app token from the
+    environment; the token travels in the header only. Returns the parsed
+    reply, or None when no token is set. Raises on transport or HTTP errors."""
+    import urllib.request
+    tok = (os.environ.get("HUBSPOT_ACCESS_TOKEN") or "").strip()
+    if not tok:
+        return None
+    req = urllib.request.Request(
+        HS_BASE + path, data=json.dumps(body).encode(),
+        headers={"Authorization": f"Bearer {tok}",
+                 "Content-Type": "application/json"}, method="POST")
+    return json.loads(urllib.request.urlopen(req, timeout=timeout).read())
+
+
+def _engine():
+    """(cfg, gio) for the queue and workbook lines, or (cfg|None, None)."""
+    cfg = gio = None
+    try:
+        from backfill import Config, GoogleIO
+        cfg = Config.load(os.environ.get("ENGINE_CONFIG", "config.json"))
+        gio = GoogleIO(cfg, enabled=True)
+    except Exception as e:
+        log.warning("digest: engine config or Google access unavailable; "
+                    "queue and workbook lines omitted: %s", e)
+    return cfg, gio
+
+
+def _queue_state(gio, cfg, tab, now):
+    """Rows of one realtime queue tab by state, and the age of the oldest
+    queued row (a blank state is queued, as the consumers read it)."""
+    rows = gio.queue_read_all(cfg.queue_spreadsheet_id, tab=tab) or []
+    counts, oldest = {}, None
+    for r in rows:
+        st = str(r.get("status") or "").strip().lower()
+        if not st and not str(r.get("order_id") or "").strip():
+            continue                                  # an empty sheet row
+        st = st or "queued"
+        counts[st] = counts.get(st, 0) + 1
+        if st == "queued":
+            t = _when(r.get("received_at"))
+            if t is not None and (oldest is None or t < oldest):
+                oldest = t
+    return {"tab": tab, "queued": counts.get("queued", 0),
+            "held": counts.get("held", 0), "error": counts.get("error", 0),
+            "deferred": counts.get("deferred", 0),
+            "oldest_queued_s": (max(0.0, (now - oldest).total_seconds())
+                                if oldest is not None else None)}
+
+
+def _customer_paths(start, end):
+    """How the day's customer rows were read, from customer_sync.log (and its
+    rotated .1): distinct customer ids per path. None when there is no log."""
+    files = [ROOT / p for p in CUSTOMER_LOGS if (ROOT / p).exists()]
+    if not files:
+        return None
+    seen = {k: set() for k in ("json", "salvaged", "looked up",
+                               "lookup_failed", "held")}
+    wrote = set()
+    for p in files:
+        for line in _tail_since(p, start):
+            if not start <= line[:10] <= end:
+                continue
+            m = _CUST_PATH.match(line)
+            if m:
+                seen[m.group(2)].add(m.group(3))
+                continue
+            m = _CUST_WROTE.match(line)
+            if m:
+                wrote.add(m.group(2))
+                continue
+            m = _CUST_HELD.match(line)
+            if m:
+                seen["held"].add(m.group(2))
+                continue
+            m = _CUST_GAVE_UP.match(line)
+            if m:
+                seen["lookup_failed"].add(m.group(2))
+    seen["json"] |= wrote - set().union(*seen.values())
+    return {k: len(v) for k, v in seen.items()}
+
+
+def _sweep_finds(now):
+    """The last customer sweep run (customer_sweep.py writes its state only
+    on a live run): days checked, customers, missing, queued, the queued ids
+    from mirror/customer_sweep.csv, and the flags the consent filler wrote in
+    the same run (mirror/consent_filled.csv). None when it never ran here."""
+    p = ROOT / "mirror/customer_sweep_state.json"
+    if not p.exists():
+        return None
+    runs = []
+    for day, rec in (json.loads(p.read_text()).get("swept") or {}).items():
+        t = _when((rec or {}).get("ts"))
+        if t is not None:
+            runs.append((t, day, rec))
+    if not runs:
+        return None
+    last = max(t for t, _, _ in runs)
+    # one run saves each day as it finishes, minutes apart; the service is
+    # capped at an hour, and the consent filler runs right after the days
+    first, upto = last - timedelta(hours=1), last + timedelta(hours=1)
+    cur = [(day, rec) for t, day, rec in runs if t >= first]
+
+    def in_run(path, field=None):
+        if not path.exists():
+            return None
+        out = []
+        for r in _csv_rows(path):
+            t = _when(r.get("ts"))
+            if t is not None and first <= t <= upto:
+                out.append(str(r.get(field) or "") if field else r)
+        return out
+
+    ids = in_run(ROOT / "mirror/customer_sweep.csv", "salla_customer_id") or []
+    consent = in_run(ROOT / "mirror/consent_filled.csv")
+    age = now - last
+    return {"ts": last, "days": sorted(day for day, _ in cur),
+            "customers": sum(int(r.get("customers") or 0) for _, r in cur),
+            "missing": sum(int(r.get("missing") or 0) for _, r in cur),
+            "queued": sum(int(r.get("queued") or 0) for _, r in cur),
+            "ids": [i for i in ids if i],
+            "consent": len(consent) if consent is not None else None,
+            "stale": age > timedelta(hours=48), "age_days": age.days}
+
+
+def _consent_gap(now, days):
+    """Contacts with a Salla id and no consent flag, created in the last
+    `days` days: one HubSpot search, total only (the digest already runs one
+    such count for the under-review watchdog). None when no token is set or
+    the search fails, never 0."""
+    since_ms = int((now - timedelta(days=days)).timestamp() * 1000)
+    body = {"filterGroups": [{"filters": [
+        {"propertyName": "salla_customer_id", "operator": "HAS_PROPERTY"},
+        {"propertyName": "salla_consent_status", "operator": "NOT_HAS_PROPERTY"},
+        {"propertyName": "createdate", "operator": "GTE", "value": str(since_ms)}]}],
+        "properties": ["salla_customer_id"], "limit": 1}
+    try:
+        d = _hs_post("/crm/v3/objects/contacts/search", body)
+        return None if d is None else int(d["total"])
+    except Exception as e:
+        log.warning("consent gap search unavailable: %s", e)
+        return None
+
+
+def _consent_coverage(now, cfg=None):
+    """Consent flags the filler wrote in the last 24 hours (with the yes/no
+    split, from mirror/consent_filled.csv) and the HubSpot gap it left.
+    `written` is None when the ledger does not exist yet."""
+    days = int(getattr(cfg, "consent_filler_days", 3) or 3)
+    p = ROOT / "mirror/consent_filled.csv"
+    written, yes, no = None, 0, 0
+    if p.exists():
+        since, written = now - timedelta(hours=24), 0
+        for r in _csv_rows(p):
+            t = _when(r.get("ts"))
+            if t is None or not since <= t <= now:
+                continue
+            written += 1
+            v = str(r.get("salla_consent_status") or "").strip().lower()
+            yes += v == "true"
+            no += v == "false"
+    gap = _consent_gap(now, days)
+    if written is None and gap is None:
+        return None
+    return {"written": written, "yes": yes, "no": no, "gap": gap, "days": days}
+
+
+def _capacity_fn():
+    """sheet_capacity.capacity(gio, cfg), wherever the module lives, or None."""
+    import importlib
+    for name in ("sheet_capacity", "tools.sheet_capacity"):
+        try:
+            fn = getattr(importlib.import_module(name), "capacity", None)
+        except ImportError as e:
+            log.debug("capacity module %s not importable: %s", name, e)
+            continue
+        if callable(fn):
+            return fn
+    log.info("workbook capacity module not present; line omitted")
+    return None
+
+
+def _capacity(gio, cfg):
+    """Cells used per workbook against Google's 10M cap, and the alert pct."""
+    fn = _capacity_fn()
+    if fn is None:
+        return None
+    entries = []
+    for e in fn(gio, cfg) or []:
+        cells = int(e.get("cells") or 0)
+        pct = e.get("pct")
+        entries.append({"workbook": str(e.get("workbook") or e.get("spreadsheet_id")
+                                        or "workbook"),
+                        "cells": cells,
+                        "pct": (float(pct) if pct is not None
+                                else 100.0 * cells / CELL_CAP)})
+    if not entries:
+        return None
+    return {"entries": entries,
+            "alert_pct": float(getattr(cfg, "capacity_alert_pct", 80.0) or 80.0)}
+
+
+def _audit_misses(now):
+    """Audit events in the last 24 hours that never got a sheet row: the
+    engine mirrors every audit write to mirror/audit_mirror.csv (LocalMirror)
+    with sheet_row -1 when the sheet append failed."""
+    p = ROOT / "mirror/audit_mirror.csv"
+    if not p.exists():
+        return None
+    with open(p, newline="", encoding="utf-8", errors="replace") as f:
+        head = next(csv.reader(f), [])
+    i_ts, i_ev, i_row = head.index("ts"), head.index("event"), head.index("sheet_row")
+    since = (now - timedelta(hours=24)).strftime("%Y-%m-%d %H:%M:%S")
+    until = now.strftime("%Y-%m-%d %H:%M:%S")
+    lines = _tail_since(p, since)
+    k = next((i for i, ln in enumerate(lines) if _TS_LINE.match(ln)), len(lines))
+    total, by = 0, {}
+    for row in csv.reader(lines[k:]):
+        if len(row) <= max(i_ts, i_ev, i_row):
+            continue
+        if not since <= row[i_ts][:19] <= until:
+            continue
+        if row[i_row].strip() not in ("-1", "-1.0"):
+            continue
+        total += 1
+        ev = row[i_ev].strip() or "unknown"
+        by[ev] = by.get(ev, 0) + 1
+    return {"total": total, "by_event": by}
+
+
+def _ops_watch(start, end, now=None, engine=None):
+    """[v2.12] Every v2.12 digest value, each measured on its own."""
+    now = now or datetime.now()
+    cfg, gio = engine if engine is not None else _engine()
+    ops = {"customer_queue": None, "status_queue": None, "capacity": None}
+    if cfg is not None and gio is not None:
+        ops["customer_queue"] = _safe(
+            "Customer Queue", _queue_state, gio, cfg,
+            getattr(cfg, "customer_queue_tab", "Customer Queue"), now)
+        ops["status_queue"] = _safe(
+            "Status Queue", _queue_state, gio, cfg,
+            getattr(cfg, "status_queue_tab", "Status Queue"), now)
+        ops["capacity"] = _safe("workbook capacity", _capacity, gio, cfg)
+    ops["customer_paths"] = _safe("customer payload paths", _customer_paths,
+                                  start, end)
+    ops["sweep"] = _safe("customer sweep", _sweep_finds, now)
+    ops["consent"] = _safe("consent coverage", _consent_coverage, now, cfg)
+    ops["audit_misses"] = _safe("audit sheet misses", _audit_misses, now)
+    return ops
+
+
+# ---- [v2.12] line renderers (plain text, no em dashes) --------------------
+
+def _cells(c):
+    if c >= 1_000_000:
+        return f"{c / 1_000_000:.1f}".rstrip("0").rstrip(".") + "M"
+    if c >= 1000:
+        return f"{c / 1000:.0f}k"
+    return f"{c:,}"
+
+
+def _queue_line(q):
+    line = f"• {q['tab']}: {q['queued']:,} queued"
+    if q["queued"]:
+        line += f" (oldest {dur(q['oldest_queued_s'])})"
+    line += f", {q['held']:,} held, {q['error']:,} error"
+    if q.get("deferred"):
+        line += f", {q['deferred']:,} deferred"
+    return line
+
+
+def _paths_line(p):
+    line = (f"• Customer payloads yesterday: {p['json']:,} JSON, "
+            f"{p['salvaged']:,} salvaged, {p['looked up']:,} looked up, "
+            f"{p['lookup_failed']:,} lookup failed")
+    if p.get("held"):
+        line += f", {p['held']:,} held"
+    return line
+
+
+def _sweep_line(s):
+    line = (f"• Customer sweep (last run {s['ts'].strftime('%-d %b %H:%M')}): "
+            f"{len(s['days'])} day(s), {s['customers']:,} customers checked, "
+            f"{s['missing']:,} missing, {s['queued']:,} queued")
+    if s["ids"]:
+        line += ": " + ", ".join(s["ids"][:5])
+        if len(s["ids"]) > 5:
+            line += f" and {len(s['ids']) - 5} more"
+    line += "."
+    if s["consent"] is not None:
+        line += f" Consent filler wrote {s['consent']:,} flag(s)."
+    if s["stale"]:
+        line += f"  ⚠️ no run for {s['age_days']} days, check the timer"
+    return line
+
+
+def _consent_line(c):
+    w = c["written"]
+    line = f"• Consent flags written in the last 24h: {n(w)}"
+    if w:
+        line += f" ({c['yes']:,} opted in, {c['no']:,} opted out)"
+    return (line + f". Contacts created in the last {c['days']} days with no "
+            f"flag: {n(c['gap'])}.")
+
+
+def _audit_line(m):
+    if not m["total"]:
+        return None                      # a quiet sheet needs no line
+    parts = ", ".join(f"{_AUDIT_EVENTS.get(ev, ev)} {c:,}" for ev, c in
+                      sorted(m["by_event"].items(), key=lambda kv: -kv[1]))
+    return (f"• Audit sheet: {m['total']:,} event(s) in the last 24h got no "
+            f"sheet row ({parts}). The local mirror has them.")
+
+
+def _capacity_line(cap):
+    parts = []
+    for i, e in enumerate(cap["entries"]):
+        s = f"{e['workbook']} {_cells(e['cells'])}"
+        if i == 0:
+            s += f" of {_cells(CELL_CAP)} cells"
+        s += f" ({e['pct']:.0f}%)"
+        if e["pct"] > cap["alert_pct"]:
+            s += " ⚠️"
+        parts.append(s)
+    return "• Workbooks: " + ", ".join(parts) if parts else None
+
+
+def _capacity_breaches(a):
+    """Verdict entries for workbooks above capacity_alert_pct."""
+    try:
+        cap = (a.get("ops") or {}).get("capacity") or {}
+        return [f"{e['workbook']} workbook at {e['pct']:.0f}% of its cell limit"
+                for e in cap.get("entries") or [] if e["pct"] > cap["alert_pct"]]
+    except Exception as e:
+        log.warning("capacity verdict unavailable: %s", e)
+        return []
+
+
+def _ops_lines(ops):
+    """Thread lines for the customers and realtime queues reply."""
+    out = []
+    for label, fn, key in (("Customer Queue", _queue_line, "customer_queue"),
+                           ("Status Queue", _queue_line, "status_queue"),
+                           ("customer payload paths", _paths_line, "customer_paths"),
+                           ("customer sweep", _sweep_line, "sweep"),
+                           ("consent coverage", _consent_line, "consent"),
+                           ("audit sheet misses", _audit_line, "audit_misses")):
+        line = _render_safe(label, fn, (ops or {}).get(key))
+        if line:
+            out.append(line)
+    return out
+
+
 def _verdict(a):
     """One honest sentence up top. Reads the actual numbers, not a fixed string."""
     bad = []
@@ -332,6 +805,7 @@ def _verdict(a):
     if (a.get("reconcile") or {}).get("stale"):
         bad.append("the weekly reconciliation has not run for "
                    f"{a['reconcile']['age_days']} days")
+    bad += _capacity_breaches(a)                       # [v2.12]
     if not a["created"]:
         return "No sync activity recorded in this period."
     if not bad:
@@ -447,6 +921,11 @@ def render(a):
             line += "  ⚠️ unchanged since the previous report"
         head.append(line)
     head += _credit_lines(a)
+    # [v2.12] workbook capacity: the one v2.12 value that can need a decision
+    cap = _render_safe("workbook capacity", _capacity_line,
+                       (a.get("ops") or {}).get("capacity"))
+    if cap:
+        head.append(cap)
     if a["errors_unrecovered"] is not None:
         head.append(f"• Errors: {n(a['errors_unrecovered'])} unrecovered")
 
@@ -468,13 +947,9 @@ def _stuck_in_review(hours=48):
     """
     try:
         from backfill import Config
-        import urllib.request
         stage = (Config.load("config.json").status_stage_map or {}).get(
             "under_review")
         if not stage:
-            return None
-        tok = (os.environ.get("HUBSPOT_ACCESS_TOKEN") or "").strip()
-        if not tok:
             return None
         cutoff = int((datetime.now().timestamp() - hours * 3600) * 1000)
         body = {"filterGroups": [{"filters": [
@@ -483,12 +958,10 @@ def _stuck_in_review(hours=48):
             {"propertyName": "hs_lastmodifieddate", "operator": "LT",
              "value": str(cutoff)}]}],
             "properties": ["salla_order_id"], "limit": 10}
-        req = urllib.request.Request(
-            "https://api.hubapi.com/crm/v3/objects/orders/search",
-            data=json.dumps(body).encode(),
-            headers={"Authorization": f"Bearer {tok}",
-                     "Content-Type": "application/json"}, method="POST")
-        d = json.loads(urllib.request.urlopen(req, timeout=20).read())
+        # [v2.12] shared with the consent gap count; None when no token
+        d = _hs_post("/crm/v3/objects/orders/search", body)
+        if d is None:
+            return None
         total = int(d.get("total", 0))
         ids = [r["properties"].get("salla_order_id", "?")
                for r in d.get("results", [])[:5]]
@@ -567,6 +1040,11 @@ def _threads(a):
                      f"decisions, not sync failures: the orders sit safely in "
                      f"the queue and sync themselves once the products go live.")
         out.append("\n".join(t))
+
+    # --- [v2.12] customers and realtime queues ---------------------------
+    lines = _ops_lines(a.get("ops"))
+    if lines:
+        out.append("\n".join(["*Customers and realtime queues*"] + lines))
 
     # --- credits ---------------------------------------------------------
     c = q.get("credits") or {}
