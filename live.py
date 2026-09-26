@@ -45,6 +45,7 @@ from pathlib import Path
 import backfill
 from backfill import (Config, Cursor, Engine, GoogleIO, HubSpot, LocalMirror,
                       RelayClient, RelayError, dig, now_str, install_dns_cache)
+from realtime_base import trim_lock
 
 log = logging.getLogger("backfill")  # share the engine's logger/format
 
@@ -471,12 +472,26 @@ class LiveEngine(Engine):
     # -- trim -------------------------------------------------------------------
 
     def _maybe_trim(self, rows):
+        """Daily trim of the Live Queue. This engine is the only deleter of
+        its tab.
+
+        [v2.12] The cursor is reset to row 2 BEFORE the delete and again in
+        `finally`, the same order realtime_base.RealtimeConsumer._maybe_trim
+        uses. Rows move up when rows above them are deleted; before v2.12 the
+        reset came after the delete, so a crash (or a poll) in between read
+        from a row number that now pointed past rows that had moved up. The
+        trim lock is held for the delete so tools that hold row numbers
+        refuse to run meanwhile. A dry run never trims, and a failed trim is
+        logged and not retried until the next day (as in realtime_base)."""
+        if not self.live:
+            return
         today = datetime.now().date()
         if (datetime.now().hour != self.cfg.live_trim_hour
                 or self._last_trim_day == today):
             return
         if any(r["status"] == "queued" for r in rows):
             return  # only trim a fully drained queue
+        self._last_trim_day = today
         cutoff = (datetime.now() - timedelta(days=self.cfg.live_trim_days))
         def keep(r):
             try:
@@ -484,10 +499,17 @@ class LiveEngine(Engine):
                                          "%Y-%m-%d %H:%M:%S") >= cutoff
             except ValueError:
                 return True  # unparseable -> keep, never guess-delete
-        n = self.gio.queue_trim(self.qsid, keep)
-        self._last_trim_day = today
         self._start_row = 2
         self._save_state()
+        n = 0
+        try:
+            with trim_lock(self.cfg.live_queue_tab):
+                n = self.gio.queue_trim(self.qsid, keep)
+        except Exception as e:
+            log.exception("TRIM failed (nothing further deleted): %s", e)
+        finally:
+            self._start_row = 2
+            self._save_state()
         if n:
             log.info("TRIM removed %d terminal row(s) older than %d days",
                      n, self.cfg.live_trim_days)
