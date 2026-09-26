@@ -42,5 +42,16 @@ class TestZidProps(unittest.TestCase):
         self.assertEqual(p["hs_total_price"], "260")
 
 
+class TestCorpusRepair(unittest.TestCase):
+    def test_total_rebuilt_or_refused(self):
+        o = {"amounts": {"total": {"amount": "SAR"}, "sub_total": {"amount": "300"},
+                         "shipping_cost": {"amount": "25", "currency": "مجفف"}}}
+        self.assertTrue(zu.repair_corpus_row(o))
+        self.assertEqual(o["amounts"]["total"]["amount"], 325.0)
+        self.assertEqual(o["amounts"]["shipping_cost"]["currency"], "SAR")
+        bad = {"amounts": {"total": {"amount": "SAR"}, "sub_total": {"amount": "x"}, "shipping_cost": {}}}
+        self.assertFalse(zu.repair_corpus_row(bad))
+
+
 if __name__ == "__main__":
     unittest.main()

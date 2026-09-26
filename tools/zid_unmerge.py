@@ -83,9 +83,35 @@ def corpus(ids, pattern="mirror/zed/20*.jsonl.gz"):
     return found
 
 
+def _num(v):
+    try:
+        return float(str(v))
+    except (TypeError, ValueError):
+        return None
+
+
+def repair_corpus_row(o):
+    """The two corpus defects zed_create_missing.py repaired: a shipping
+    currency holding a product name (forced to SAR, the store's only
+    currency) and a total holding a currency code (rebuilt as sub_total +
+    shipping). Returns False when the total cannot be rebuilt honestly."""
+    cur = str(dig(o, "amounts.shipping_cost.currency") or "")
+    if not (len(cur) == 3 and cur.isascii() and cur.isalpha()):
+        o.setdefault("amounts", {}).setdefault("shipping_cost", {})["currency"] = "SAR"
+    if _num(dig(o, "amounts.total.amount")) is None:
+        sub = _num(dig(o, "amounts.sub_total.amount"))
+        ship = _num(dig(o, "amounts.shipping_cost.amount")) or 0.0
+        if not sub or sub <= 0:
+            return False
+        o["amounts"]["total"] = {"amount": round(sub + ship, 2)}
+    return True
+
+
 def zid_props(hs, o, tz):
     """The property set the engine's create path would send for this order,
     captured without writing, then labelled and keyed as an imported order."""
+    if not repair_corpus_row(o):
+        raise ValueError("total and sub_total both unreadable in the corpus")
     captured = {}
 
     class Capture(HubSpot):
@@ -137,7 +163,7 @@ def plan(hs, cfg, s, o):
     wz = []
     if wids:
         st, wb = hs._req("POST", f"/crm/v3/objects/{WARRANTY}/batch/read",
-                         {"properties": ["warranty_key", "hs_pipeline_stage", "origin"],
+                         {"properties": ["warranty_key", "hs_pipeline_stage", "origin", "warranty_months_snapshot"],
                           "inputs": [{"id": x} for x in wids]}, what="unmerge W read")
         for w in (wb or {}).get("results") or []:
             key = str(dig(w, "properties.warranty_key") or "")
@@ -146,10 +172,21 @@ def plan(hs, cfg, s, o):
                 order_day = str(dig(o, "date.date") or "")[:10]
                 in_scope = bool(order_day) and date.fromisoformat(order_day) >= zr.BACKFILL_CUTOFF
                 props = {"warranty_key": ":".join([zr.zid_key(n)] + parts[1:])}
-                if not in_scope:
+                months = dig(w, "properties.warranty_months_snapshot")
+                delivered = str(dig(o, "status.slug") or "").lower() in ("delivered", "completed")
+                if not in_scope or not delivered:
                     props.update({"hs_pipeline_stage": zr.W_STAGE["voided"], "void_reason": zr.VOID_OPTION["value"]})
+                    action = "void"
+                elif str(dig(w, "properties.origin") or "") == "live_engine" and months:
+                    # minted from the SALLA order's delivery: date it from the Zid order
+                    end = zr.add_months(order_day, float(months))
+                    props.update({"warranty_start_date": order_day, "warranty_end_date": end,
+                                  "hs_pipeline_stage": zr.warranty_stage(end)})
+                    action = "redate"
+                else:
+                    action = "rekey"
                 wz.append({"id": str(w["id"]), "key": key, "stage": dig(w, "properties.hs_pipeline_stage"),
-                           "props": props, "action": "rekey" if in_scope else "void"})
+                           "props": props, "action": action})
     return {"salla_hs": sid, "n": n, "zid_items": zitems, "warranties": wz,
             "props": zid_props(hs, o, cfg.salla_timezone_default), "contact": contact_by_phone(hs, o)}
 
