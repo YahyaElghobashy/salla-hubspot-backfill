@@ -264,35 +264,20 @@ def batch_update_flags(hs, pairs):
 
 
 def fill_recent(cfg, relay, hs, live):
+    """[v2.12] The last `consent_filler_days` days from the Salla day lists:
+    one relay call per 60 customers instead of one per contact. The
+    per-contact lookups cost about 4,000 Make operations a day at the 1,000
+    cap (measured 25 Sep); the day lists cost about 360 for the same days.
+    Today is included, so a customer created since midnight is filled today
+    or on the next run."""
     days = int(getattr(cfg, "consent_filler_days", 3))
-    cap = int(getattr(cfg, "consent_filler_cap", 400))
-    since = int((datetime.now() - timedelta(days=days)).timestamp() * 1000)
-    todo = contacts_without_flag(hs, since, cap)
-    pairs, unknown, cache = [], 0, {}
-    for contact_id, sid in todo:
-        # salla_customer_id is not unique in HubSpot: duplicates of one
-        # customer share it, so each Salla id is looked up once per run
-        if sid not in cache:
-            try:
-                env = relay.get_path(f"customers/{sid}?{API_FIELDS}")
-                data = env.get("data") if env.get("status") == 200 else None
-                cache[sid] = flag_text((data or {}).get("is_notifications_enabled"))
-            except Exception as e:
-                log.warning("consent lookup %s failed: %s", sid, e)
-                cache[sid] = None
-        v = cache[sid]
-        if v is None:
-            unknown += 1
-            continue
-        pairs.append((contact_id, v))
-    written = batch_update_flags(hs, pairs) if (pairs and live) else 0
-    if live and written:
-        append_csv(CONSENT_LEDGER, ["ts", "contact_id", "salla_consent_status"],
-                   [[now_str(), c, v] for c, v in pairs])
-    log.info("CONSENT recent: %d contacts without the flag (last %d days), %d resolved, "
-             "%d unknown, %d written%s", len(todo), days, len(pairs), unknown, written,
-             "" if live else " (dry run)")
-    return {"checked": len(todo), "resolved": len(pairs), "unknown": unknown, "written": written}
+    today = datetime.now().date()
+    out = fill_history(cfg, relay, hs, today - timedelta(days=days), today, live)
+    log.info("CONSENT recent: %d Salla flags read over %d days in %d relay calls, %d contacts "
+             "without the flag, %d written%s", out["flags"], days + 1, out["relay_calls"],
+             out["contacts"], out["written"], "" if live else " (dry run)")
+    return {"checked": out["flags"], "resolved": out["contacts"], "unknown": 0,
+            "written": out["written"], **out}
 
 
 def fill_history(cfg, relay, hs, first, last, live):

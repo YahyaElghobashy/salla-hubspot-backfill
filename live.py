@@ -279,7 +279,10 @@ class LiveEngine(Engine):
             return None  # go to create path; the duplicate-400 guardrail covers dupes
         if zid and not hs_id:
             # [v2.12] a Zid-import order holds this number: never verify,
-            # top up or ledger it as this order; park the row (terminal)
+            # top up or ledger it as this order. Move that record off the
+            # number and create the order; park the row when that fails.
+            if self.zid_auto_rekey(oid, zid):
+                return None
             return ("held", self.zid_collision(oid, zid))
         if not hs_id:
             return None

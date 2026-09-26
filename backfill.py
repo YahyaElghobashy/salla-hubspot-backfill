@@ -730,6 +730,10 @@ class Config:
     dlq_min_age_minutes: int = 45
     # Workbook capacity guard (Google caps a workbook at 10,000,000 cells).
     capacity_alert_pct: float = 80.0
+    # [v2.12] when a Zid-import order holds a new Salla order's number, move
+    # that record to Z<number> (zid_rekey.py) and create the Salla order,
+    # instead of parking the row. Dry runs never re-key.
+    zid_auto_rekey: bool = True
     # ---- v2.12 audit append hardening (GoogleIO.audit_append) -----------
     # A Sheets 500/502/timeout on the arrival append used to fire the fallback
     # append at once, into the same outage (13 times; 2 rows lost). The
@@ -2738,6 +2742,35 @@ class Engine:
             tl = self.__dict__.setdefault("_sig_tl", threading.local())
         tl.value = value
 
+    def _create_order_freeing_zid(self, order, customer_id):
+        """[v2.12] create_order; when a Zid-import order holds the number and
+        Config.zid_auto_rekey is on, move that record to Z<n> first and try
+        once more. A dry run never re-keys: it parks, as before."""
+        try:
+            return self.hs.create_order(order, customer_id, self.cfg.salla_timezone_default)
+        except ZidCollision as zc:
+            if not self.zid_auto_rekey(str(order.get("id")), zc.zid_hs_id):
+                raise
+            return self.hs.create_order(order, customer_id, self.cfg.salla_timezone_default)
+
+    def zid_auto_rekey(self, oid, zid_hs_id):
+        """[v2.12] Move the Zid order holding `oid` to Z<oid>. True when the
+        number is free afterwards; False (and the caller parks) in a dry run,
+        when the switch is off, or when the move failed."""
+        if not (self.live and getattr(self.cfg, "zid_auto_rekey", True)):
+            log.warning("ZID COLLISION on salla %s (Zid HS %s): auto re-key %s", oid,
+                        zid_hs_id, "is off" if self.live else "skipped in dry run")
+            return False
+        try:
+            import zid_rekey
+            base = getattr(self.mirror, "dir", None)
+            zid_rekey.ZidRekey(self.hs, mirror_dir=str(base if isinstance(base, (str, Path)) else "mirror"),
+                               live=True).rekey(zid_hs_id, oid)
+            return True
+        except Exception as e:
+            log.error("ZID COLLISION on salla %s: re-key of Zid HS %s failed: %s", oid, zid_hs_id, e)
+            return False
+
     def zid_collision(self, oid, zid_hs_id):
         """[v2.12] Record a Salla order whose id is held by a Zid-import
         order and return the queue note. Callers park the row as terminal
@@ -2837,8 +2870,7 @@ class Engine:
         self._order_signals = set()
         # [M2] order create
         try:
-            order_id, was_fresh = self.hs.create_order(
-                order, customer_id, self.cfg.salla_timezone_default)
+            order_id, was_fresh = self._create_order_freeing_zid(order, customer_id)
         except ZidCollision as zc:
             self._outcome[oid] = ("held", self.zid_collision(oid, zc.zid_hs_id))
             return

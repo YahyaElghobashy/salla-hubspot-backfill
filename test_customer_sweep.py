@@ -7,6 +7,7 @@ import csv
 import json
 import re
 import unittest
+from datetime import datetime
 from pathlib import Path
 from unittest import mock
 
@@ -121,25 +122,45 @@ class TestSweep(unittest.TestCase):
         self.assertFalse(Path("mirror/customer_sweep_state.json").exists())
 
 
+class DayRelay(FakeRelay):
+    """Pages only for the day they were built for; other days are empty."""
+
+    def __init__(self, day, pages):
+        super().__init__(pages=pages)
+        self.day = day
+
+    def get_path(self, path):
+        if path.startswith("customers?") and f"date_from={self.day}" not in path:
+            self.paths.append(path)
+            return {"status": 200, "data": [], "pagination": {"total": 0, "totalPages": 1}}
+        return super().get_path(path)
+
+
 class TestConsentFiller(unittest.TestCase):
-    def test_fills_known_flags_only(self):
+    """[v2.12] the daily filler reads the day lists, not one customer at a time."""
+
+    def setUp(self):
         _chdir_tmp(self)
-        relay = FakeRelay(singles={"51": {"id": 51, "is_notifications_enabled": True},
-                                   "52": {"id": 52, "is_notifications_enabled": False},
-                                   "53": {"id": 53}})
-        hs = FakeHS(no_flag=[("A", "51"), ("B", "52"), ("C", "53")])
-        out = sw.fill_recent(_cfg(), relay, hs, live=True)
-        self.assertEqual((out["resolved"], out["unknown"], out["written"]), (2, 1, 2))
+        self.day = datetime.now().date().isoformat()
+        c53 = cust(53, day=self.day)
+        c53["is_notifications_enabled"] = None
+        self.relay = DayRelay(self.day, pages=[[cust(51, day=self.day, flag=True),
+                                                cust(52, day=self.day, flag=False), c53]])
+
+    def test_fills_known_flags_from_the_day_lists(self):
+        hs = FakeHS(existing={"51", "52", "53"})
+        out = sw.fill_recent(_cfg(), self.relay, hs, live=True)
+        self.assertEqual((out["resolved"], out["written"]), (2, 2))
         inputs = hs.writes[0][2]["inputs"]
         self.assertEqual({(i["id"], i["properties"]["salla_consent_status"]) for i in inputs},
-                         {("A", "true"), ("B", "false")})
-        self.assertIn("fields[]=is_notifications_enabled", relay.paths[0])
+                         {("C51", "true"), ("C52", "false")})
+        self.assertTrue(all(p.startswith("customers?date_from=") for p in self.relay.paths))
+        self.assertFalse(any("customers/" in p for p in self.relay.paths))   # no per-contact lookups
+        self.assertEqual(len(self.relay.paths), 4)                           # one page per day, 4 days
 
     def test_dry_run_writes_nothing(self):
-        _chdir_tmp(self)
-        relay = FakeRelay(singles={"51": {"id": 51, "is_notifications_enabled": True}})
-        hs = FakeHS(no_flag=[("A", "51")])
-        out = sw.fill_recent(_cfg(), relay, hs, live=False)
+        hs = FakeHS(existing={"51"})
+        out = sw.fill_recent(_cfg(), self.relay, hs, live=False)
         self.assertEqual((out["resolved"], out["written"]), (1, 0))
         self.assertEqual(hs.writes, [])
 

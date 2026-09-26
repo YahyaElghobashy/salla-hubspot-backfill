@@ -384,8 +384,11 @@ class QueueDrainEngine(Engine):
             log.error("pre-existing search failed for %s: %s", oid, e)
             return None  # create path's duplicate-400 guardrail covers it
         if zid and not hs_id:
-            # [v2.12] held by a Zid-import order: park it; the full attempt
-            # budget is spent so hourly passes stop re-claiming the row
+            # [v2.12] held by a Zid-import order: move it off the number and
+            # create; otherwise park with the full attempt budget spent so
+            # hourly passes stop re-claiming the row
+            if self.zid_auto_rekey(oid, zid):
+                return None
             return ("Error", self.zid_collision(oid, zid),
                     self.cfg.live_max_attempts)
         if not hs_id:

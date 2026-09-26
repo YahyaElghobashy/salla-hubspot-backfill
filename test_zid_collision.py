@@ -125,6 +125,7 @@ class FakeEngine(backfill.Engine):
         _ = live_mode
         self.cfg = backfill.Config()
         self.cfg.alerts_enabled = True
+        self.live = live_mode
         self.hs = types.SimpleNamespace(live=live_mode)
         self.mirror = types.SimpleNamespace(dir=Path("mirror"), error=mock.Mock())
         self._outcome, self.stats = {}, {}
@@ -137,11 +138,13 @@ class TestPark(unittest.TestCase):
 
     def test_finish_create_parks_and_alerts_once(self):
         e = FakeEngine()
+        e.cfg.zid_auto_rekey = False
         e.hs.create_order = mock.Mock(side_effect=backfill.ZidCollision("4938528", "Z1"))
         e.top_up_items = mock.Mock()
         with mock.patch("notify.send_alert", create=True) as alert:
             e._finish_create(ORDER, -1, None, 1)
             e2 = FakeEngine()
+            e2.cfg.zid_auto_rekey = False
             e2.hs.create_order = e.hs.create_order
             e2._finish_create(ORDER, -1, None, 1)
         state, note = e._outcome["4938528"]
@@ -170,6 +173,7 @@ class TestLivePath(unittest.TestCase):
                                      order_line_item_count=mock.Mock())
         f.top_up_items = mock.Mock()
         f.zid_collision = lambda oid, z: f"zid collision: {oid} {z}"
+        f.zid_auto_rekey = lambda oid, z: False
         res = live.LiveEngine._resolve_preexisting(f, {"order_id": "4938528"})
         self.assertEqual(res[0], "held")
         self.assertTrue(res[1].startswith("zid collision"))
@@ -184,6 +188,7 @@ class TestDrainPath(unittest.TestCase):
         f.created_ledger = types.SimpleNamespace(get=lambda oid: None)
         f.hs = types.SimpleNamespace(orders_by_salla_id=lambda oid: (None, "Z1"))
         f.zid_collision = lambda oid, z: "zid collision: x"
+        f.zid_auto_rekey = lambda oid, z: False
         f._bump = lambda k: None
         res = queue_drain.QueueDrainEngine.resolve_preexisting(f, "4938528", 1)
         self.assertEqual(res, ("Error", "zid collision: x", f.cfg.live_max_attempts))
