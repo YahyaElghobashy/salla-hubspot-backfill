@@ -38,9 +38,11 @@ notify.send_alert when a workbook is above cfg.capacity_alert_pct:
 alert per Riyadh calendar day, unless a workbook has since crossed into a
 higher 5-point band (80-85, 85-90, ...) than the one it was last alerted at
 that day. A workbook that goes over for the first time that day alerts too.
-The state is written only after notify.send_alert returned, so an alert that
-raised is tried again on the next run. The CLI loads .env first (the Slack
-settings live there), as reconcile.py and gift_refresh.py do.
+The state is written only after the alert went out. notify.send_alert never
+raises: it returns the Slack message ts when the post landed and None when it
+did not (Slack off or failing), so only a ts counts as sent, and an alert
+that did not go out is tried again on the next run. The CLI loads .env first
+(the Slack settings live there), as reconcile.py and gift_refresh.py do.
 """
 
 import argparse
@@ -240,9 +242,18 @@ def report(results, cfg, alert=False, notifier=None, out=None, now=None,
     try:
         if notifier is None:
             import notify as notifier
-        notifier.send_alert(subject, body)
+        ts = notifier.send_alert(subject, body)
     except Exception as e:
         log.warning("capacity alert failed: %s", e)
+        return over
+    if not ts:
+        # [v2.12] send_alert swallows its own failures and returns None: no
+        # Slack message went out, so no cooldown is recorded
+        slack_on = getattr(notifier, "slack_enabled", None)
+        why = ("Slack is not configured" if callable(slack_on) and not slack_on()
+               else "the Slack post failed")
+        log.warning("capacity alert not sent (%s); no cooldown recorded, the "
+                    "next run tries again", why)
         return over
     save_alert_state(over, state, today, now, state_path)
     return over

@@ -13,10 +13,13 @@ offset-ignoring API caught, a capped scan with nothing unresolved reading
 executions shown as not watchable and left out of every count, WARNING logs
 that name the scenario and never the token, the token only ever in the
 Authorization header, per-scenario alert lines with their replay notes, state
-keys (relay_dlq kept, never a fake 0, when nothing could be measured), read
-failures logged once per state change with one alert after 6h under the 12h
-cooldown, and the certificate section (including "not recorded" never
-blocking repairs and a malformed config never killing the certificate).
+keys (relay_dlq kept, never a fake 0, when nothing could be measured, None
+when nothing is watched, relay_dlq_partial while a watched queue was not
+measured), read failures logged once per state change with one alert after
+6h under the 12h cooldown and a gap of more than three polls restarting the
+streak, dlq_min_age_minutes cut to 7 days, and the certificate section
+(including "not recorded" never blocking repairs and a malformed config
+never killing the certificate).
 
 Run: python3 -m unittest test_make_queue_alerts -v
 """
@@ -199,6 +202,25 @@ class WatchList(unittest.TestCase):
                     self.assertEqual(
                         cw.dlq_min_age(cfg(dlq_min_age_minutes=bad)), 45)
                 self.assertIn("dlq_min_age_minutes", "\n".join(cm.output))
+
+    def test_min_age_overflow_and_ceiling(self):
+        """[v2.12] an int too big for a float is not a number (45); anything
+        over 7 days is cut to 7 days, and scan_dlq still runs with it."""
+        with self.assertLogs("backfill", level="WARNING") as cm:
+            self.assertEqual(cw.dlq_min_age(cfg(dlq_min_age_minutes=10 ** 400)), 45)
+        self.assertIn("is not a number", "\n".join(cm.output))
+        for big in (7 * 24 * 60 + 1, 1e300, "99999999"):
+            with self.subTest(big=big):
+                with self.assertLogs("backfill", level="WARNING") as cm:
+                    self.assertEqual(cw.dlq_min_age(cfg(dlq_min_age_minutes=big)),
+                                     cw.DLQ_MIN_AGE_MAX)
+                self.assertIn("over 7 days", "\n".join(cm.output))
+        self.assertEqual(cw.dlq_min_age(cfg(dlq_min_age_minutes=7 * 24 * 60)),
+                         7 * 24 * 60)
+        rows = cw.scan_dlq(cfg(dlq_min_age_minutes=1e300),
+                           get=FakeMake({"6568689": [item(8 * 24 * 60), item(60)]}),
+                           now=NOW)
+        self.assertEqual(rows[0]["count"], 1)            # only the 8-day-old item
 
     def test_config_fields_declared(self):
         c = cw.Config()
@@ -595,7 +617,7 @@ class Alert(unittest.TestCase):
         w = self._watch()
         w.state["dlq_read_fail"] = {"5563154": {
             "label": "customer updated", "ticks": 80,
-            "since": time.time() - 7 * 3600}}
+            "since": time.time() - 7 * 3600, "last": time.time() - 300}}
         w.check_relay_dlq(get=FakeMake({"6568689": [item(120)],
                                         "5563154": RuntimeError("503")}),
                           now=NOW)
@@ -606,6 +628,115 @@ class Alert(unittest.TestCase):
         self.assertIn("customer updated: 81 checks in a row failed", body)
         self.assertNotIn("Not checked this time", body)
         self.assertClientText(subject, body)
+
+    def test_failed_tick_records_its_time(self):
+        w = self._watch()
+        w.check_relay_dlq(get=FakeMake({"5563154": RuntimeError("503")}), now=NOW)
+        e = w.state["dlq_read_fail"]["5563154"]
+        self.assertEqual(e["ticks"], 1)
+        self.assertAlmostEqual(e["last"], time.time(), delta=5)
+        self.assertEqual(e["since"], e["last"])
+
+    def test_gap_of_more_than_three_polls_restarts_the_streak(self):
+        """[v2.12] a watcher that was stopped for a day must not count the
+        day as failing: the streak starts again at 1 and nothing alerts."""
+        down = FakeMake({"5563154": RuntimeError("503")})
+        w = self._watch()
+        w.state["dlq_read_fail"] = {"5563154": {
+            "label": "customer updated", "ticks": 40,
+            "since": time.time() - 30 * 3600,
+            "last": time.time() - 3 * w.poll_s - 60}}
+        with self.assertLogs("backfill", level="WARNING") as cm:
+            w.check_relay_dlq(get=down, now=NOW)
+        self.assertTrue(any("customer updated cannot be read" in l for l in cm.output))
+        e = w.state["dlq_read_fail"]["5563154"]
+        self.assertEqual(e["ticks"], 1)
+        self.assertAlmostEqual(e["since"], time.time(), delta=5)
+        self.assertEqual(self.sent, [])
+
+    def test_gap_within_three_polls_continues_the_streak(self):
+        down = FakeMake({"5563154": RuntimeError("503")})
+        w = self._watch()
+        since = time.time() - 7 * 3600
+        w.state["dlq_read_fail"] = {"5563154": {
+            "label": "customer updated", "ticks": 40, "since": since,
+            "last": time.time() - 3 * w.poll_s + 30}}
+        with self.assertLogs("backfill", level="WARNING") as cm:
+            w.check_relay_dlq(get=down, now=NOW)
+        self.assertFalse(any("cannot be read" in l for l in cm.output))  # no new streak
+        e = w.state["dlq_read_fail"]["5563154"]
+        self.assertEqual((e["ticks"], e["since"]), (41, since))
+        self.assertEqual(len(self.sent), 1)              # 7h unreadable: alerts
+
+    def test_gap_follows_the_poll_interval(self):
+        down = FakeMake({"5563154": RuntimeError("503")})
+        w = cw.CreditWatch(cfg(), poll_s=3600.0)         # hourly watcher
+        w.state["dlq_read_fail"] = {"5563154": {
+            "label": "customer updated", "ticks": 5,
+            "since": time.time() - 5 * 3600, "last": time.time() - 2 * 3600}}
+        w.check_relay_dlq(get=down, now=NOW)
+        self.assertEqual(w.state["dlq_read_fail"]["5563154"]["ticks"], 6)
+
+    def test_entry_without_last_is_judged_by_since(self):
+        """An entry written before `last` existed: since is a lower bound for
+        the last failure, so a recent since continues, an old one restarts."""
+        down = FakeMake({"5563154": RuntimeError("503")})
+        w = self._watch()
+        w.state["dlq_read_fail"] = {"5563154": {
+            "label": "customer updated", "ticks": 2, "since": time.time() - 120}}
+        w.check_relay_dlq(get=down, now=NOW)
+        self.assertEqual(w.state["dlq_read_fail"]["5563154"]["ticks"], 3)
+        w.state["dlq_read_fail"] = {"5563154": {
+            "label": "customer updated", "ticks": 80, "since": time.time() - 7 * 3600}}
+        w.check_relay_dlq(get=down, now=NOW)
+        self.assertEqual(w.state["dlq_read_fail"]["5563154"]["ticks"], 1)
+        self.assertEqual(self.sent, [])
+        for bad in ({"ticks": "x", "since": 1.0}, {"since": "soon"}, {"ticks": 3}):
+            with self.subTest(bad=bad):
+                w.state["dlq_read_fail"] = {"5563154": bad}
+                w.check_relay_dlq(get=down, now=NOW)
+                self.assertEqual(w.state["dlq_read_fail"]["5563154"]["ticks"], 1)
+
+    def test_main_passes_the_interval_to_the_watch(self):
+        seen = {}
+
+        class Stop(Exception):
+            pass
+
+        def fake_watch(c, dry_run=False, poll_s=None):
+            seen["poll_s"] = poll_s
+            raise Stop
+        with mock.patch.object(cw, "CreditWatch", side_effect=fake_watch), \
+                mock.patch.object(cw, "Config") as conf, \
+                mock.patch.object(cw.logging, "basicConfig"), \
+                mock.patch("sys.argv", ["credit_watch.py", "--interval", "900"]):
+            conf.load.return_value = cfg()
+            with self.assertRaises(Stop):
+                cw.main()
+        self.assertEqual(seen["poll_s"], 900.0)
+
+    def test_empty_watch_list_is_none_never_zero(self):
+        w = self._watch(make_dlq_watch=[{"id": "6892982",
+                                         "stores_incomplete": False}])
+        w.state["relay_dlq"] = 4
+        w.check_relay_dlq(get=FakeMake({}), now=NOW)
+        self.assertIsNone(w.state["relay_dlq"])
+        self.assertNotIn("relay_dlq_partial", w.state)
+        self.assertEqual(self.sent, [])
+
+    def test_partial_measurement_is_flagged(self):
+        w = self._watch()
+        w.check_relay_dlq(get=FakeMake({"6568689": [item(120)],
+                                        "5563154": RuntimeError("503")}), now=NOW)
+        self.assertEqual(w.state["relay_dlq"], 1)       # the measured queues' sum
+        self.assertIs(w.state["relay_dlq_partial"], True)
+        down = FakeMake({s: RuntimeError("503") for s in WATCHABLE})
+        w.check_relay_dlq(get=down, now=NOW)
+        self.assertEqual(w.state["relay_dlq"], 1)       # last known total kept
+        self.assertIs(w.state["relay_dlq_partial"], True)
+        w.check_relay_dlq(get=FakeMake({}), now=NOW)
+        self.assertEqual(w.state["relay_dlq"], 0)
+        self.assertNotIn("relay_dlq_partial", w.state)  # everything measured
 
     def test_tick_logs_watch_failure_at_warning(self):
         w = self._watch()

@@ -24,11 +24,16 @@ TAB = "Order Audit Log"
 
 
 class FakeHttpError(Exception):
-    """Shaped like googleapiclient's HttpError: the status is on .resp."""
+    """Shaped like googleapiclient's HttpError: the status is on .resp, the
+    raw JSON body on .content, and str() carries the message only. Sheets
+    names INVALID_ARGUMENT in the body alone, never in the message."""
 
-    def __init__(self, status, text):
-        super().__init__(f"<HttpError {status} when requesting append returned \"{text}\">")
+    def __init__(self, status, text, api_status="INVALID_ARGUMENT"):
+        super().__init__(f"<HttpError {status} when requesting append returned "
+                         f"\"{text}\". Details: \"{text}\">")
         self.resp = type("Resp", (), {"status": status})()
+        self.content = json.dumps({"error": {"code": status, "message": text,
+                                             "status": api_status}}).encode()
 
 
 class FakeReq:
@@ -48,6 +53,8 @@ class FakeValues:
             mode = self.svc.append_script.pop(0) if self.svc.append_script else "ok"
             if mode == "fail":
                 raise TimeoutError("The read operation timed out")
+            if mode == "einval":   # a socket-level EINVAL: says nothing about the row
+                raise OSError(22, "Invalid argument")
             if mode == "bad":   # the row itself rejected, e.g. an oversized cell
                 raise FakeHttpError(400, "Your input contains more than the maximum "
                                          "of 50000 characters in a single cell.")
@@ -295,6 +302,82 @@ class TestAuditAppendFallback(unittest.TestCase):
                     self.assertEqual(g.audit_append(_arrival("5001")), -1)
                 self.assertEqual(self.sleeps, [3.0, 10.0])
                 self.assertIn("audit_fallback_backoff_s", "\n".join(logs.output))
+
+    def test_backoff_that_overflows_a_float_warns_and_uses_the_default(self):
+        for bad in (10 ** 400, [3, 10 ** 400]):
+            with self.subTest(bad=type(bad).__name__):
+                self.sleeps.clear()
+                self.cfg.audit_fallback_backoff_s = bad
+                g = self.gio()
+                self.svc.append_script = ["fail", "fail", "fail"]
+                with self.assertLogs("backfill", "WARNING") as logs:
+                    self.assertEqual(g.audit_append(_arrival("5001")), -1)
+                self.assertEqual(self.sleeps, [3.0, 10.0])
+                self.assertIn("audit_fallback_backoff_s", "\n".join(logs.output))
+
+    def test_backoff_wait_is_cut_to_120_seconds(self):
+        self.cfg.audit_fallback_backoff_s = [5, 600, 86400]
+        g = self.gio()
+        self.svc.append_script = ["fail", "fail", "fail", "fail"]
+        with self.assertLogs("backfill", "WARNING") as logs:
+            self.assertEqual(g.audit_append(_arrival("5001")), -1)
+        self.assertEqual(self.sleeps, [5.0, 120.0, 120.0])
+        self.assertTrue(any("audit_fallback_backoff_s" in m and "120" in m
+                            for m in logs.output))
+
+    def test_einval_oserror_is_retried_with_the_original_row(self):
+        """[v2.12] OSError(22) reads "Invalid argument" but is no Sheets 400:
+        the row is re-sent as it was, Drive link included."""
+        g = self.gio()
+        self.svc.append_script = ["einval", "ok"]
+        self.assertEqual(g.audit_append(_arrival("5001")), 32)
+        self.assertEqual(self.appends(g), ["audit append", "audit append retry"])
+        self.assertEqual(self.svc.rows[-1][27], LINK)
+        self.assertEqual(_ledger()[0]["outcome"], "retried")
+
+    def test_invalid_argument_needs_a_400_and_the_status_text(self):
+        inv = backfill.GoogleIO._audit_invalid_argument
+        oversized = FakeHttpError(400, "Your input contains more than the maximum "
+                                       "of 50000 characters in a single cell.")
+        self.assertNotIn("INVALID_ARGUMENT", str(oversized))  # the body has it
+        self.assertTrue(inv(oversized))
+        worded = FakeHttpError(400, "Invalid argument: row", api_status="")
+        self.assertTrue(inv(worded))
+        for e in (OSError(22, "Invalid argument"),
+                  ValueError("invalid argument"),
+                  RuntimeError("<HttpError 400 INVALID_ARGUMENT>"),     # no .resp
+                  FakeHttpError(400, "Unable to parse range",
+                                api_status="FAILED_PRECONDITION"),
+                  FakeHttpError(500, "Internal error"),                 # body says so,
+                  FakeHttpError("x", "bad")):                           # status not 400
+            with self.subTest(e=repr(e)[:60]):
+                self.assertFalse(inv(e))
+
+    def test_bad_dedup_rows_warns_once_and_still_checks_the_tail(self):
+        """[v2.12] A bad audit_dedup_rows used to raise inside the tail read,
+        logged as a failed read, so the duplicate check never ran."""
+        for bad in ("fifty", 0, -3, 2.5, True, [50]):
+            with self.subTest(bad=bad):
+                Path("mirror/audit_fallback.csv").unlink(missing_ok=True)
+                self.cfg.audit_dedup_rows = bad
+                g = self.gio()
+                self.svc.append_script = ["land"]
+                with self.assertLogs("backfill", "WARNING") as logs:
+                    self.assertEqual(g.audit_append(_arrival("5001")), 32)
+                    self.svc.append_script = ["land"]
+                    self.assertEqual(g.audit_append(_arrival("5002")), 33)
+                out = "\n".join(logs.output)
+                self.assertEqual(out.count("audit_dedup_rows="), 1)   # normalised once
+                self.assertNotIn("Audit tail read failed", out)
+                self.assertEqual([r["outcome"] for r in _ledger()], ["found", "found"])
+                self.assertEqual(self.svc.col_a().count("5001"), 1)
+
+    def test_dedup_rows_unset_or_numeric_text_is_accepted_quietly(self):
+        for raw, want in ((None, 50), ("", 50), ("20", 20), (20.0, 20), (7, 7)):
+            with self.subTest(raw=raw):
+                self.cfg.audit_dedup_rows = raw
+                with self.assertNoLogs("backfill", "WARNING"):
+                    self.assertEqual(self.gio()._audit_dedup_n(), want)
 
     def test_ledger_can_be_disabled(self):
         self.cfg.audit_fallback_ledger = ""

@@ -724,7 +724,8 @@ class Config:
     # replaces the whole default. Only items Make has given up on count:
     # status=unresolved, never one it still has scheduled or in progress on
     # its own backoff (1, 10, 10, 30, 30, 180, 180 min, about 7.4 h).
-    # dlq_min_age_minutes is a secondary floor on top of that.
+    # dlq_min_age_minutes is a secondary floor on top of that (at most 7
+    # days; a longer value is cut to 7 days with a warning).
     make_dlq_watch: "list | dict | None" = None
     dlq_min_age_minutes: int = 45
     # Workbook capacity guard (Google caps a workbook at 10,000,000 cells).
@@ -734,10 +735,11 @@ class Config:
     # append at once, into the same outage (13 times; 2 rows lost). The
     # fallback now waits these many seconds before each attempt (a list, or
     # one number for a single attempt; anything else falls back to 3 s, 10 s
-    # with a warning), and first reads column A of the tab's tail: an append
-    # that landed despite its error is reused, never doubled, when it sits
-    # among the last audit_dedup_rows rows that carry an order id. Every
-    # fallback outcome is one row in audit_fallback_ledger ("" disables it).
+    # with a warning; one wait is at most 120 s), and first reads column A of
+    # the tab's tail: an append that landed despite its error is reused, never
+    # doubled, when it sits among the last audit_dedup_rows rows that carry an
+    # order id (a whole number of 1 or more; anything else warns and means
+    # 50). Every fallback outcome is one row in audit_fallback_ledger ("" disables it).
     audit_fallback_backoff_s: tuple = (3.0, 10.0)
     audit_dedup_rows: int = 50
     audit_fallback_ledger: str = "mirror/audit_fallback.csv"
@@ -1714,6 +1716,8 @@ class GoogleIO:
 
     AUDIT_FALLBACK_TEXT = "JSON exceeded limit - use Order Ops > Backfill JSON from Salla"
     AUDIT_BACKOFF_DEFAULT = (3.0, 10.0)
+    AUDIT_BACKOFF_MAX_S = 120.0  # [v2.12] one wait never blocks the order path longer
+    AUDIT_DEDUP_DEFAULT = 50
     AUDIT_TAIL_PAGE = 1000       # rows per column-A read when walking up the tab
     AUDIT_TAIL_MAX_PAGES = 5
     _ledger_lock = threading.Lock()   # lanes share one fallback ledger
@@ -1766,8 +1770,10 @@ class GoogleIO:
         """[v2.12] cfg.audit_fallback_backoff_s as a list of seconds: one
         number is a single attempt, a list or tuple one attempt per entry, an
         empty one a single attempt without a wait. Any other type, or a
-        negative or non-finite entry, is logged and AUDIT_BACKOFF_DEFAULT
-        used, so a config typo never breaks the order path."""
+        negative, non-finite or float-overflowing entry, is logged and
+        AUDIT_BACKOFF_DEFAULT used, so a config typo never breaks the order
+        path. An entry over AUDIT_BACKOFF_MAX_S (120 s) is logged and cut to
+        it: the fallback waits inside the order path."""
         raw = getattr(self.cfg, "audit_fallback_backoff_s", self.AUDIT_BACKOFF_DEFAULT)
         try:
             if isinstance(raw, bool):
@@ -1783,28 +1789,40 @@ class GoogleIO:
             delays = [float(d) for d in raw_list]
             if not all(0.0 <= d < float("inf") for d in delays):   # NaN fails too
                 raise ValueError("negative or non-finite")
-        except (TypeError, ValueError) as e:
-            log.warning("audit_fallback_backoff_s=%r is not seconds or a list of "
+        except (TypeError, ValueError, OverflowError) as e:
+            log.warning("audit_fallback_backoff_s=%.80r is not seconds or a list of "
                         "seconds (%s); using %s", raw, e,
                         list(self.AUDIT_BACKOFF_DEFAULT))
             return list(self.AUDIT_BACKOFF_DEFAULT)
+        cap = self.AUDIT_BACKOFF_MAX_S
+        if any(d > cap for d in delays):
+            log.warning("audit_fallback_backoff_s=%.80r has a wait over %gs; "
+                        "each wait is cut to %gs", raw, cap, cap)
+            delays = [min(d, cap) for d in delays]
         return delays or [0.0]
 
     @staticmethod
     def _audit_invalid_argument(e):
         """True for a Sheets 400 / INVALID_ARGUMENT: the row itself was
-        rejected (an oversized cell), so sending it again cannot succeed."""
+        rejected (an oversized cell), so sending it again cannot succeed.
+
+        [v2.12] Both halves are required: an HttpError whose .resp.status is
+        400, and INVALID_ARGUMENT (or "invalid argument") in its text. A
+        plain OSError(22) reads "Invalid argument" too and must not turn the
+        retry into the fallback text. Sheets puts the INVALID_ARGUMENT status
+        only in the response body (HttpError.content); str(e) carries the
+        message alone, so both are searched."""
         status = getattr(getattr(e, "resp", None), "status", None)
-        if status is None:
-            status = getattr(e, "status_code", None)
         try:
-            if int(status) == 400:
-                return True
-        except (TypeError, ValueError):
-            pass
-        s = str(e).lower()
-        return ("httperror 400" in s or "invalid_argument" in s
-                or "invalid argument" in s)
+            if int(status) != 400:
+                return False
+        except (TypeError, ValueError, OverflowError):
+            return False
+        body = getattr(e, "content", b"")
+        if isinstance(body, (bytes, bytearray)):
+            body = bytes(body).decode("utf-8", "replace")
+        text = f"{e} {body if isinstance(body, str) else ''}".lower()
+        return "invalid_argument" in text or "invalid argument" in text
 
     def _audit_fallback(self, values_by_idx, first_error):
         """[v2.12] Wait, look for the row, then append it again.
@@ -1907,6 +1925,35 @@ class GoogleIO:
                 out[oid] = row  # later rows overwrite: last occurrence wins
         return out
 
+    def _audit_dedup_n(self):
+        """[v2.12] cfg.audit_dedup_rows as a whole number of rows >= 1,
+        worked out once per GoogleIO. Unset (None or "") means 50. Any other
+        value that is not a whole number of 1 or more logs one WARNING that
+        names the key and means 50: before, it raised inside the tail read
+        and was logged as a failed read, so the duplicate check was dropped
+        on every fallback."""
+        n = getattr(self, "_audit_dedup_rows", None)
+        if n is not None:
+            return n
+        raw = getattr(self.cfg, "audit_dedup_rows", self.AUDIT_DEDUP_DEFAULT)
+        n = self.AUDIT_DEDUP_DEFAULT
+        if raw is not None and not (isinstance(raw, str) and not raw.strip()):
+            try:
+                if isinstance(raw, bool):
+                    raise TypeError("bool")
+                if isinstance(raw, float) and not raw.is_integer():
+                    raise ValueError("not a whole number")
+                n = int(raw.strip() if isinstance(raw, str) else raw)
+                if n < 1:
+                    raise ValueError("below 1")
+            except (TypeError, ValueError, OverflowError) as e:
+                log.warning("audit_dedup_rows=%.80r is not a whole number of rows "
+                            "of 1 or more (%s); using %d", raw, e,
+                            self.AUDIT_DEDUP_DEFAULT)
+                n = self.AUDIT_DEDUP_DEFAULT
+        self._audit_dedup_rows = n
+        return n
+
     def _audit_find(self, oid):
         """Last audit row whose column A is `oid` among the last
         cfg.audit_dedup_rows id-bearing rows of the tab, or None.
@@ -1915,7 +1962,7 @@ class GoogleIO:
         far above the bottom, a page walk reads 1000 rows), so it is cut to
         the bottom n rows that carry an id first: an older row of the same
         order higher up is never taken for this append."""
-        n = max(1, int(getattr(self.cfg, "audit_dedup_rows", 50) or 50))
+        n = self._audit_dedup_n()
         window = [(r, got) for r, got in self._audit_tail(n) if got][-n:]
         rows = [r for r, got in window if got == str(oid)]
         return rows[-1] if rows else None

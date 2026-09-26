@@ -6,12 +6,17 @@
   * tools.sheet_capacity.capacity sums rowCount x columnCount per tab and per
     workbook against the 10M-cell cap, through GoogleIO's Sheets service; the
     CLI alerts only above cfg.capacity_alert_pct, at most once per Riyadh day
-    unless a workbook reaches a higher 5-point band, lists only tabs that
-    hold cells, and loads .env before reading the config.
+    unless a workbook reaches a higher 5-point band, records the cooldown
+    only when notify.send_alert returned a Slack ts (it returns None, never
+    raises, when the post did not go out), lists only tabs that hold cells,
+    and loads .env before reading the config.
   * realtime_base.trim_lock is owner-aware: "<pid> <tab> <ts>", a live holder
-    is refused (TrimLockHeld) and every caller skips instead of overwriting,
-    a dead holder is taken over with a WARNING, exit unlinks only its own
-    lock. tools/trim_queue.py counts cells through tools.sheet_capacity.
+    is refused (TrimLockHeld) and every caller skips instead of overwriting
+    (the realtime consumer without a "removed 0" line), a dead holder is
+    taken over with a WARNING, exit unlinks only its own lock, a lock whose
+    line could not be written is removed, an unreadable lock keeps its real
+    mtime, and only ASCII pids up to 4194304 count. tools/trim_queue.py
+    counts cells through tools.sheet_capacity.
 
 Offline, against fakes. Run: python3 -m unittest test_trim_capacity -v
 """
@@ -226,6 +231,18 @@ class TestCapacity(unittest.TestCase):
             capacity(types.SimpleNamespace(sheets=None), _cfg())      # Google disabled
 
 
+# notify.send_alert never raises: it returns the Slack message ts when the post
+# went out and None when it did not. The fakes return a ts, like a real post.
+SLACK_TS = "1790000000.000100"
+
+
+def notifier(ts=SLACK_TS, slack_on=True):
+    n = mock.Mock()
+    n.send_alert.return_value = ts
+    n.slack_enabled.return_value = slack_on
+    return n
+
+
 def result(pct_cells, name="Queue workbook"):
     return {"workbook": name, "spreadsheet_id": "QS", "cells": pct_cells,
             "pct": round(100.0 * pct_cells / 10_000_000, 2),
@@ -241,10 +258,10 @@ class TestCapacityReport(unittest.TestCase):
         self.addCleanup(patcher.stop)
 
     def run_report(self, results, alert=True, **cfg_kw):
-        notifier = mock.Mock()
+        n = notifier()
         out = io.StringIO()
-        over = sc.report(results, _cfg(**cfg_kw), alert=alert, notifier=notifier, out=out)
-        return over, notifier, out.getvalue()
+        over = sc.report(results, _cfg(**cfg_kw), alert=alert, notifier=n, out=out)
+        return over, n, out.getvalue()
 
     def test_default_threshold_is_80(self):
         self.assertEqual(Config().capacity_alert_pct, 80.0)
@@ -281,9 +298,9 @@ class TestCapacityReport(unittest.TestCase):
         self.assertLess(body.index("Audit workbook"), body.index("Queue workbook"))
 
     def test_alert_failure_does_not_raise(self):
-        notifier = mock.Mock()
-        notifier.send_alert.side_effect = RuntimeError("slack down")
-        sc.report([result(9_000_000)], _cfg(), alert=True, notifier=notifier, out=io.StringIO())
+        n = notifier()
+        n.send_alert.side_effect = RuntimeError("slack down")
+        sc.report([result(9_000_000)], _cfg(), alert=True, notifier=n, out=io.StringIO())
         self.assertIn("capacity alert failed", self.log.warning.call_args[0][0])
 
     def test_cli_main(self):
@@ -296,7 +313,7 @@ class TestCapacityReport(unittest.TestCase):
         with mock.patch.object(backfill, "setup_logging"), \
                 mock.patch.object(backfill.Config, "load", return_value=cfg), \
                 mock.patch.object(backfill, "GoogleIO", return_value=gio) as gcls, \
-                mock.patch.object(notify, "send_alert") as send, \
+                mock.patch.object(notify, "send_alert", return_value=SLACK_TS) as send, \
                 mock.patch("sys.stdout", out):
             self.assertEqual(sc.main(["--alert"]), 0)
         gcls.assert_called_once_with(cfg, enabled=True)
@@ -339,7 +356,7 @@ def riyadh(day, hour, minute=0):
 class TestCapacityCooldown(unittest.TestCase):
     def setUp(self):
         _chdir_tmp(self)
-        self.notifier = mock.Mock()
+        self.notifier = notifier()
 
     def send(self, results, now, notifier=None, **cfg_kw):
         n = notifier or self.notifier
@@ -392,12 +409,45 @@ class TestCapacityCooldown(unittest.TestCase):
         self.assertEqual(self.state()["bands"], {"QS": 17, "AUDIT": 16})
 
     def test_failed_send_is_retried_next_run(self):
-        broken = mock.Mock()
+        broken = notifier()
         broken.send_alert.side_effect = RuntimeError("slack down")
         self.send([wb(85.0)], riyadh(26, 9), notifier=broken)
         self.assertFalse(sc.ALERT_STATE.exists())
         self.assertEqual(self.send([wb(85.0)], riyadh(26, 10)), 1)
         self.assertTrue(sc.ALERT_STATE.exists())
+
+    def test_post_that_did_not_go_out_is_retried_next_run(self):
+        """[v2.12] send_alert swallows a failed post and returns None: that
+        is not a sent alert, so no cooldown is recorded."""
+        silent = notifier(ts=None)
+        self.assertEqual(self.send([wb(85.0)], riyadh(26, 9), notifier=silent), 1)
+        self.assertFalse(sc.ALERT_STATE.exists())
+        self.assertTrue(any("not sent (the Slack post failed)" in m
+                            for m in self.logs.output))
+        self.assertEqual(self.send([wb(85.0)], riyadh(26, 10)), 1)
+        self.assertEqual(self.state()["bands"], {"QS": 17})
+
+    def test_slack_off_records_no_cooldown(self):
+        off = notifier(ts=None, slack_on=False)
+        self.send([wb(85.0)], riyadh(26, 9), notifier=off)
+        self.assertFalse(sc.ALERT_STATE.exists())
+        self.assertTrue(any("not sent (Slack is not configured)" in m
+                            for m in self.logs.output))
+
+    def test_real_notify_without_slack_writes_no_state(self):
+        """The real notify module with no Slack or SMTP settings: send_alert
+        returns None and logs the alert, and no cooldown is written."""
+        import notify
+        keys = ("SLACK_BOT_TOKEN", "SLACK_CHANNEL_ID", "SLACK_CHANNEL_IDS",
+                "SMTP_HOST", "SMTP_FROM", "SMTP_TO")
+        with mock.patch.dict(os.environ, {k: "" for k in keys}), \
+                self.assertLogs("backfill", level="INFO") as logs:
+            self.assertFalse(notify.slack_enabled())
+            sc.report([wb(85.0)], _cfg(), alert=True, notifier=notify,
+                      out=io.StringIO(), now=riyadh(26, 9))
+        self.assertFalse(sc.ALERT_STATE.exists())
+        self.assertTrue(any("not sent (Slack is not configured)" in m
+                            for m in logs.output))
 
     def test_suppressed_alert_writes_no_state(self):
         self.send([wb(85.0)], riyadh(26, 9), alerts_enabled=False)
@@ -556,6 +606,88 @@ class TestTrimLock(unittest.TestCase):
             with realtime_base.trim_lock("Live Queue"):
                 pass
 
+    def test_read_failure_after_stat_keeps_the_real_mtime(self):
+        """[v2.12] stat first, then read: a lock that cannot be read keeps
+        its real age, so the two-hour rule can expire it."""
+        hold(None, raw="4242 Status Queue 2026-09-26T04:00:00\n", age_s=3 * 3600)
+        real = self.lock.stat().st_mtime
+        with mock.patch.object(Path, "read_text", side_effect=PermissionError("denied")):
+            h = realtime_base.trim_lock_holder()
+            self.assertIsNone(h["pid"])
+            self.assertEqual(h["mtime"], real)
+            self.assertFalse(realtime_base.trim_lock_active())
+        hold(None, raw="x", age_s=60)                              # recent: still held
+        with mock.patch.object(Path, "read_text", side_effect=PermissionError("denied")):
+            self.assertTrue(realtime_base.trim_lock_active())
+
+    def test_failed_stat_reports_now(self):
+        hold(None, raw="x", age_s=3 * 3600)
+        with mock.patch.object(Path, "stat", side_effect=PermissionError("denied")):
+            h = realtime_base.trim_lock_holder()
+        self.assertIsNone(h["pid"])
+        self.assertAlmostEqual(h["mtime"], time.time(), delta=5)
+
+    def test_undecodable_lock_is_unreadable_not_a_crash(self):
+        self.lock.write_bytes(b"\xff\xfe12 Status Queue \x80\n")
+        t = time.time() - 3 * 3600
+        os.utime(self.lock, (t, t))
+        h = realtime_base.trim_lock_holder()
+        self.assertIsNone(h["pid"])
+        self.assertAlmostEqual(h["mtime"], t, delta=1)
+        self.assertFalse(realtime_base.trim_lock_active())
+        with self.assertLogs("backfill", level="WARNING"):
+            with realtime_base.trim_lock("Live Queue"):
+                self.assertEqual(realtime_base.trim_lock_holder()["pid"], os.getpid())
+
+    def test_pid_must_be_ascii_digits_within_pid_max(self):
+        for raw in ("\u0664\u0662 Status Queue 2026-09-26T04:00:00",   # Arabic-Indic 42
+                    "\u00b2 Status Queue 2026-09-26T04:00:00",          # superscript 2
+                    "4194305 Status Queue 2026-09-26T04:00:00",
+                    "9" * 5000 + " Status Queue 2026-09-26T04:00:00",
+                    "0 Status Queue 2026-09-26T04:00:00",
+                    json.dumps({"pid": 10 ** 30, "tab": "Status Queue"}),
+                    '{"pid": Infinity, "tab": "Status Queue"}',
+                    json.dumps({"pid": True, "tab": "Status Queue"})):
+            with self.subTest(raw=raw[:30]):
+                hold(None, raw=raw)
+                h = realtime_base.trim_lock_holder()
+                self.assertIsNone(h["pid"])
+                self.assertTrue(realtime_base.trim_lock_active())   # fresh: age rule
+        hold(None, raw="4194304 Status Queue 2026-09-26T04:00:00")
+        self.assertEqual(realtime_base.trim_lock_holder()["pid"], 4194304)
+
+    def test_pid_alive_never_raises(self):
+        for pid in (10 ** 30, -(10 ** 30), 2 ** 63):
+            with self.subTest(pid=pid):
+                self.assertFalse(realtime_base._pid_alive(pid))
+
+    def test_failed_write_removes_the_lock_it_created(self):
+        """[v2.12] a lock created but left without its line would read as
+        unparseable and block every trim for two hours."""
+        real_fdopen = os.fdopen
+
+        class FullDisk:
+            def __init__(self, fd, *a, **k):
+                self.fh = real_fdopen(fd, *a, **k)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                self.fh.close()
+                return False
+
+            def write(self, text):
+                raise OSError(28, "No space left on device")
+        with mock.patch.object(realtime_base.os, "fdopen", side_effect=FullDisk):
+            with self.assertRaises(OSError) as cm:
+                with realtime_base.trim_lock("Status Queue"):
+                    self.fail("entered a lock whose line was never written")
+        self.assertEqual(cm.exception.errno, 28)
+        self.assertFalse(self.lock.exists())
+        with realtime_base.trim_lock("Status Queue"):                # usable at once
+            self.assertTrue(self.lock.exists())
+
     def test_exit_leaves_a_lock_that_is_not_ours(self):
         other = live_pid(self)
         with self.assertLogs("backfill", level="WARNING") as logs:
@@ -620,9 +752,11 @@ class TestTrimCallersSkipAHeldLock(unittest.TestCase):
         s._start_row = 900
         pid = live_pid(self)
         hold(pid, tab="Live Queue")
-        with self.assertLogs("backfill", level="WARNING") as logs:
+        with self.assertLogs("backfill", level="INFO") as logs:
             s._maybe_trim()
         self.assertTrue(any("trim skipped today" in m for m in logs.output))
+        # [v2.12] a skipped trim removed nothing and says only that
+        self.assertFalse(any("TRIM removed" in m for m in logs.output))
         self.assertEqual(gio.trims, [])
         self.assertEqual(json.loads(Path("mirror/customers_state.json").read_text())["start_row"], 2)
         self.assertEqual(realtime_base.trim_lock_holder()["pid"], pid)

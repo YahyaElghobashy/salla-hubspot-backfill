@@ -35,10 +35,30 @@ log = logging.getLogger("backfill")
 HEARTBEAT_STALE_S = 300
 TRIM_LOCK = Path("mirror/trim.lock")
 TRIM_LOCK_STALE_S = 2 * 3600
+# [v2.12] Linux PID_MAX_LIMIT. A larger number in the lock is not a pid, and
+# os.kill rejects it with OverflowError rather than an OSError.
+PID_MAX = 4194304
 
 
 class TrimLockHeld(RuntimeError):
     """[v2.12] trim_lock refused: another live process holds TRIM_LOCK."""
+
+
+def _lock_pid(value):
+    """[v2.12] A pid read from the lock, or None. Only ASCII digits count
+    (str.isdigit also accepts Arabic-Indic and superscript digits) and only
+    up to PID_MAX, so a garbled lock never reaches os.kill. The length check
+    comes first: int() refuses a digit string over 4300 characters."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        pid = value
+    else:
+        head = str(value if value is not None else "").strip()
+        if not (head.isascii() and head.isdigit()) or len(head) > len(str(PID_MAX)):
+            return None
+        pid = int(head)
+    return pid if 0 < pid <= PID_MAX else None
 
 
 def trim_lock_holder():
@@ -46,25 +66,35 @@ def trim_lock_holder():
     there is no lock file. The file holds one line "<pid> <tab> <ts>" (tab
     names contain spaces, ts does not). A v2.11 JSON lock is read too, so a
     lock left by the previous version is still understood. pid is None when
-    the file cannot be parsed (for example read between create and write)."""
+    the file cannot be parsed (for example read between create and write, or
+    bytes that are not UTF-8).
+
+    The file is stat'ed before it is read. When the stat worked and the read
+    did not, mtime stays the file's real one, so the two-hour rule for an
+    unreadable lock can still expire; only a failed stat reports "now"."""
     try:
         mtime = TRIM_LOCK.stat().st_mtime
-        text = TRIM_LOCK.read_text(encoding="utf-8").strip()
     except FileNotFoundError:
         return None
     except OSError:
         return {"pid": None, "tab": "", "ts": "", "mtime": time.time()}
+    try:
+        text = TRIM_LOCK.read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        return None                                   # released after the stat
+    except (OSError, UnicodeDecodeError):
+        return {"pid": None, "tab": "", "ts": "", "mtime": mtime}
     pid, tab, ts = None, "", ""
     if text.startswith("{"):
         try:
             d = json.loads(text)
-            pid, tab, ts = int(d.get("pid")), str(d.get("tab", "")), str(d.get("ts", ""))
-        except (ValueError, TypeError):
+            pid = _lock_pid(d.get("pid"))
+            tab, ts = str(d.get("tab", "")), str(d.get("ts", ""))
+        except (ValueError, TypeError, AttributeError):
             pass
     else:
         head, _, rest = text.partition(" ")
-        if head.isdigit():
-            pid = int(head)
+        pid = _lock_pid(head)
         tab, _, ts = rest.rpartition(" ")
     return {"pid": pid, "tab": tab, "ts": ts, "mtime": mtime}
 
@@ -76,8 +106,8 @@ def _pid_alive(pid):
         return False
     except PermissionError:
         return True            # exists, owned by another user
-    except OSError:
-        return False
+    except (OSError, OverflowError, ValueError):
+        return False           # [v2.12] no process can have this pid
     return True
 
 
@@ -179,8 +209,18 @@ class trim_lock:
                         except FileNotFoundError:
                             pass
                 continue
-            with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                fh.write(line)
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                    fh.write(line)
+            except BaseException:
+                # [v2.12] the file is ours (O_EXCL) but has no line: left in
+                # place it reads as unparseable and blocks every trim for
+                # two hours. Remove it, then let the error through.
+                try:
+                    TRIM_LOCK.unlink()
+                except OSError:
+                    pass
+                raise
             self._held = True
             return self
         raise TrimLockHeld(f"trim lock {TRIM_LOCK} could not be taken for "
@@ -452,6 +492,7 @@ class RealtimeConsumer:
                                         deletable=self.trimmable)
         except TrimLockHeld as e:
             log.warning("%s trim skipped today, nothing deleted: %s", self.name, e)
+            return      # [v2.12] no trim ran: no "removed 0" line (finally still resets)
         except Exception as e:
             log.exception("%s trim failed (nothing further deleted): %s", self.name, e)
         finally:

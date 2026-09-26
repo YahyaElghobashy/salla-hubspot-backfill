@@ -228,7 +228,7 @@ LOG_MARKED = """\
 class CustomerPaths(Base):
     # LOG predates the json marker: JSON is inferred and the line says so
     EXPECT = {"json": 2, "salvaged": 1, "looked up": 1, "lookup_failed": 2, "held": 1,
-              "recorded": True, "json_marker": False}
+              "recorded": True, "json_marker": False, "json_inferred": True}
 
     def test_counts_distinct_customers_per_path_for_the_day(self):
         Path("customer_sync.log").write_text(LOG)
@@ -248,11 +248,34 @@ class CustomerPaths(Base):
         Path("customer_sync.log").write_text(LOG_MARKED)
         p = self.ops()["customer_paths"]
         self.assertEqual(p, {"json": 3, "salvaged": 1, "looked up": 0, "lookup_failed": 0,
-                             "held": 0, "recorded": True, "json_marker": True})
+                             "held": 0, "recorded": True, "json_marker": True,
+                             "json_inferred": False})
         self.assertEqual(rd._paths_line(p),
                          "• Customer payloads yesterday (distinct customers by how the "
                          "row was read): 3 plain JSON, 1 salvaged from the capture text, "
                          "0 fetched from Salla, 0 gave up after Salla lookups failed")
+
+    def test_no_marker_and_no_contact_write_is_a_plain_zero(self):
+        """[v2.12] Nothing was inferred on a day with no JSON marker and no
+        contact written, so the line carries no inference note."""
+        Path("customer_sync.log").write_text(
+            "2026-09-25 02:00:00,000 INFO    [MainThread] CUSTOMER payload salvaged 103\n"
+            "2026-09-25 06:00:00,000 ERROR   [MainThread] CUSTOMER row 19 (107): payload "
+            "unreadable and no Salla lookup configured -- held\n")
+        p = self.ops()["customer_paths"]
+        self.assertEqual((p["json"], p["json_marker"], p["json_inferred"]), (0, False, False))
+        line = rd._paths_line(p)
+        self.assertIn("row was read): 0 plain JSON, 1 salvaged", line)
+        self.assertNotIn("inferred", line)
+
+    def test_inference_note_follows_json_inferred(self):
+        base = {"json": 0, "salvaged": 0, "looked up": 0, "lookup_failed": 0,
+                "held": 0, "recorded": True, "json_marker": False}
+        self.assertNotIn("inferred", rd._paths_line(dict(base, json_inferred=False)))
+        self.assertIn("0 plain JSON (inferred from contacts written",
+                      rd._paths_line(dict(base, json_inferred=True)))
+        # a result without json_inferred (older shape) keeps the old rule
+        self.assertIn("(inferred", rd._paths_line(base))
 
     def test_no_line_in_the_window_is_not_recorded_never_zeros(self):
         Path("customer_sync.log.1").write_text(LOG.splitlines(keepends=True)[0])
@@ -318,7 +341,8 @@ class CustomerPaths(Base):
         self.assertEqual(rd._customer_paths(DAY, DAY),
                          {"json": 1, "salvaged": 1, "looked up": 1,
                           "lookup_failed": 1, "held": 1,
-                          "recorded": True, "json_marker": True})
+                          "recorded": True, "json_marker": True,
+                          "json_inferred": False})
 
 
 # ----------------------------------------------------------------------------
@@ -590,7 +614,7 @@ class AuditMisses(Base):
     def test_orders_with_no_row_and_no_later_real_row(self):
         self.write()
         a = self.ops()["audit_misses"]
-        self.assertEqual(a, {"total": 3, "ids": ["2", "8", "5"]})
+        self.assertEqual(a, {"total": 3, "ids": ["2", "8", "5"], "blank": 0})
         self.assertEqual(rd._audit_line(a),
                          "• Audit sheet: 3 order(s) from the last 24h have no sheet row "
                          "(2, 8, 5). Dry runs and runs without Google count here too. "
@@ -599,15 +623,32 @@ class AuditMisses(Base):
     def test_small_blocks_give_the_same_answer(self):
         self.write()
         with mock.patch.object(rd, "TAIL_BLOCK", 64):
-            self.assertEqual(self.ops()["audit_misses"], {"total": 3, "ids": ["2", "8", "5"]})
+            self.assertEqual(self.ops()["audit_misses"],
+                             {"total": 3, "ids": ["2", "8", "5"], "blank": 0})
 
     def test_long_id_list_and_an_arrival_with_no_id(self):
         self.write(extra=[("2026-09-26 03:00:00", "arrived_append", -1, {0: str(20 + i)})
                           for i in range(4)]
                    + [("2026-09-26 04:00:00", "arrived_append", -1, {9: "2"})])
         a = self.ops()["audit_misses"]
-        self.assertEqual(a["total"], 8)
-        self.assertIn("(2, 8, 5, 20, 21 and 2 more)", rd._audit_line(a))
+        self.assertEqual((a["total"], len(a["ids"]), a["blank"]), (8, 7, 1))
+        # [v2.12] 5 named + 2 more + 1 with no id = the 8 in the total
+        self.assertIn("(2, 8, 5, 20, 21 and 2 more, plus 1 with no order id)",
+                      rd._audit_line(a))
+
+    def test_audit_line_counts_from_the_total(self):
+        ids = [str(i) for i in range(1, 8)]
+        line = rd._audit_line({"total": 12, "ids": ids, "blank": 2})
+        self.assertIn("12 order(s)", line)
+        self.assertIn("(1, 2, 3, 4, 5 and 5 more, plus 2 with no order id)", line)
+        line = rd._audit_line({"total": 3, "ids": [], "blank": 3})
+        self.assertIn("have no sheet row (3 with no order id).", line)
+        # older shape without "blank": the rest of the total has no id
+        line = rd._audit_line({"total": 4, "ids": ["9", "10"]})
+        self.assertIn("(9, 10, plus 2 with no order id)", line)
+        line = rd._audit_line({"total": 2, "ids": ["9", "10"], "blank": 0})
+        self.assertIn("(9, 10).", line)
+        self.assertNotIn("more", line)
 
     def test_quiet_sheet_and_missing_mirror(self):
         self.assertIsNone(self.ops()["audit_misses"])

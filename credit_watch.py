@@ -105,6 +105,14 @@ DLQ_MIN_AGE_DEFAULT = 45
 DLQ_NOT_STUCK = ("resolved", "scheduled", "inprogress")
 DLQ_FAIL_ALERT_S = 6 * 3600     # continuous read failure before it alerts
 DLQ_COOLDOWN_S = 12 * 3600      # one retry-queue alert per 12h, any kind
+# [v2.12] A failure streak is only continuous while failed ticks follow each
+# other. A gap of more than this many poll intervals since the last failed
+# tick (the watcher was stopped, the VM was down) starts a new streak.
+DLQ_FAIL_GAP_POLLS = 3
+POLL_S_DEFAULT = 300.0          # main()'s --interval default
+# [v2.12] dlq_min_age_minutes ceiling: a longer floor would hide lost work
+# for good, and a huge one overflows timedelta in scan_dlq.
+DLQ_MIN_AGE_MAX = 7 * 24 * 60
 
 # [v2.12] Replay notes go to Slack as written: plain sentences, no dashes.
 # Replaying is NOT safe everywhere, so each scenario says what a replay does.
@@ -166,9 +174,11 @@ def _flag(v, default=True):
 
 
 def dlq_min_age(cfg):
-    """[v2.12] Config.dlq_min_age_minutes as minutes (>= 0). A secondary
-    floor: status=unresolved already leaves Make's own retries alone. Unset
-    means 45; a value that is not a number logs a WARNING and means 45."""
+    """[v2.12] Config.dlq_min_age_minutes as minutes, between 0 and
+    DLQ_MIN_AGE_MAX (7 days). A secondary floor: status=unresolved already
+    leaves Make's own retries alone. Unset means 45; a value that is not a
+    number (an int too large for a float included) logs one WARNING and
+    means 45; a value over 7 days logs one WARNING and means 7 days."""
     raw = getattr(cfg, "dlq_min_age_minutes", DLQ_MIN_AGE_DEFAULT)
     if raw is None:
         return float(DLQ_MIN_AGE_DEFAULT)
@@ -178,10 +188,14 @@ def dlq_min_age(cfg):
         mins = float(raw)
         if not math.isfinite(mins):
             raise ValueError("not finite")
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         _config_warning("config dlq_min_age_minutes=%.60r is not a number; "
                         "using %d", raw, DLQ_MIN_AGE_DEFAULT)
         return float(DLQ_MIN_AGE_DEFAULT)
+    if mins > DLQ_MIN_AGE_MAX:
+        _config_warning("config dlq_min_age_minutes=%.60r is over 7 days; "
+                        "using %d", raw, DLQ_MIN_AGE_MAX)
+        return float(DLQ_MIN_AGE_MAX)
     return max(0.0, mins)
 
 
@@ -408,9 +422,12 @@ def dlq_state(rows):
 
 
 class CreditWatch:
-    def __init__(self, cfg, dry_run=False):
+    def __init__(self, cfg, dry_run=False, poll_s=POLL_S_DEFAULT):
         self.cfg = cfg
         self.dry_run = dry_run
+        # [v2.12] seconds between ticks: a longer gap between two failed
+        # retry-queue reads breaks their streak (_track_read_failures)
+        self.poll_s = poll_s
         self.state = self._load()
 
     # ------------- state -------------
@@ -624,19 +641,29 @@ class CreditWatch:
 
         Alert at most every 12h (dlq_alerted_at) while anything is parked, or
         once a queue has been unreadable for 6h straight. State keys:
-        relay_dlq (the total; kept as it was, or None, when no queue could be
-        measured, never a fake 0), dlq_alerted_at, relay_dlq_by_scenario, and
+        relay_dlq (the total of the queues measured this tick; kept as it
+        was, or None, when no queue could be measured, and None when no
+        queue is watched at all, never a fake 0), relay_dlq_partial (True
+        only while some watched queue was not measured, so relay_dlq counts
+        part of the watch), dlq_alerted_at, relay_dlq_by_scenario, and
         dlq_read_fail (consecutive failed ticks per scenario)."""
         rows = scan_dlq(self.cfg, get=get, now=now, quiet=True)
         watch = [r for r in rows if r["stores_incomplete"]]
         found = [r for r in watch if r["count"]]
         unread = [r for r in watch if r["count"] is None]
         long_fail = self._track_read_failures(watch)
-        if watch and len(unread) == len(watch):
+        if not watch:
+            # [v2.12] nothing is watched, so nothing was measured: not a 0
+            self.state["relay_dlq"] = None
+        elif len(unread) == len(watch):
             # nothing measured: the last known total stands (None if none)
             self.state.setdefault("relay_dlq", None)
         else:
             self.state["relay_dlq"] = sum(r["count"] for r in found)
+        if unread:
+            self.state["relay_dlq_partial"] = True
+        else:
+            self.state.pop("relay_dlq_partial", None)
         self.state["relay_dlq_by_scenario"] = dlq_state(rows)
         if not found and not long_fail:
             # re-arm only when every queue was actually measured: a failed
@@ -697,12 +724,36 @@ class CreditWatch:
             "note on each line before you replay.\n"
             + "\n".join(lines))
 
+    def _streak(self, p, t):
+        """(ticks, since) carrying on the failure streak in state entry `p`,
+        or None when this failed tick starts a new one: no entry, an entry
+        that cannot be read, or more than DLQ_FAIL_GAP_POLLS poll intervals
+        since the last failed tick. An entry written before `last` was kept
+        is judged by `since`, a lower bound for its last failure."""
+        if p is None:
+            return None
+        try:
+            last = float(p.get("last") if p.get("last") is not None
+                         else p.get("since"))
+            ticks = int(p.get("ticks") or 0) + 1
+            since = float(p.get("since") if p.get("since") is not None else last)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        gap = DLQ_FAIL_GAP_POLLS * float(self.poll_s)
+        if not (math.isfinite(last) and math.isfinite(since)) or t - last > gap:
+            return None
+        return ticks, since
+
     def _track_read_failures(self, rows):
         """[v2.12] Consecutive failed reads per watched scenario, in state
-        under dlq_read_fail as {id: {label, ticks, since}}. Logs WARNING once
-        when a queue starts failing and once when it reads again, never on
-        every tick. Returns (row, seconds failing, ticks) for each queue that
-        has failed continuously for DLQ_FAIL_ALERT_S or longer."""
+        under dlq_read_fail as {id: {label, ticks, since, last}}. last is the
+        time of the latest failed tick: when more than DLQ_FAIL_GAP_POLLS
+        poll intervals separate it from this one (the watcher was stopped),
+        the streak starts again at 1 instead of counting the gap as failing.
+        Logs WARNING once when a queue starts failing (a restarted streak
+        included) and once when it reads again, never on every tick. Returns
+        (row, seconds failing, ticks) for each queue that has failed
+        continuously for DLQ_FAIL_ALERT_S or longer."""
         prev = self.state.get("dlq_read_fail")
         prev = prev if isinstance(prev, dict) else {}
         t = time.time()
@@ -711,18 +762,15 @@ class CreditWatch:
             p = prev.get(r["id"])
             p = p if isinstance(p, dict) else None
             if r["error"]:
-                if p is None:
+                streak = self._streak(p, t)
+                if streak is None:
                     ticks, since = 1, t
                     log.warning("make retry queue for %s cannot be read: %s",
                                 r["label"], r["error"])
                 else:
-                    try:
-                        ticks = int(p.get("ticks") or 0) + 1
-                        since = float(p.get("since") or t)
-                    except (TypeError, ValueError):
-                        ticks, since = 1, t
+                    ticks, since = streak
                 cur[r["id"]] = {"label": r["label"], "ticks": ticks,
-                                "since": since}
+                                "since": since, "last": t}
                 if t - since >= DLQ_FAIL_ALERT_S:
                     long_fail.append((r, t - since, ticks))
             elif p is not None:
@@ -901,7 +949,8 @@ def main():
                 os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
 
     cfg = Config.load(args.config)
-    watch = CreditWatch(cfg, dry_run=args.dry_run)
+    interval = max(60.0, args.interval)
+    watch = CreditWatch(cfg, dry_run=args.dry_run, poll_s=interval)
 
     if args.once:
         org = watch.tick()
@@ -917,7 +966,6 @@ def main():
     except OSError:
         sys.exit("another credit_watch instance holds the lock; exiting")
 
-    interval = max(60.0, args.interval)
     log.info("credit watch started interval=%ss alerting=%s",
              int(interval), notify.channels_summary())
     while not STOP_FILE.exists():

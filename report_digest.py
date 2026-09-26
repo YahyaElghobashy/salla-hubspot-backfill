@@ -500,8 +500,11 @@ def _customer_paths(start, end):
     rotated .1): distinct customer ids per path, counted from the markers.
     None when there is no log; {"recorded": False} when the log has no
     timestamped line in the window (a sync that logged nothing that day is
-    not a day of zeros). json_marker is False when the JSON count had to be
-    inferred (log days from before the "CUSTOMER payload json" marker)."""
+    not a day of zeros). json_marker is False when the window has no
+    "CUSTOMER payload json" marker (log days from before it existed).
+    [v2.12] json_inferred is True only when the JSON count then really came
+    from the inference, i.e. contacts were written that day; with no marker
+    and no contact write the count is a plain 0 and nothing was inferred."""
     files = [ROOT / p for p in CUSTOMER_LOGS if (ROOT / p).exists()]
     if not files:
         return None
@@ -531,12 +534,13 @@ def _customer_paths(start, end):
     if not logged:
         return {"recorded": False}
     marker = bool(seen["json"])
-    if not marker:
+    inferred = not marker and bool(wrote)
+    if inferred:
         # a log day from before the json marker: infer JSON from contacts
         # written by customers that carry no other marker
         seen["json"] = wrote - set().union(*seen.values())
     out = {k: len(v) for k, v in seen.items()}
-    out.update(recorded=True, json_marker=marker)
+    out.update(recorded=True, json_marker=marker, json_inferred=inferred)
     return out
 
 
@@ -725,7 +729,7 @@ def _audit_misses(now):
                 blank += 1                # no id to heal it by: counted as is
         elif row is not None and row > 0:
             missed.pop(oid, None)         # a later real row heals the miss
-    return {"total": len(missed) + blank, "ids": list(missed)}
+    return {"total": len(missed) + blank, "ids": list(missed), "blank": blank}
 
 
 def _ops_watch(start, end, now=None, engine=None):
@@ -774,7 +778,9 @@ def _paths_line(p):
         return ("• Customer payloads yesterday: not recorded (customer_sync.log "
                 "has no lines for the day)")
     json_part = f"{p['json']:,} plain JSON"
-    if not p.get("json_marker", True):
+    # [v2.12] the note only when the count was inferred; a result without
+    # json_inferred (older shape) falls back to json_marker
+    if p.get("json_inferred", not p.get("json_marker", True)):
         json_part += " (inferred from contacts written, the log has no JSON marker)"
     line = (f"• Customer payloads yesterday (distinct customers by how the row "
             f"was read): {json_part}, {p['salvaged']:,} salvaged from the "
@@ -811,15 +817,25 @@ def _consent_line(c):
 
 
 def _audit_line(m):
-    if not m["total"]:
+    total = m["total"]
+    if not total:
         return None                      # a quiet sheet needs no line
-    line = f"• Audit sheet: {m['total']:,} order(s) from the last 24h have no sheet row"
-    ids = m.get("ids") or []
-    if ids:
-        line += " (" + ", ".join(ids[:5])
-        if len(ids) > 5:
-            line += f" and {len(ids) - 5} more"
-        line += ")"
+    line = f"• Audit sheet: {total:,} order(s) from the last 24h have no sheet row"
+    ids = [str(i) for i in (m.get("ids") or [])]
+    blank = m.get("blank")
+    if blank is None:                    # older shape: the rest of the total
+        blank = max(0, total - len(ids))
+    # [v2.12] counted from the total, so the named ids, "N more" and the
+    # arrivals with no order id always add up to it
+    shown = ids[:5]
+    more = max(0, total - blank - len(shown))
+    parts = []
+    if shown:
+        parts.append(", ".join(shown) + (f" and {more:,} more" if more else ""))
+    if blank:
+        parts.append(f"{'plus ' if shown else ''}{blank:,} with no order id")
+    if parts:
+        line += " (" + ", ".join(parts) + ")"
     return (line + ". Dry runs and runs without Google count here too. "
             "The local mirror has them.")
 
