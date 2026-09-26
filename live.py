@@ -272,10 +272,14 @@ class LiveEngine(Engine):
                      oid, hs_id)
             return ("done", f"HS {hs_id} (synced by this engine)")
         try:
-            hs_id = self.hs.find_order_by_salla_id(oid)
+            hs_id, zid = self.hs.orders_by_salla_id(oid)
         except Exception as e:
             log.error("pre-existing search failed for %s: %s", oid, e)
             return None  # go to create path; the duplicate-400 guardrail covers dupes
+        if zid and not hs_id:
+            # [v2.12] a Zid-import order holds this number: never verify,
+            # top up or ledger it as this order; park the row (terminal)
+            return ("held", self.zid_collision(oid, zid))
         if not hs_id:
             return None
         li = self.hs.order_line_item_count(hs_id)
@@ -396,8 +400,11 @@ class LiveEngine(Engine):
                                             "done", row["attempts"], f"HS {ref}")
                         self.processed_today += 1
                     elif outcome == "held":
-                        note = (f"catalog gate: {ref} -- in review queue"
-                                if ref else "catalog gate -- in review queue")
+                        if str(ref).startswith("zid collision"):
+                            note = ref          # [v2.12] not a catalog hold
+                        else:
+                            note = (f"catalog gate: {ref} -- in review queue"
+                                    if ref else "catalog gate -- in review queue")
                         self.gio.queue_mark(self.qsid, row["row"], oid,
                                             "held", row["attempts"], note)
                         self.processed_today += 1

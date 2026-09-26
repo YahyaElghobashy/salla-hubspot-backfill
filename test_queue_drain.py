@@ -129,6 +129,8 @@ def make_engine(tmp, live=False, cfg=None, gio_cls=FakeGio):
     cfg = cfg or make_cfg(tmp)
     gio = gio_cls(cfg)
     hs = MagicMock()
+    # [v2.12] lookups go through orders_by_salla_id; keep the old fake knob
+    hs.orders_by_salla_id.side_effect = lambda oid: (hs.find_order_by_salla_id(oid), None)
     relay = MagicMock()
     relay._gap = SimpleNamespace(rate=1.0)
     mirror = MagicMock()

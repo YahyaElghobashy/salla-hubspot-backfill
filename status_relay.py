@@ -39,7 +39,8 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-from backfill import Config, HubSpot, GoogleIO, dig, now_str, setup_logging
+from backfill import (Config, HubSpot, GoogleIO, dig, is_zid_order, now_str,
+                      setup_logging)
 from realtime_base import RealtimeConsumer, TabLock
 
 log = logging.getLogger("backfill")
@@ -150,10 +151,18 @@ class StatusRelay(RealtimeConsumer):
                 {"filters": [{"propertyName": "salla_order_reference",
                               "operator": "EQ",
                               "value": str(reference_id or order_id)}]}],
-            "properties": ["hs_object_id", "hs_pipeline_stage"],
-            "limit": 1}, "status find order")
+            "properties": ["hs_object_id", "hs_pipeline_stage", "salla_store"],
+            "limit": 10}, "status find order")
         res = d.get("results") or []
-        return res[0] if res else None
+        # [v2.12] a Zid-import order carries a Zid order number in
+        # salla_order_id and salla_order_reference; it is never the Salla
+        # order, whatever number it shares with it
+        mine = [r for r in res if not is_zid_order(r.get("properties"))]
+        if res and not mine:
+            log.warning("ZID COLLISION: status for salla order %s (ref %s) "
+                        "matched only Zid order HS %s -- not applied",
+                        order_id, reference_id, res[0].get("id"))
+        return mine[0] if mine else None
 
     def _refresh_live_index(self):
         every = float(getattr(self.cfg, "held_index_refresh_s", 600))

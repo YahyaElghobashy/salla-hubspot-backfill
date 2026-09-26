@@ -379,10 +379,15 @@ class QueueDrainEngine(Engine):
             self._bump("skipped_existing")
             return ("Processed", f"already synced by engine -- HS {hs_id}")
         try:
-            hs_id = self.hs.find_order_by_salla_id(oid)
+            hs_id, zid = self.hs.orders_by_salla_id(oid)
         except Exception as e:
             log.error("pre-existing search failed for %s: %s", oid, e)
             return None  # create path's duplicate-400 guardrail covers it
+        if zid and not hs_id:
+            # [v2.12] held by a Zid-import order: park it; the full attempt
+            # budget is spent so hourly passes stop re-claiming the row
+            return ("Error", self.zid_collision(oid, zid),
+                    self.cfg.live_max_attempts)
         if not hs_id:
             return None
         li = self.hs.order_line_item_count(hs_id)
@@ -406,7 +411,7 @@ class QueueDrainEngine(Engine):
         oid = str(order.get("id"))
         pre = self.resolve_preexisting(oid, len(order.get("items", []) or []))
         if pre:
-            return (pre[0], pre[1], 1)
+            return (pre[0], pre[1], pre[2] if len(pre) > 2 else 1)
         unverified = self.gate_cached(order)
         if unverified:
             self.note_blocked(order, unverified)
@@ -448,6 +453,8 @@ class QueueDrainEngine(Engine):
         outcome, hs_ref = self._outcome.pop(oid, ("error", ""))
         if outcome == "created":
             return ("Processed", f"created HS {hs_ref}", 1)
+        if outcome == "held" and str(hs_ref).startswith("zid collision"):
+            return ("Error", hs_ref, self.cfg.live_max_attempts)   # [v2.12]
         return ("Error", "create failed -- see drain.log / mirror/errors.csv", 1)
 
     # -- claim + dedupe ----------------------------------------------------------

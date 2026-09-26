@@ -49,14 +49,14 @@ class TestConflicts(unittest.TestCase):
         hs.cfg = backfill.Config()
         hs._write = lambda m, p, b, w: (400, CONFLICT_ORDER)
         hs._req = lambda method, path, body=None, is_search=False, what="": (
-            200, {"properties": {"salla_order_id": "465318964"}})
-        hs.find_order_by_salla_id = mock.Mock(return_value="SEARCHED")
+            200, {"properties": {"salla_order_id": "465318964", "salla_store": "Salla"}})
+        hs.orders_by_salla_id = mock.Mock(return_value=("SEARCHED", None))
         order = {"id": 465318964, "items": [], "date": {"date": "2026-09-23 13:08:00"},
                  "amounts": {}, "customer": {}}
         with mock.patch("time.sleep"):
             self.assertEqual(hs.create_order(order, None, "Asia/Riyadh"),
                              ("1374395867335", False))
-        hs.find_order_by_salla_id.assert_not_called()
+        hs.orders_by_salla_id.assert_not_called()
         hs._req = lambda method, path, body=None, is_search=False, what="": (
             200, {"properties": {"salla_order_id": "someone else"}})
         with mock.patch("time.sleep"):
@@ -133,7 +133,7 @@ class TestLiveVerifyPath(unittest.TestCase):
     def fake(self, li, topup):
         f = types.SimpleNamespace()
         f.created_ledger = types.SimpleNamespace(get=lambda oid: None, add=mock.Mock())
-        f.hs = types.SimpleNamespace(find_order_by_salla_id=lambda oid: "H1",
+        f.hs = types.SimpleNamespace(orders_by_salla_id=lambda oid: ("H1", None),
                                      order_line_item_count=mock.Mock(return_value=li))
         f.relay = types.SimpleNamespace(fetch_orders=lambda ids: {"7": ORDER})
         f.top_up_items = mock.Mock(return_value=topup)

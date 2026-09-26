@@ -411,6 +411,7 @@ class TestV16Live(unittest.TestCase):
                                     "hs_external_order_id"}
         hs._write = fake_write
         hs.find_order_by_salla_id = lambda oid: "HS777"
+        hs.orders_by_salla_id = lambda oid: ("HS777", None)
         with mock.patch("time.sleep"):
             out = hs.create_order({"id": 555, "reference_id": 555,
                                    "date": {"date": ""}, "amounts": {},
@@ -424,6 +425,7 @@ class TestV16Live(unittest.TestCase):
         hs.live = True
         hs._write = lambda *a, **k: (400, {"message": "INVALID_PROPERTY foo"})
         hs.find_order_by_salla_id = lambda oid: "HS777"
+        hs.orders_by_salla_id = lambda oid: ("HS777", None)
         out = hs.create_order({"id": 556, "reference_id": 556,
                                "date": {"date": ""}, "amounts": {},
                                "customer": {}, "status": {}},

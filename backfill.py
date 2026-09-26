@@ -67,6 +67,32 @@ RACE_RETRY_WAIT_S = 5  # [M3-guardrail] wait before the post-failure re-search
 # [v2.11] HubSpot names the record that already holds a unique value:
 #   "... on 1374378254574. 1374395867335 already has that value."
 CONFLICT_HOLDER = re.compile(r"(\d{6,}) already has that value")
+# [v2.12] The Zid import (Aug 2026) stored each Zid order NUMBER in
+# salla_order_id, which is unique on orders, and keyed its line items
+# "Z<number>-<n>". Salla order ids share that number space: a new Salla order
+# whose id equals a Zid order number finds the Zid order by search, and the
+# unique constraint refuses to create the Salla order. A record whose
+# salla_store is "Zid" is therefore never the Salla order of that id.
+ZID_STORE = "Zid"
+ZID_ITEM_KEY = re.compile(r"^Z\d+-\d+$")
+ZID_LOCK = threading.Lock()
+
+
+def is_zid_order(props):
+    """[v2.12] True for a Zid-import order record (see ZID_STORE)."""
+    return str((props or {}).get("salla_store") or "").strip() == ZID_STORE
+
+
+class ZidCollision(RuntimeError):
+    """[v2.12] A Salla order id is held in HubSpot by a Zid-import order. The
+    Salla order cannot be created until that Zid record is re-keyed; nothing
+    may be written to the Zid record in the meantime."""
+
+    def __init__(self, salla_order_id, zid_hs_id):
+        super().__init__(f"salla_order_id {salla_order_id} is held by Zid order "
+                         f"HS {zid_hs_id}")
+        self.salla_order_id = str(salla_order_id)
+        self.zid_hs_id = str(zid_hs_id)
 
 # Creation stage follows the order's CURRENT Salla status, keyed on
 # status.slug (expanded payloads expose the parent-level status). Unmapped
@@ -1023,15 +1049,31 @@ class HubSpot:
             raise RuntimeError(f"{what}: HubSpot search {status}: {json.dumps(data)[:300]}")
         return data
 
-    def find_order_by_salla_id(self, salla_order_id):
-        """v1.6: like the dedup search but returns the HubSpot order id."""
+    def orders_by_salla_id(self, salla_order_id):
+        """[v2.12] (salla_hs_id, zid_hs_id) for a Salla order id: the order a
+        search on salla_order_id finds, split by store. A Zid-import order
+        holding the same number is reported, never returned as the order."""
         data = self.search("/crm/v3/objects/orders/search", {
             "filterGroups": [{"filters": [{"propertyName": "salla_order_id",
                                            "operator": "EQ",
                                            "value": str(salla_order_id)}]}],
-            "properties": ["hs_object_id"], "limit": 1}, f"find {salla_order_id}")
-        results = data.get("results", [])
-        return results[0]["id"] if results else None
+            "properties": ["hs_object_id", "salla_store"], "limit": 10},
+            f"find {salla_order_id}")
+        salla = zid = None
+        for r in data.get("results", []):
+            if is_zid_order(r.get("properties")):
+                zid = zid or str(r["id"])
+            else:
+                salla = salla or str(r["id"])
+        if zid and not salla:
+            log.warning("ZID COLLISION: salla order %s -- HS %s is the Zid order "
+                        "with that number, not this order", salla_order_id, zid)
+        return salla, zid
+
+    def find_order_by_salla_id(self, salla_order_id):
+        """v1.6: like the dedup search but returns the HubSpot order id.
+        [v2.12] Never a Zid-import order (see orders_by_salla_id)."""
+        return self.orders_by_salla_id(salla_order_id)[0]
 
     def order_line_item_count(self, order_id):
         """v1.6: partial-order detector -- a crash between order create and
@@ -1044,13 +1086,10 @@ class HubSpot:
         return len((data or {}).get("results") or [])
 
     def dedup_order_exists(self, salla_order_id):
-        """[M310] POST /crm/v3/objects/orders/search on salla_order_id."""
-        data = self.search("/crm/v3/objects/orders/search", {
-            "filterGroups": [{"filters": [{"propertyName": "salla_order_id",
-                                           "operator": "EQ",
-                                           "value": str(salla_order_id)}]}],
-            "properties": ["hs_object_id"], "limit": 1}, f"dedup {salla_order_id}")
-        return int(data.get("total", 0)) > 0
+        """[M310] POST /crm/v3/objects/orders/search on salla_order_id.
+        [v2.12] A Zid-import order with the same number does not count: the
+        order goes on to the create path, which parks it as a collision."""
+        return bool(self.orders_by_salla_id(salla_order_id)[0])
 
     def _phone_filter_groups(self, mobile_code, mobile):
         """OR-groups covering every spelling a contact's phone may be stored in.
@@ -1350,7 +1389,13 @@ class HubSpot:
             # back to the search only when that fails. 2026-09-23: the search
             # came back empty 5 s later and the order was left without items.
             existing = self.existing_id_from_conflict(data, "salla_order_id")
-            if existing and not self._order_is(existing, order.get("id")):
+            holder = self._order_holder(existing, order.get("id")) if existing else None
+            if holder == "zid":
+                log.error("ZID COLLISION: salla order %s cannot be created -- "
+                          "salla_order_id is held by Zid order HS %s",
+                          order.get("id"), existing)
+                raise ZidCollision(order.get("id"), existing)
+            if holder != "salla":
                 existing = None
             if not existing:
                 log.warning("Order create rejected as duplicate for salla %s: "
@@ -1358,7 +1403,11 @@ class HubSpot:
                             order.get("id"), RACE_RETRY_WAIT_S)
                 time.sleep(RACE_RETRY_WAIT_S)
                 try:
-                    existing = self.find_order_by_salla_id(order.get("id"))
+                    existing, zid = self.orders_by_salla_id(order.get("id"))
+                    if zid and not existing:
+                        raise ZidCollision(order.get("id"), zid)
+                except ZidCollision:
+                    raise
                 except Exception as e:
                     log.error("Duplicate guardrail re-search failed: %s", e)
                     existing = None
@@ -1414,11 +1463,20 @@ class HubSpot:
         m = CONFLICT_HOLDER.search(text)
         return m.group(1) if m else None
 
-    def _order_is(self, hs_order_id, salla_order_id):
+    def _order_holder(self, hs_order_id, salla_order_id):
+        """[v2.12] "salla" when HS order `hs_order_id` is the Salla order of
+        that id, "zid" when it is the Zid-import order carrying the same
+        number, None when it is neither or the read fails."""
         status, data = self._req("GET", f"/crm/v3/objects/orders/{hs_order_id}"
-                                 "?properties=salla_order_id", what="order confirm")
-        return (status == 200 and str(dig(data, "properties.salla_order_id"))
-                == str(salla_order_id))
+                                 "?properties=salla_order_id,salla_store",
+                                 what="order confirm")
+        if status != 200 or (str(dig(data, "properties.salla_order_id"))
+                             != str(salla_order_id)):
+            return None
+        return "zid" if is_zid_order(data.get("properties")) else "salla"
+
+    def _order_is(self, hs_order_id, salla_order_id):
+        return self._order_holder(hs_order_id, salla_order_id) == "salla"
 
     def order_item_keys(self, order_id):
         """[v2.11] salla_order_item_id of every line item on an order, via the
@@ -1447,7 +1505,8 @@ class HubSpot:
                 return None
             for r in data.get("results") or []:
                 k = str(dig(r, "properties.salla_order_item_id") or "").strip()
-                if not k:
+                if not k or ZID_ITEM_KEY.match(k):
+                    # [v2.12] a Zid-import item: this is not a Salla order
                     return None
                 keys.add(k)
         return keys
@@ -2363,6 +2422,47 @@ class Engine:
             tl = self.__dict__.setdefault("_sig_tl", threading.local())
         tl.value = value
 
+    def zid_collision(self, oid, zid_hs_id):
+        """[v2.12] Record a Salla order whose id is held by a Zid-import
+        order and return the queue note. Callers park the row as terminal
+        (no retry loop). mirror/zid_collisions.json is the worklist for
+        tools/zid_rekey.py and makes the Slack alert fire once per order,
+        across processes. Nothing is written to the Zid record."""
+        oid = str(oid)
+        note = (f"zid collision: salla_order_id {oid} is held by Zid order "
+                f"HS {zid_hs_id}; not created -- tools/zid_rekey.py")
+        self.mirror.error(oid, "zid_collision", note)
+        self._bump("errors")
+        base = getattr(self.mirror, "dir", None)
+        path = Path(base if isinstance(base, (str, Path)) else "mirror") / "zid_collisions.json"
+        with ZID_LOCK:
+            try:
+                seen = json.loads(path.read_text()) if path.exists() else {}
+            except Exception:
+                seen = {}
+            first = oid not in seen
+            if first:
+                seen[oid] = {"zid_hs_id": str(zid_hs_id), "first_seen": now_str()}
+                if getattr(self.hs, "live", False):
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    tmp = path.with_suffix(".tmp")
+                    tmp.write_text(json.dumps(seen, indent=1, sort_keys=True))
+                    tmp.replace(path)
+        log.error("ZID COLLISION parked salla order %s (Zid HS %s)%s", oid,
+                  zid_hs_id, "" if first else " -- already known")
+        if first and getattr(self.cfg, "alerts_enabled", False) and getattr(self.hs, "live", False):
+            try:
+                import notify
+                notify.send_alert(
+                    "Salla order blocked by a Zid order number",
+                    f"Salla order {oid} was not created: HubSpot order {zid_hs_id} "
+                    f"is the imported Zid order with the same number. The queue "
+                    f"row is parked and nothing was written. Fix: "
+                    f"tools/zid_rekey.py --order {oid}")
+            except Exception as e:
+                log.warning("zid collision alert failed: %s", e)
+        return note
+
     def top_up_items(self, order, hs_order_id):
         """[v2.11] Add the line items an EXISTING order is missing, keyed by
         salla_order_item_id (unique in HubSpot, so nothing can double).
@@ -2405,8 +2505,12 @@ class Engine:
         oid = str(order.get("id"))
         self._order_signals = set()
         # [M2] order create
-        order_id, was_fresh = self.hs.create_order(
-            order, customer_id, self.cfg.salla_timezone_default)
+        try:
+            order_id, was_fresh = self.hs.create_order(
+                order, customer_id, self.cfg.salla_timezone_default)
+        except ZidCollision as zc:
+            self._outcome[oid] = ("held", self.zid_collision(oid, zc.zid_hs_id))
+            return
         if not order_id:  # [oe2 Ignore]
             self.mirror.error(oid, "order_create", "createAnOrder failed after retries")
             self._bump("errors")
