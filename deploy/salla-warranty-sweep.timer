@@ -1,0 +1,12 @@
+[Unit]
+Description=Warranty sweep, daily at 05:23
+
+[Timer]
+# 05:23 local: after the customer trim hour and the 04:41 customer sweep,
+# before the 09:00 digest; off every other job's minute.
+OnCalendar=*-*-* 05:23:00
+Persistent=true
+RandomizedDelaySec=120
+
+[Install]
+WantedBy=timers.target

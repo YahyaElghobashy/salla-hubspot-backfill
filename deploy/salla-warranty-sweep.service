@@ -1,0 +1,25 @@
+# Daily warranty sweep (tools/warranty_sweep.py, Repair Batch 1.0).
+#
+# Why it exists: the warranty workflow enrols an order when its stage
+# changes to Delivered or Completed. An order that reaches HubSpot already
+# delivered (released from the catalog gate days later, re-created after a
+# repair) never changes stage there and never got its warranties: 4,783
+# such orders were found on 2026-09-27. The sweep runs the deployed action's
+# own code (warranty_engine_action.py) on every delivered or completed Salla
+# order touched in the last 3 days that has no warranty, and voids any
+# warranty still active on a cancelled or returned order. Idempotent: the
+# action upserts by warranty key. STOP.warranty pauses it.
+[Unit]
+Description=Warranty sweep: delivered devices without a warranty, stale actives (daily)
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=integrations_claragroup_com
+WorkingDirectory=/home/integrations_claragroup_com/app
+ExecStart=/bin/bash -lc 'set -a; . /home/integrations_claragroup_com/app/.env; set +a; exec /home/integrations_claragroup_com/app/venv/bin/python3 tools/warranty_sweep.py --config config.live.json --days 3 --apply'
+Restart=no
+TimeoutStartSec=5400
+
+[Install]
+WantedBy=multi-user.target
