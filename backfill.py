@@ -715,10 +715,17 @@ class Config:
     customer_sweep_cap: int = 300
     consent_filler_days: int = 3
     consent_filler_cap: int = 400
-    # credit_watch retry-queue watch: {label: make scenario id}. Empty keeps
-    # the two relay scenarios. Items younger than dlq_min_age_minutes are left
-    # to Make's own automatic retry (it re-runs transient failures ~30 min on).
-    make_dlq_watch: dict = None
+    # [v2.12] credit_watch retry-queue watch, also the certificate's "make
+    # queue" section. make_dlq_watch: a list of {id, label, replay_note,
+    # stores_incomplete} ({label: id} is accepted too); None or empty
+    # watches the two relay scenarios plus credit_watch.DEFAULT_DLQ_WATCH.
+    # stores_incomplete defaults to true; false means Make does not keep that
+    # scenario's failed runs, so it is shown as not watchable. A list here
+    # replaces the whole default. Only items Make has given up on count:
+    # status=unresolved, never one it still has scheduled or in progress on
+    # its own backoff (1, 10, 10, 30, 30, 180, 180 min, about 7.4 h).
+    # dlq_min_age_minutes is a secondary floor on top of that.
+    make_dlq_watch: "list | dict | None" = None
     dlq_min_age_minutes: int = 45
     # Workbook capacity guard (Google caps a workbook at 10,000,000 cells).
     capacity_alert_pct: float = 80.0

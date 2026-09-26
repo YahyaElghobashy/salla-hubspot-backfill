@@ -78,6 +78,8 @@
   "make_hook_id": "",
   "make_backfill_scenario_id": "",
   "make_intake_scenario_id": "",
+  "make_dlq_watch": null,
+  "dlq_min_age_minutes": 45,
   "credit_alert_thresholds": [
     50000,
     10000,

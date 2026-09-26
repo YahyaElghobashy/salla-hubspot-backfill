@@ -505,37 +505,71 @@ ADVISORY_PHASES = ("make queue",)
 
 
 def phase_make_queue(cfg, get=None, now=None):
-    """[v2.12] Unresolved Make retry-queue items per watched scenario, older
-    than dlq_min_age_minutes (Make still owns younger ones: it retries
-    transient failures itself ~30 min on). The very read credit_watch alerts
-    from, so the certificate and the 12h alert can never disagree. One line
-    per scenario: clear, stuck (count, oldest age, replay note, link), or
-    not checked. Every read failing is NOT RECORDED, never 0."""
-    import credit_watch
-    rows = credit_watch.scan_dlq(cfg, get=get, now=now)
-    mins = int(getattr(cfg, "dlq_min_age_minutes", 45) or 0)
-    stuck = [r for r in rows if r["count"]]
-    unread = [r for r in rows if r["count"] is None]
-    total = sum(r["count"] for r in stuck)
-    detail = [credit_watch.dlq_line(r) for r in rows]
-    data = {"total": total, "by_scenario": credit_watch.dlq_state(rows)}
-    if not rows:
-        return Finding("make queue", True, True, "no Make scenarios watched",
-                       [], data)
-    if len(unread) == len(rows):
-        return Finding("make queue", False, False,
-                       "Make retry queues not recorded (Make API unreadable)",
+    """[v2.12] Make retry-queue items Make has given up on, per watched
+    scenario: status=unresolved, never one Make still has scheduled or in
+    progress on its own backoff (1, 10, 10, 30, 30, 180, 180 min, about
+    7.4 h), and older than dlq_min_age_minutes as a floor on top. The very
+    read credit_watch alerts from, so the certificate and the 12h alert can
+    never disagree. One line per scenario: clear, stuck (count, oldest age,
+    replay note, link), not checked, not measured (a capped scan with
+    nothing unresolved on the pages read), or not watchable (the scenario
+    does not store incomplete executions; left out of every count and of
+    ok). Every watchable read failing is NOT RECORDED, never 0. A malformed
+    config or any other error is NOT RECORDED too: this section is advisory
+    and must never cost the rest of the certificate."""
+    try:
+        import credit_watch
+        rows = credit_watch.scan_dlq(cfg, get=get, now=now)
+        mins = int(credit_watch.dlq_min_age(cfg))
+        watch = [r for r in rows if r["stores_incomplete"]]
+        blind = len(rows) - len(watch)
+        stuck = [r for r in watch if r["count"]]
+        unread = [r for r in watch if r["count"] is None]
+        errs = [r for r in unread if r["error"]]
+        floors = [r for r in unread if not r["error"]]
+        total = sum(r["count"] for r in stuck)
+        detail = [credit_watch.dlq_line(r) for r in rows]
+        data = {"total": total, "by_scenario": credit_watch.dlq_state(rows)}
+        if not rows:
+            return Finding("make queue", True, True,
+                           "no Make scenarios watched", [], data)
+        if not watch:
+            return Finding("make queue", True, True,
+                           f"no watchable Make retry queue ({blind} "
+                           f"scenario(s) do not store incomplete executions)",
+                           detail, data)
+        if len(unread) == len(watch):
+            why = ("Make API unreadable" if len(errs) == len(unread)
+                   else "not measured")
+            return Finding("make queue", False, False,
+                           f"Make retry queues not recorded ({why})",
+                           detail, data)
+        if stuck:
+            summary = (f"{total} unresolved Make item(s) older than {mins} "
+                       f"min in {len(stuck)} of {len(watch)} scenario(s)")
+        else:
+            summary = (f"no Make retry-queue items older than {mins} min in "
+                       f"{len(watch) - len(unread)} scenario(s)")
+        if errs:
+            summary += f"; {len(errs)} scenario(s) not checked"
+        if floors:
+            summary += f"; {len(floors)} not measured"
+        if blind:
+            summary += f"; {blind} not watchable"
+        return Finding("make queue", True, not stuck and not unread, summary,
                        detail, data)
-    if stuck:
-        summary = (f"{total} unresolved Make item(s) older than {mins} min "
-                   f"in {len(stuck)} of {len(rows)} scenario(s)")
-    else:
-        summary = (f"no Make retry-queue items older than {mins} min in "
-                   f"{len(rows) - len(unread)} scenario(s)")
-    if unread:
-        summary += f"; {len(unread)} scenario(s) not checked"
-    return Finding("make queue", True, not stuck and not unread, summary,
-                   detail, data)
+    except Exception as e:
+        try:
+            from credit_watch import _safe_err
+            err = _safe_err(e)
+        except Exception:
+            err = type(e).__name__
+        log.warning("make queue section not recorded: %s", err)
+        return Finding("make queue", False, False,
+                       "Make retry queues not recorded (config or read "
+                       "error)",
+                       [f"not recorded (config or read error: "
+                        f"{type(e).__name__})"], {})
 
 
 # --------------------------------------------------------------------------
