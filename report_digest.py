@@ -127,6 +127,8 @@ def ledger_total(path, start, end, stage_field=None):
             d = (row.get("ts") or "")[:10]
             if not d or d < start or d > end:
                 continue
+            if "hubspot_order_id" in row and not (row.get("hubspot_order_id") or "").strip():
+                continue   # [v2.12] CreatedLedger.revoke tombstone, not a create
             total += 1
             if stage_field:
                 k = (row.get(stage_field) or "unknown").strip()
@@ -225,7 +227,8 @@ def _live_held():
         rows = gio.queue_read(cfg.queue_spreadsheet_id, start_row=2,
                               tab=getattr(cfg, "live_queue_tab", "Live Queue"))
         held = [r for r in rows or []
-                if str(r.get("status") or r.get("state") or "") == "held"]
+                if str(r.get("status") or r.get("state") or "") == "held"
+                and not str(r.get("note") or "").startswith("zid collision")]
         oldest = None
         names = {}
         for r in held:

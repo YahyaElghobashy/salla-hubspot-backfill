@@ -159,10 +159,12 @@ class StatusRelay(RealtimeConsumer):
         # salla_order_id and salla_order_reference; it is never the Salla
         # order, whatever number it shares with it
         mine = [r for r in res if not is_zid_order(r.get("properties"))]
+        self._zid_holder = None
         if res and not mine:
+            self._zid_holder = str(res[0].get("id"))
             log.warning("ZID COLLISION: status for salla order %s (ref %s) "
                         "matched only Zid order HS %s -- not applied",
-                        order_id, reference_id, res[0].get("id"))
+                        order_id, reference_id, self._zid_holder)
         return mine[0] if mine else None
 
     def _refresh_live_index(self):
@@ -187,8 +189,8 @@ class StatusRelay(RealtimeConsumer):
         if min_ref <= 0:
             return None
         self._refresh_live_index()
-        state, _ = self._live_index.get(str(oid), ("", ""))
-        if state == "held":
+        state, note = self._live_index.get(str(oid), ("", ""))
+        if state == "held" and not str(note).startswith("zid collision"):
             return "held"
         if state:
             # the live engine SAW this order (done/error/gone) yet HubSpot
@@ -201,7 +203,7 @@ class StatusRelay(RealtimeConsumer):
 
     def _held_summary(self):
         held = [(o, note) for o, (st, note) in self._live_index.items()
-                if st == "held"]
+                if st == "held" and not str(note).startswith("zid collision")]
         names = {}
         for _, note in held:
             if note.startswith("catalog gate:"):
@@ -354,6 +356,21 @@ class StatusRelay(RealtimeConsumer):
             return "superseded", f"older than applied event ({slug})"
 
         hs_order = self._find_order(oid, row["reference_id"])
+        zid = getattr(self, "_zid_holder", None)
+        if hs_order is None and zid:
+            # [v2.12] the only match is the imported Zid order with the same
+            # number: the Salla order cannot exist until that record is
+            # re-keyed, so waiting ~8 h for it helps nobody
+            self._exception_row(row, slug, "Order number held by an imported Zid "
+                                "order", "Salla order is created after the Zid "
+                                "order is re-keyed; nothing changed", hs_order_id="")
+            self._alert(f"zid:{oid}",
+                        "🟠 Delivery status for an order blocked by a Zid number",
+                        f"Order {oid} got status “{slug}”, but HubSpot order {zid} "
+                        f"is the imported Zid order with the same number, so the "
+                        f"Salla order is not in HubSpot yet. Nothing was changed "
+                        f"on the Zid order.\n{self._links_line()}")
+            return "error-final", f"zid collision: number held by Zid HS {zid}"
         if hs_order is None:
             attempts = int(row["attempts"] or 0)
             if attempts >= len(self.ladder):

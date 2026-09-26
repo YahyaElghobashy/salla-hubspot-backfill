@@ -60,15 +60,37 @@ class TestLookups(unittest.TestCase):
         self.assertEqual(merged.orders_by_salla_id("57671183"), ("1284409404634", None))
         self.assertIn("hs_source_store", merged.search.call_args[0][1]["properties"])
 
-    def test_zid_item_keys_make_the_order_unsafe(self):
+    def test_zid_item_keys_are_left_out(self):
         hs = hs_with([])
 
         def req(method, path, body=None, is_search=False, what=""):
             if "associations" in path:
-                return 200, {"results": [{"toObjectId": 1}]}
-            return 200, {"results": [{"properties": {"salla_order_item_id": "Z4938528-1"}}]}
+                return 200, {"results": [{"toObjectId": 1}, {"toObjectId": 2}, {"toObjectId": 3}]}
+            return 200, {"results": [
+                {"properties": {"salla_order_item_id": "Z57671183-1"}},
+                {"properties": {"salla_order_item_id": "Z57671183-2.1"}},
+                {"properties": {"salla_order_item_id": "635576180"}}]}
         hs._req = req
-        self.assertIsNone(hs.order_item_keys("1337741441227"))
+        self.assertEqual(hs.order_item_keys("1284409404634"), {"635576180"})
+
+    def test_zid_key_pattern(self):
+        m = backfill.ZID_ITEM_KEY.match
+        for k in ("Z4938528-1", "Z4938528-12.3", "Z4938528-1_C10"):
+            self.assertTrue(m(k), k)
+        for k in ("635576180", "617268197_C10", "Z-1", "4938528-1"):
+            self.assertFalse(m(k), k)
+
+
+class TestLedgerRevoke(unittest.TestCase):
+    def test_revoked_entry_reads_as_absent_after_reload(self):
+        _chdir_tmp(self)
+        led = backfill.CreatedLedger("mirror")
+        led.add("57671183", "1337741441227")
+        led.revoke("57671183")
+        self.assertIsNone(led.get("57671183"))
+        self.assertIsNone(backfill.CreatedLedger("mirror").get("57671183"))
+        led.add("57671183", "1378999")
+        self.assertEqual(backfill.CreatedLedger("mirror").get("57671183"), "1378999")
 
 
 class TestCreate(unittest.TestCase):
@@ -168,6 +190,21 @@ class TestDrainPath(unittest.TestCase):
 
 
 class TestStatusRelay(unittest.TestCase):
+    def test_zid_only_match_gives_up_at_once(self):
+        f = types.SimpleNamespace(hs=hs_with([ZID]), stage_map={"shipped": "S1"},
+                                  ledger=types.SimpleNamespace(newer_than_applied=lambda o, t: True),
+                                  parse_event=status_relay.StatusRelay.parse_event,
+                                  _exception_row=mock.Mock(), _alert=mock.Mock(),
+                                  _links_line=lambda: "")
+        f._find_order = lambda oid, ref: status_relay.StatusRelay._find_order(f, oid, ref)
+        row = {"order_id": "4938528", "reference_id": "287459205",
+               "event": "status:shipped@2026-09-26 04:00:00", "attempts": 0}
+        state, note = status_relay.StatusRelay.handle_row(f, row)
+        self.assertEqual(state, "error-final")
+        self.assertIn("zid collision", note)
+        f._exception_row.assert_called_once()
+        f._alert.assert_called_once()
+
     def test_zid_match_is_ignored(self):
         f = types.SimpleNamespace(hs=hs_with([ZID]))
         self.assertIsNone(status_relay.StatusRelay._find_order(f, "4938528", "287459205"))

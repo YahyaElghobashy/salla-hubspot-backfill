@@ -77,7 +77,9 @@ CONFLICT_HOLDER = re.compile(r"(\d{6,}) already has that value")
 # merged 52 Zid orders into the Salla orders holding their numbers and set
 # salla_store "Zid" on those genuine Salla orders (hs_source_store "Salla").
 ZID_STORE = "Zid"
-ZID_ITEM_KEY = re.compile(r"^Z\d+-\d+$")
+# Z<number>-<seq>, plus bundle components Z<number>-<seq>.<k> and template
+# suffixes Z<number>-<seq>_<code> written by the import's legacy route
+ZID_ITEM_KEY = re.compile(r"^Z\d+-\d+([._].*)?$")
 ZID_LOCK = threading.Lock()
 ORDER_STORE_PROPS = ["salla_store", "hs_source_store"]
 
@@ -960,7 +962,17 @@ class CreatedLedger:
                 csv.writer(f).writerow(["ts", "salla_order_id", "hubspot_order_id"])
 
     def get(self, salla_order_id):
-        return self._map.get(str(salla_order_id))
+        return self._map.get(str(salla_order_id)) or None
+
+    def revoke(self, salla_order_id):
+        """[v2.12] Tombstone an entry that pointed at the wrong record (a Zid
+        order holding the same number): an empty hubspot_order_id row, which
+        last-wins loading turns into "not synced". Readers that count rows
+        must skip empty ids (report_digest.ledger_total does)."""
+        with self._lock:
+            self._map.pop(str(salla_order_id), None)
+            with open(self.path, "a", newline="") as f:
+                csv.writer(f).writerow([now_str(), salla_order_id, ""])
 
     def add(self, salla_order_id, hubspot_order_id):
         with self._lock:
@@ -1509,9 +1521,14 @@ class HubSpot:
                 return None
             for r in data.get("results") or []:
                 k = str(dig(r, "properties.salla_order_item_id") or "").strip()
-                if not k or ZID_ITEM_KEY.match(k):
-                    # [v2.12] a Zid-import item: this is not a Salla order
+                if not k:
                     return None
+                if ZID_ITEM_KEY.match(k):
+                    # [v2.12] a Zid item merged onto a Salla order (the
+                    # 2026-09-16 zed_create_missing run did this to 52):
+                    # it is not one of this order's Salla items, so it is
+                    # left out and the Salla items are still compared by key
+                    continue
                 keys.add(k)
         return keys
 
@@ -2429,40 +2446,55 @@ class Engine:
     def zid_collision(self, oid, zid_hs_id):
         """[v2.12] Record a Salla order whose id is held by a Zid-import
         order and return the queue note. Callers park the row as terminal
-        (no retry loop). mirror/zid_collisions.json is the worklist for
-        tools/zid_rekey.py and makes the Slack alert fire once per order,
-        across processes. Nothing is written to the Zid record."""
+        (no retry loop). mirror/zid_collisions.json is the worklist for the
+        re-key and makes the errors.csv row and the Slack alert happen once
+        per order, across processes. Nothing is written to the Zid record.
+        Dry runs only log. Never raises: the note is returned even when the
+        worklist cannot be written, so the row is always parked."""
         oid = str(oid)
         note = (f"zid collision: salla_order_id {oid} is held by Zid order "
-                f"HS {zid_hs_id}; not created -- tools/zid_rekey.py")
-        self.mirror.error(oid, "zid_collision", note)
-        self._bump("errors")
-        base = getattr(self.mirror, "dir", None)
-        path = Path(base if isinstance(base, (str, Path)) else "mirror") / "zid_collisions.json"
-        with ZID_LOCK:
-            try:
-                seen = json.loads(path.read_text()) if path.exists() else {}
-            except Exception:
-                seen = {}
-            first = oid not in seen
-            if first:
-                seen[oid] = {"zid_hs_id": str(zid_hs_id), "first_seen": now_str()}
-                if getattr(self.hs, "live", False):
+                f"HS {zid_hs_id}; Salla order not created, awaiting Zid re-key")
+        if not getattr(self.hs, "live", False):
+            log.warning("ZID COLLISION (dry run, would park) salla order %s "
+                        "(Zid HS %s)", oid, zid_hs_id)
+            return note
+        first = True
+        try:
+            base = getattr(self.mirror, "dir", None)
+            path = Path(base if isinstance(base, (str, Path)) else "mirror") / "zid_collisions.json"
+            with ZID_LOCK:
+                try:
+                    seen = json.loads(path.read_text()) if path.exists() else {}
+                except Exception:
+                    seen = {}
+                first = oid not in seen
+                if first:
+                    seen[oid] = {"zid_hs_id": str(zid_hs_id), "first_seen": now_str()}
                     path.parent.mkdir(parents=True, exist_ok=True)
                     tmp = path.with_suffix(".tmp")
                     tmp.write_text(json.dumps(seen, indent=1, sort_keys=True))
                     tmp.replace(path)
+        except Exception as e:
+            log.warning("zid collision worklist not updated for %s: %s", oid, e)
         log.error("ZID COLLISION parked salla order %s (Zid HS %s)%s", oid,
                   zid_hs_id, "" if first else " -- already known")
-        if first and getattr(self.cfg, "alerts_enabled", False) and getattr(self.hs, "live", False):
+        if not first:
+            return note
+        try:
+            self.mirror.error(oid, "zid_collision", note)
+            self._bump("errors")
+        except Exception as e:
+            log.warning("zid collision ledger row failed for %s: %s", oid, e)
+        if getattr(self.cfg, "alerts_enabled", False):
             try:
                 import notify
                 notify.send_alert(
                     "Salla order blocked by a Zid order number",
                     f"Salla order {oid} was not created: HubSpot order {zid_hs_id} "
-                    f"is the imported Zid order with the same number. The queue "
-                    f"row is parked and nothing was written. Fix: "
-                    f"tools/zid_rekey.py --order {oid}")
+                    f"is the imported Zid order with the same number, and order "
+                    f"numbers must be unique. The queue row is parked and nothing "
+                    f"was written to the Zid order. The Salla order is created "
+                    f"once the Zid order is re-keyed.")
             except Exception as e:
                 log.warning("zid collision alert failed: %s", e)
         return note
