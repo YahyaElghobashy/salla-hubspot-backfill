@@ -977,17 +977,37 @@ class CreatedLedger:
         self._lock = threading.Lock()
         self._map = {}
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        if self.path.exists():
-            with open(self.path, newline="") as f:
-                for row in csv.reader(f):
-                    if len(row) >= 3 and row[1] != "salla_order_id":
-                        self._map[str(row[1])] = str(row[2])
-        else:
+        if not self.path.exists():
             with open(self.path, "w", newline="") as f:
                 csv.writer(f).writerow(["ts", "salla_order_id", "hubspot_order_id"])
+        self._load()
+
+    def _load(self):
+        self._map = {}
+        with open(self.path, newline="") as f:
+            for row in csv.reader(f):
+                if len(row) >= 3 and row[1] != "salla_order_id":
+                    self._map[str(row[1])] = str(row[2])
+        st = self.path.stat()
+        self._seen = (st.st_mtime_ns, st.st_size)
+
+    def _refresh(self):
+        """[v2.12] Re-read the file when another process changed it. A tool
+        that revokes an entry (zid_rekey.py) must be seen by the running
+        engine at once: on 2026-09-27 the engine marked 18 requeued orders
+        "synced by this engine" from a map loaded before the revoke. One
+        stat per lookup; our own appends update the marker as they land."""
+        try:
+            st = self.path.stat()
+        except OSError:
+            return
+        if (st.st_mtime_ns, st.st_size) != self._seen:
+            self._load()
 
     def get(self, salla_order_id):
-        return self._map.get(str(salla_order_id)) or None
+        with self._lock:
+            self._refresh()
+            return self._map.get(str(salla_order_id)) or None
 
     def revoke(self, salla_order_id):
         """[v2.12] Tombstone an entry that pointed at the wrong record (a Zid
@@ -995,15 +1015,21 @@ class CreatedLedger:
         last-wins loading turns into "not synced". Readers that count rows
         must skip empty ids (report_digest.ledger_total does)."""
         with self._lock:
+            self._refresh()
             self._map.pop(str(salla_order_id), None)
             with open(self.path, "a", newline="") as f:
                 csv.writer(f).writerow([now_str(), salla_order_id, ""])
+            st = self.path.stat()
+            self._seen = (st.st_mtime_ns, st.st_size)
 
     def add(self, salla_order_id, hubspot_order_id):
         with self._lock:
+            self._refresh()
             self._map[str(salla_order_id)] = str(hubspot_order_id)
             with open(self.path, "a", newline="") as f:
                 csv.writer(f).writerow([now_str(), salla_order_id, hubspot_order_id])
+            st = self.path.stat()
+            self._seen = (st.st_mtime_ns, st.st_size)
 
 
 # ----------------------------------------------------------------------------

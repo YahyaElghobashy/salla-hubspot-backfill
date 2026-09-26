@@ -82,6 +82,21 @@ class TestLookups(unittest.TestCase):
 
 
 class TestLedgerRevoke(unittest.TestCase):
+    def test_another_process_revoke_is_seen_without_restart(self):
+        """[v2.12] the engine's live ledger object must notice a tombstone
+        written by a tool (a second CreatedLedger on the same file)."""
+        _chdir_tmp(self)
+        engine_view = backfill.CreatedLedger("mirror")
+        engine_view.add("57671183", "1337741441227")
+        import os, time
+        tool_view = backfill.CreatedLedger("mirror")
+        tool_view.revoke("57671183")
+        os.utime("mirror/created.csv", (time.time() + 2, time.time() + 2))   # force a visible change
+        self.assertIsNone(engine_view.get("57671183"))
+        tool_view.add("57671183", "1378999")
+        os.utime("mirror/created.csv", (time.time() + 4, time.time() + 4))
+        self.assertEqual(engine_view.get("57671183"), "1378999")
+
     def test_revoked_entry_reads_as_absent_after_reload(self):
         _chdir_tmp(self)
         led = backfill.CreatedLedger("mirror")
