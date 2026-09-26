@@ -26,6 +26,12 @@ unless --include-unlinked. A replayed row keeps its arrival columns only:
 updates the engine made after a -1 append never reached the sheet, and
 update events mirrored before v2.12 carry no order id to rebuild them from.
 
+An order with a -1 update but no arrival event in the window is reported as
+no_arrival_in_range. Either it arrived before --since (widen the window), or
+its arrival was never mirrored at all: before v2.12 queue_drain.py appended
+arrival rows for drained orders without a mirror event. No window finds
+those, so their audit row has to be added by hand.
+
 Run from the app directory:
     python3 tools/audit_replay.py                                     # dry run
     python3 tools/audit_replay.py --since 2026-09-23 --until 2026-09-25 --apply
@@ -120,7 +126,10 @@ def replay(cfg, gio, mirror_dir="mirror", since=DEFAULT_SINCE, until=DEFAULT_UNT
 
         for oid in sorted(rowless - set(arrivals)):
             log.warning("order %s: -1 update in range but no arrival event in "
-                        "range; widen --since to replay it", oid)
+                        "range. Widen --since if it arrived earlier; if no window "
+                        "finds one, its arrival was never mirrored (queue drain "
+                        "arrivals before v2.12) and its audit row has to be "
+                        "added by hand", oid)
             record(oid, None, "row -1", "no_arrival_in_range")
 
         candidates = [d for oid, d in arrivals.items()

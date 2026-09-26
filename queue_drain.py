@@ -448,6 +448,9 @@ class QueueDrainEngine(Engine):
                    10: ",".join(str(i.get("name", "")) for i in items),
                    11: "Order Arrived", 29: now_str(), 30: "Yes"}
             audit_row = self.gio.audit_append(add)
+            # [v2.12] mirrored like the engine's arrival, so a -1 row here is
+            # replayable by tools/audit_replay.py
+            self.mirror.audit_event("arrived_append", audit_row, add, order_id=oid)
             self._audit_rows[oid] = audit_row
         self.route_create(order, audit_row)   # sets self._outcome[oid]
         outcome, hs_ref = self._outcome.pop(oid, ("error", ""))

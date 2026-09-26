@@ -732,9 +732,11 @@ class Config:
     # ---- v2.12 audit append hardening (GoogleIO.audit_append) -----------
     # A Sheets 500/502/timeout on the arrival append used to fire the fallback
     # append at once, into the same outage (13 times; 2 rows lost). The
-    # fallback now waits these many seconds before each attempt, and first
-    # reads column A of at least the tab's last audit_dedup_rows rows: an
-    # append that landed despite its error is reused, never doubled. Every
+    # fallback now waits these many seconds before each attempt (a list, or
+    # one number for a single attempt; anything else falls back to 3 s, 10 s
+    # with a warning), and first reads column A of the tab's tail: an append
+    # that landed despite its error is reused, never doubled, when it sits
+    # among the last audit_dedup_rows rows that carry an order id. Every
     # fallback outcome is one row in audit_fallback_ledger ("" disables it).
     audit_fallback_backoff_s: tuple = (3.0, 10.0)
     audit_dedup_rows: int = 50
@@ -1711,6 +1713,7 @@ class GoogleIO:
             return ""
 
     AUDIT_FALLBACK_TEXT = "JSON exceeded limit - use Order Ops > Backfill JSON from Salla"
+    AUDIT_BACKOFF_DEFAULT = (3.0, 10.0)
     AUDIT_TAIL_PAGE = 1000       # rows per column-A read when walking up the tab
     AUDIT_TAIL_MAX_PAGES = 5
     _ledger_lock = threading.Lock()   # lanes share one fallback ledger
@@ -1721,19 +1724,25 @@ class GoogleIO:
         [v2.12] When the append raises (Sheets 500/502/timeout), the fallback
         no longer fires straight into the same outage. Before each fallback
         attempt it waits (cfg.audit_fallback_backoff_s, 3 s then 10 s), then
-        reads column A of the tab's last rows: a first append that landed
-        despite its error is found there and its row returned, so no twin row
-        is written (a row the same order got moments earlier, e.g. on a retry,
-        is reused the same way: its updates land on that row). Each outcome (found / fallback / lost) is recorded in
-        cfg.audit_fallback_ledger. A lost row (-1) is recoverable later with
-        tools/audit_replay.py from mirror/audit_mirror.csv."""
+        reads column A of the tab's tail: a first append that landed despite
+        its error is found among the last cfg.audit_dedup_rows id-bearing
+        rows and its row returned, so no twin row is written (a row the same
+        order got moments earlier, e.g. on a retry, is reused the same way:
+        its updates land on that row). The first attempt re-sends the original
+        values, Drive link included; the [oe203] fallback row (column 27 set
+        to AUDIT_FALLBACK_TEXT) is written only after a 400/invalid argument,
+        the oversized-cell case, or on the final attempt. Each outcome (found /
+        retried / fallback / lost, "_unchecked" when column A could not be
+        read) is recorded in cfg.audit_fallback_ledger. A lost row (-1) is
+        recoverable later with tools/audit_replay.py from
+        mirror/audit_mirror.csv."""
         if not self.enabled:
             return -1
         log.debug("PHASE sheet append")  # v1.2 observability
         try:
             return self._audit_append_row(values_by_idx, "audit append")
         except Exception as e:  # [oe203] fallback row semantics
-            log.error("Audit append failed, writing fallback row: %s", e)
+            log.error("Audit append failed, retrying after a backoff: %s", e)
             return self._audit_fallback(values_by_idx, e)
 
     def _audit_append_row(self, values_by_idx, what):
@@ -1753,14 +1762,64 @@ class GoogleIO:
             self._audit_last_row = n
         return n
 
+    def _audit_backoff(self):
+        """[v2.12] cfg.audit_fallback_backoff_s as a list of seconds: one
+        number is a single attempt, a list or tuple one attempt per entry, an
+        empty one a single attempt without a wait. Any other type, or a
+        negative or non-finite entry, is logged and AUDIT_BACKOFF_DEFAULT
+        used, so a config typo never breaks the order path."""
+        raw = getattr(self.cfg, "audit_fallback_backoff_s", self.AUDIT_BACKOFF_DEFAULT)
+        try:
+            if isinstance(raw, bool):
+                raise TypeError("bool")
+            if isinstance(raw, (int, float)):
+                raw_list = [raw]
+            elif isinstance(raw, (list, tuple)):
+                raw_list = list(raw)
+            else:
+                raise TypeError(type(raw).__name__)
+            if any(isinstance(d, bool) for d in raw_list):
+                raise TypeError("bool")
+            delays = [float(d) for d in raw_list]
+            if not all(0.0 <= d < float("inf") for d in delays):   # NaN fails too
+                raise ValueError("negative or non-finite")
+        except (TypeError, ValueError) as e:
+            log.warning("audit_fallback_backoff_s=%r is not seconds or a list of "
+                        "seconds (%s); using %s", raw, e,
+                        list(self.AUDIT_BACKOFF_DEFAULT))
+            return list(self.AUDIT_BACKOFF_DEFAULT)
+        return delays or [0.0]
+
+    @staticmethod
+    def _audit_invalid_argument(e):
+        """True for a Sheets 400 / INVALID_ARGUMENT: the row itself was
+        rejected (an oversized cell), so sending it again cannot succeed."""
+        status = getattr(getattr(e, "resp", None), "status", None)
+        if status is None:
+            status = getattr(e, "status_code", None)
+        try:
+            if int(status) == 400:
+                return True
+        except (TypeError, ValueError):
+            pass
+        s = str(e).lower()
+        return ("httperror 400" in s or "invalid_argument" in s
+                or "invalid argument" in s)
+
     def _audit_fallback(self, values_by_idx, first_error):
-        """[v2.12] Wait, look for the row, then append the fallback row."""
+        """[v2.12] Wait, look for the row, then append it again.
+
+        A 500/502/timeout says nothing about the row, so the first attempt
+        re-sends the original values (Drive link kept). The [oe203] fallback
+        row, column 27 replaced by AUDIT_FALLBACK_TEXT, is sent once an error
+        was a 400/invalid argument (the oversized-cell case), and on the
+        final attempt."""
         oid = self._norm_id(values_by_idx.get(0, ""))
         fb = dict(values_by_idx)
         fb[27] = self.AUDIT_FALLBACK_TEXT
-        delays = [float(d) for d in (getattr(self.cfg, "audit_fallback_backoff_s", None)
-                                     or ())] or [0.0]
+        delays = self._audit_backoff()
         last_error = first_error
+        oversized = False
         for attempt, delay in enumerate(delays, 1):
             checked = False
             log.warning("Audit fallback for order %s: waiting %.0fs (attempt %d/%d)",
@@ -1779,15 +1838,22 @@ class GoogleIO:
                                 "the error; no second row written", oid, found)
                     self._audit_outcome(oid, "found", found, attempt, first_error)
                     return found
+            # once rejected as invalid, the original row is never sent again
+            oversized = oversized or self._audit_invalid_argument(last_error)
+            use_fb = oversized or attempt == len(delays)
             try:
-                n = self._audit_append_row(fb, "audit fallback append")
+                n = self._audit_append_row(
+                    fb if use_fb else values_by_idx,
+                    "audit fallback append" if use_fb else "audit append retry")
             except Exception as e:
                 last_error = e
-                log.error("Audit fallback append failed for order %s (attempt %d/%d): %s",
+                log.error("Audit %s failed for order %s (attempt %d/%d): %s",
+                          "fallback append" if use_fb else "append retry",
                           oid or "?", attempt, len(delays), e)
                 continue
-            self._audit_outcome(oid, "fallback" if checked or not oid
-                                else "fallback_unchecked", n, attempt, first_error)
+            kind = "fallback" if use_fb else "retried"
+            self._audit_outcome(oid, kind if checked or not oid else kind + "_unchecked",
+                                n, attempt, first_error)
             return n
         log.error("Audit fallback append also failed: %s", last_error)
         self._audit_outcome(oid, "lost", -1, len(delays), last_error)
@@ -1842,9 +1908,16 @@ class GoogleIO:
         return out
 
     def _audit_find(self, oid):
-        """Last audit row among the tail rows whose column A is `oid`, or None."""
+        """Last audit row whose column A is `oid` among the last
+        cfg.audit_dedup_rows id-bearing rows of the tab, or None.
+
+        The tail read can return far more than that (a stale hint reads from
+        far above the bottom, a page walk reads 1000 rows), so it is cut to
+        the bottom n rows that carry an id first: an older row of the same
+        order higher up is never taken for this append."""
         n = max(1, int(getattr(self.cfg, "audit_dedup_rows", 50) or 50))
-        rows = [r for r, got in self._audit_tail(n) if got == str(oid)]
+        window = [(r, got) for r, got in self._audit_tail(n) if got][-n:]
+        rows = [r for r, got in window if got == str(oid)]
         return rows[-1] if rows else None
 
     def _audit_outcome(self, oid, outcome, sheet_row, attempts, error):

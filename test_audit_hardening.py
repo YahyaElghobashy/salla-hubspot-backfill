@@ -23,6 +23,14 @@ from tools import audit_replay
 TAB = "Order Audit Log"
 
 
+class FakeHttpError(Exception):
+    """Shaped like googleapiclient's HttpError: the status is on .resp."""
+
+    def __init__(self, status, text):
+        super().__init__(f"<HttpError {status} when requesting append returned \"{text}\">")
+        self.resp = type("Resp", (), {"status": status})()
+
+
 class FakeReq:
     def __init__(self, fn):
         self.fn = fn
@@ -40,6 +48,9 @@ class FakeValues:
             mode = self.svc.append_script.pop(0) if self.svc.append_script else "ok"
             if mode == "fail":
                 raise TimeoutError("The read operation timed out")
+            if mode == "bad":   # the row itself rejected, e.g. an oversized cell
+                raise FakeHttpError(400, "Your input contains more than the maximum "
+                                         "of 50000 characters in a single cell.")
             self.svc.rows.append(list(body["values"][0]))
             n = len(self.svc.rows)
             if mode == "land":  # written server-side, error on the way back
@@ -76,7 +87,7 @@ class FakeSheets:
     def __init__(self, ids=(), blank_tail=0):
         self.rows = [["Salla Order ID"]] + [[str(i)] + [""] * (AUDIT_WIDTH - 1) for i in ids]
         self.blank_tail = blank_tail
-        self.append_script = []   # per append: "ok" | "fail" | "land"
+        self.append_script = []   # per append: "ok" | "fail" | "land" | "bad"
         self.read_fail = 0
         self.reads = []
         self.meta_calls = 0
@@ -131,7 +142,10 @@ def _ledger(path="mirror/audit_fallback.csv"):
         return list(csv.DictReader(f))
 
 
-def _arrival(oid, link="https://drive.google.com/file/d/x/view"):
+LINK = "https://drive.google.com/file/d/x/view"
+
+
+def _arrival(oid, link=LINK):
     return {0: oid, 1: f"R{oid}", 11: "Order Arrived", 27: link,
             29: "2026-09-24 10:00:00", 30: "No"}
 
@@ -177,15 +191,53 @@ class TestAuditAppendFallback(unittest.TestCase):
                          [("5001", "found", "32")])
         self.assertEqual(g.audit_fallback_counts, {"found": 1})
 
-    def test_fallback_row_after_backoff_when_first_did_not_land(self):
+    def appends(self, g):
+        return [w for w in g.whats if w.startswith("audit") and "append" in w]
+
+    def test_first_retry_after_backoff_keeps_the_drive_link(self):
         g = self.gio()
         self.svc.append_script = ["fail", "ok"]
         row = g.audit_append(_arrival("5001"))
         self.assertEqual(row, 32)
         self.assertEqual(self.sleeps, [3.0])
+        self.assertEqual(self.svc.rows[-1][27], LINK)          # original values
+        self.assertEqual(self.appends(g), ["audit append", "audit append retry"])
+        self.assertEqual(self.svc.col_a().count("5001"), 1)
+        self.assertEqual(_ledger()[0]["outcome"], "retried")
+        self.assertEqual(g.audit_fallback_counts, {"retried": 1})
+
+    def test_invalid_argument_sends_the_fallback_text_at_once(self):
+        g = self.gio()
+        self.svc.append_script = ["bad", "ok"]
+        self.assertEqual(g.audit_append(_arrival("5001")), 32)
+        self.assertEqual(self.sleeps, [3.0])
+        self.assertEqual(self.svc.rows[-1][27], backfill.GoogleIO.AUDIT_FALLBACK_TEXT)
+        self.assertEqual(self.svc.rows[-1][1], "R5001")        # rest of the row kept
+        self.assertEqual(self.appends(g), ["audit append", "audit fallback append"])
+        led = _ledger()[0]
+        self.assertEqual(led["outcome"], "fallback")
+        self.assertIn("HttpError 400", led["error"])
+
+    def test_invalid_argument_on_a_retry_is_never_resent(self):
+        self.cfg.audit_fallback_backoff_s = [1, 2, 4]
+        g = self.gio()
+        self.svc.append_script = ["fail", "bad", "fail", "ok"]
+        self.assertEqual(g.audit_append(_arrival("5001")), 32)
+        self.assertEqual(self.appends(g), ["audit append", "audit append retry",
+                                           "audit fallback append", "audit fallback append"])
+        self.assertEqual(self.svc.rows[-1][27], backfill.GoogleIO.AUDIT_FALLBACK_TEXT)
+
+    def test_final_attempt_sends_the_fallback_text(self):
+        g = self.gio()
+        self.svc.append_script = ["fail", "fail", "ok"]
+        self.assertEqual(g.audit_append(_arrival("5001")), 32)
+        self.assertEqual(self.sleeps, [3.0, 10.0])
+        self.assertEqual(self.appends(g), ["audit append", "audit append retry",
+                                           "audit fallback append"])
         self.assertEqual(self.svc.rows[-1][27], backfill.GoogleIO.AUDIT_FALLBACK_TEXT)
         self.assertEqual(self.svc.col_a().count("5001"), 1)
-        self.assertEqual(_ledger()[0]["outcome"], "fallback")
+        led = _ledger()[0]
+        self.assertEqual((led["outcome"], led["attempts"]), ("fallback", "2"))
 
     def test_second_attempt_rechecks_a_fallback_that_landed(self):
         g = self.gio()
@@ -213,7 +265,7 @@ class TestAuditAppendFallback(unittest.TestCase):
         self.svc.append_script = ["fail", "ok"]
         self.svc.read_fail = 5
         self.assertEqual(g.audit_append(_arrival("5001")), 32)
-        self.assertEqual(_ledger()[0]["outcome"], "fallback_unchecked")
+        self.assertEqual(_ledger()[0]["outcome"], "retried_unchecked")
 
     def test_backoff_schedule_is_configurable(self):
         self.cfg.audit_fallback_backoff_s = [1, 2, 4]
@@ -221,6 +273,28 @@ class TestAuditAppendFallback(unittest.TestCase):
         self.svc.append_script = ["fail", "fail", "fail", "fail"]
         self.assertEqual(g.audit_append(_arrival("5001")), -1)
         self.assertEqual(self.sleeps, [1.0, 2.0, 4.0])
+
+    def test_backoff_accepts_a_single_number(self):
+        self.cfg.audit_fallback_backoff_s = 5          # e.g. "audit_fallback_backoff_s": 5
+        g = self.gio()
+        self.svc.append_script = ["fail", "ok"]
+        self.assertEqual(g.audit_append(_arrival("5001")), 32)
+        self.assertEqual(self.sleeps, [5.0])
+        # one attempt is also the final one: the fallback text row
+        self.assertEqual(self.svc.rows[-1][27], backfill.GoogleIO.AUDIT_FALLBACK_TEXT)
+        self.assertEqual(_ledger()[0]["outcome"], "fallback")
+
+    def test_backoff_of_a_bad_type_warns_and_uses_the_default(self):
+        for bad in ("3,10", {"a": 1}, None, True, [3, "x"], [-1], [float("nan")]):
+            with self.subTest(bad=bad):
+                self.sleeps.clear()
+                self.cfg.audit_fallback_backoff_s = bad
+                g = self.gio()
+                self.svc.append_script = ["fail", "fail", "fail"]
+                with self.assertLogs("backfill", "WARNING") as logs:
+                    self.assertEqual(g.audit_append(_arrival("5001")), -1)
+                self.assertEqual(self.sleeps, [3.0, 10.0])
+                self.assertIn("audit_fallback_backoff_s", "\n".join(logs.output))
 
     def test_ledger_can_be_disabled(self):
         self.cfg.audit_fallback_ledger = ""
@@ -251,7 +325,38 @@ class TestAuditAppendFallback(unittest.TestCase):
         self.svc.rows[1][0] = "5001"                     # same id far up, row 2
         self.svc.append_script = ["fail", "ok"]
         self.assertEqual(g.audit_append(_arrival("5001")), 203)
-        self.assertEqual(_ledger()[0]["outcome"], "fallback")
+        self.assertEqual(_ledger()[0]["outcome"], "retried")
+
+    def test_without_a_hint_only_the_last_n_id_rows_are_matched(self):
+        # rows 2..201 carry ids; with n=50 the window is rows 152..201
+        g = self.gio(ids=range(1000, 1200))
+        self.svc.rows[150][0] = "5001"                   # row 151: 51st id row up
+        self.svc.append_script = ["fail", "ok"]
+        self.assertEqual(g.audit_append(_arrival("5001")), 202)
+        self.assertEqual(self.svc.meta_calls, 1)         # no hint: grid walk
+        self.assertEqual(self.svc.reads, [f"'{TAB}'!A2:A201"])   # read more than n...
+        self.assertEqual(self.svc.col_a().count("5001"), 2)      # ...matched only n
+        self.assertEqual(_ledger()[0]["outcome"], "retried")
+
+    def test_without_a_hint_an_id_inside_the_last_n_rows_is_found(self):
+        g = self.gio(ids=range(1000, 1200))
+        self.svc.rows[151][0] = "5001"                   # row 152: 50th id row up
+        self.svc.append_script = ["fail", "ok"]
+        self.assertEqual(g.audit_append(_arrival("5001")), 152)
+        self.assertEqual(self.svc.col_a().count("5001"), 1)
+        self.assertEqual(_ledger()[0]["outcome"], "found")
+
+    def test_stale_hint_matches_only_the_last_n_id_rows(self):
+        g = self.gio(ids=range(1000, 1200))
+        self.assertEqual(g.audit_append(_arrival("5000")), 202)   # hint = 202
+        # other writers add 200 rows (203..402) after this process's last append
+        self.svc.rows += [[str(i)] + [""] * (AUDIT_WIDTH - 1) for i in range(2000, 2200)]
+        self.svc.rows[209][0] = "5001"                   # row 210: far above the bottom
+        self.svc.append_script = ["fail", "ok"]
+        self.assertEqual(g.audit_append(_arrival("5001")), 403)
+        self.assertEqual(self.svc.reads, [f"'{TAB}'!A152:A"])
+        self.assertEqual(self.svc.col_a().count("5001"), 2)
+        self.assertEqual(_ledger()[0]["outcome"], "retried")
 
     def test_audit_ids_last_occurrence_wins(self):
         g = self.gio(ids=["11", "12", "11"])
@@ -386,7 +491,13 @@ class TestAuditReplay(unittest.TestCase):
             return list(csv.DictReader(f))
 
     def test_dry_run_reports_and_writes_nothing(self):
-        counts = audit_replay.replay(self.cfg, self.gio)
+        with self.assertLogs("backfill", "WARNING") as logs:
+            counts = audit_replay.replay(self.cfg, self.gio)
+        # 208: an update with no arrival; the advice covers a never-mirrored one
+        warn = "\n".join(logs.output)
+        self.assertIn("order 208", warn)
+        self.assertIn("Widen --since", warn)
+        self.assertIn("never mirrored", warn)
         self.assertEqual(counts, {"would_append": 3, "present": 1,
                                   "skipped_unlinked": 1, "no_arrival_in_range": 1})
         self.assertEqual(self.svc.col_a(), ["150", "202", "203"])   # untouched

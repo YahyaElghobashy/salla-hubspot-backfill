@@ -352,6 +352,38 @@ class TestDrainOne(unittest.TestCase):
         # archive written
         self.assertTrue(list((Path(self.tmp) / "archive").glob("order_RID*")))
 
+    def test_live_create_without_audit_row_mirrors_the_arrival(self):
+        # [v2.12] the drain's own arrival append is mirrored like the engine's,
+        # so a row lost to a Sheets outage (-1) is replayable from the mirror
+        from tools.audit_replay import collect
+        eng, hs, relay, gio = make_engine(self.tmp, live=True)
+        hs.find_order_by_salla_id.return_value = None
+        hs.gate_search_product_approved.return_value = 1
+        hs.gate_search_template.return_value = 0
+        eng.mirror = backfill.LocalMirror(Path(self.tmp) / "mirror")
+        gio.audit_append = MagicMock(return_value=-1)
+        seen = {}
+
+        def fake_route_create(o, audit_row):
+            seen["audit_row"] = audit_row
+            eng._outcome[str(o["id"])] = ("created", "HS42")
+        eng.route_create = fake_route_create
+        st, _, _ = eng.drain_one({"row": 2, "order_id": "1", "attempts": 0},
+                                 order("1", [("10", "product")]))
+        self.assertEqual((st, seen["audit_row"]), ("Processed", -1))
+        add = gio.audit_append.call_args.args[0]
+        ev = list(backfill.LocalMirror.read_audit(
+            Path(self.tmp) / "mirror" / "audit_mirror.csv"))
+        self.assertEqual([(e["event"], e["sheet_row"], e["order_id"], e["c1"], e["c11"])
+                          for e in ev],
+                         [("arrived_append", "-1", "1", "R1", "Order Arrived")])
+        self.assertEqual(add[0], "1")
+        today = ev[0]["ts"][:10]
+        arrivals, rowless, _, _ = collect(
+            Path(self.tmp) / "mirror" / "audit_mirror.csv", today, today)
+        self.assertIn("1", arrivals)
+        self.assertIn("1", rowless)
+
     def test_live_create_failure_marks_error(self):
         eng, hs, *_ = make_engine(self.tmp, live=True)
         hs.find_order_by_salla_id.return_value = None
