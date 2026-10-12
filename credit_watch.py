@@ -68,6 +68,9 @@ STATE_FILE = Path("mirror/credit_state.json")
 DLQ_KEY = "make-queue"
 LOW_KEY = "credits-low"
 OUT_KEY = "credits-out"
+# [v2.14] a scenario that stays off is re-checked every tick: its thread gets
+# one short reminder line this often, never the full alert again
+SCENARIO_OFF_REMIND_S = 24 * 3600
 LOCK_FILE = Path("credit_watch.lock")
 STOP_FILE = Path("STOP.credits")
 
@@ -634,26 +637,34 @@ class CreditWatch:
             return f"⏳ At the current pace this runs out in roughly *{hours:.0f} hours*."
         return "⏳ At the current pace this runs out in *under an hour*."
 
-    def _alert(self, subject, body, key=None, broadcast=False):
+    def _alert(self, subject, body, key=None, broadcast=False, every_s=0, update=None):
         """[v2.13] With a key the alert is a Slack issue thread: the first one
         opens it, later ones are posted into it (broadcast=True also shows
-        that reply in the channel), and _resolve answers it when it clears."""
+        that reply in the channel), and _resolve answers it when it clears.
+        [v2.14] every_s throttles those later posts (notify.issue_update) and
+        update, when given, is posted instead of the full alert, for a caller
+        that re-raises the same condition on every tick."""
         if self.dry_run:
             log.info("DRY RUN alert: %s", subject)
             return
         if not getattr(self.cfg, "alerts_enabled", True):
             log.warning("ALERT (suppressed): %s", subject)
             return
+        posted = True
         try:
             if key and notify.issue_is_open(key):
-                notify.issue_update(key, f"*{subject}*\n{body}", broadcast=broadcast)
+                posted = notify.issue_update(key, update or f"*{subject}*\n{body}",
+                                             every_s=every_s, broadcast=broadcast)
             elif key:
                 notify.issue_open(key, subject, body)
             else:
                 notify.send_alert(subject, body)
         except Exception as e:
             log.warning("credit alert dispatch failed: %s", e)
-        log.error("ALERT: %s", subject)
+        if posted:
+            log.error("ALERT: %s", subject)
+        else:
+            log.debug("alert %s already open, nothing posted: %s", key, subject)
 
     def _resolve(self, key, text, broadcast=False):
         """Answer the open thread `key`. False when none was open (the caller
@@ -678,7 +689,9 @@ class CreditWatch:
         2026 (a duplicate-SKU 400) before anyone noticed, and while it is off
         new or edited products never reach the validation sheet, so their
         orders get held as unknown. One red thread per watched scenario when
-        it goes off; it closes itself when the scenario is on again.
+        it goes off; it closes itself when the scenario is on again. While it
+        stays off the thread gets one short reminder line a day, not the
+        full alert on every tick.
         cfg.make_watch_scenarios: [id, ...] or [{"id": .., "label": ..}, ...]."""
         get = get or _get
         for entry in getattr(self.cfg, "make_watch_scenarios", None) or []:
@@ -706,9 +719,23 @@ class CreditWatch:
                          "switch the scenario back on.",
                          "This thread closes by itself once it is on again."],
                         [shown]),
-                    key=key)
+                    key=key, every_s=SCENARIO_OFF_REMIND_S,
+                    update=self._still_off_line(key, label))
             elif sc.get("isActive") is True:
                 self._resolve(key, f"✅ {label} is switched on again.")
+
+    @staticmethod
+    def _still_off_line(key, label):
+        """The daily reminder in an open make-off thread: one line, with how
+        long the thread has been open (the scenario may have been off before
+        the watcher saw it, hence "at least")."""
+        try:
+            opened = float((notify.issue_get(key) or {})["opened_at"])
+            state = f"has been switched off for at least {fmt_age((time.time() - opened) / 60)}"
+        except Exception:
+            state = "is still switched off"
+        return (f"🔴 Reminder: \"{label}\" {state} and its Salla events are still "
+                "not reaching HubSpot.")
 
     # ------------- retry-queue watch (v2.8, widened v2.12) -------------
 

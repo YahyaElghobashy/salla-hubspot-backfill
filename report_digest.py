@@ -251,50 +251,48 @@ def _backfill_parked():
 
 
 def _live_held():
-    """Outstanding catalog-held orders, measured LIVE from the Live Queue tab.
+    """Outstanding catalog-held orders, measured LIVE from the queue sheets.
 
     v2.8: the old number came from the last drain-scan line in drain.log, which
     goes stale the moment scans stop (it reported "1 (as of 2026-08-25)" for
-    two weeks while the true backlog reached 19). Best-effort by design: any
-    failure falls back to the stale-but-dated figure rather than breaking the
-    digest.
-    Returns {"value", "as_of", "oldest_days", "top"} or None.
+    two weeks while the true backlog reached 19).
+    [v2.14] Counted by reconcile.held_index, the Sunday certificate's reader:
+    Live Queue and Queue Log holds, one per order id, Zid number collisions
+    left out. The Live Queue alone missed the backfill and gap-sweep holds the
+    certificate counts, so the two reports disagreed. A failed read returns
+    {"value": None}: the headline says "held count not recorded" and the
+    verdict flags it, never the drain's per-pass figure as the total.
+    Returns {"value", "as_of", "oldest_days", "top"}.
     """
     try:
-        from backfill import Config, GoogleIO
-        cfg = Config.load(_engine_config_path())
-        gio = GoogleIO(cfg, enabled=True)
-        rows = gio.queue_read(cfg.queue_spreadsheet_id, start_row=2,
-                              tab=getattr(cfg, "live_queue_tab", "Live Queue"))
-        held = [r for r in rows or []
-                if str(r.get("status") or r.get("state") or "") == "held"
-                and not str(r.get("note") or "").startswith("zid collision")]
-        oldest = None
+        from backfill import Config
+        import reconcile
+        index = reconcile.held_index(Config.load(_engine_config_path()))
+        since = [ts for ts, _ in index.values() if ts is not None]
+        oldest_days = (datetime.now() - min(since)).days if since else None
         names = {}
-        for r in held:
-            ts = str(r.get("received_at") or "")[:10]
-            if ts:
-                oldest = ts if oldest is None or ts < oldest else oldest
-            note = str(r.get("note") or "")
-            if note.startswith("catalog gate:"):
-                for nm in note[len("catalog gate:"):].split("--")[0].split(","):
-                    nm = nm.strip()
-                    if nm:
-                        names[nm] = names.get(nm, 0) + 1
-        oldest_days = None
-        if oldest:
-            try:
-                oldest_days = (datetime.now()
-                               - datetime.strptime(oldest, "%Y-%m-%d")).days
-            except ValueError:
-                pass
+        for _, blocker in index.values():
+            for nm in str(blocker or "").split(","):
+                nm = nm.strip()
+                if nm:
+                    names[nm] = names.get(nm, 0) + 1
         top = ", ".join(f"{nm} ({c})" for nm, c in
                         sorted(names.items(), key=lambda kv: -kv[1])[:3])
-        return {"value": len(held), "as_of": "live",
+        return {"value": len(index), "as_of": "live",
                 "oldest_days": oldest_days, "top": top}
     except Exception as e:
         log.warning("live held count unavailable: %s", e)
-        return None
+        return {"value": None, "as_of": None, "oldest_days": None, "top": ""}
+
+
+def _held_unrecorded(a):
+    """[v2.14] True when there is no live held count and the report must say
+    so: the read failed, or only the drain's figure is on hand, which is one
+    release pass capped by --max-orders and never the backlog."""
+    lh = a.get("live_held")
+    if lh and lh.get("value") is not None:
+        return False
+    return lh is not None or ((a.get("now") or {}).get("held") or {}).get("value") is not None
 
 
 def _gift_watch():
@@ -922,6 +920,8 @@ def _verdict(a):
     if (lh.get("value") or 0) >= 5 or (lh.get("oldest_days") or 0) >= 3:
         bad.append(f"{lh['value']} orders held for catalog "
                    f"(oldest {lh.get('oldest_days', '?')}d)")
+    elif _held_unrecorded(a):                          # [v2.14] unknown is not healthy
+        bad.append("held count not recorded")
     if a.get("backfill_stalled"):
         bad.append("backfill has not advanced since the previous report")
     if (a.get("reconcile") or {}).get("stale"):
@@ -1006,11 +1006,15 @@ def render(a):
         head.append(line)
         if lh.get("top"):
             head.append(f"   ↳ blocking products: {lh['top']}")
-    else:
+    elif _held_unrecorded(a):
+        # [v2.14] the drain-log figure is one capped release pass: the 11 Oct
+        # headline quoted it as the total while 1,700+ orders were held
         held = (q.get("held") or {})
+        line = "• Held for catalog: held count not recorded"
         if held.get("value") is not None:
-            head.append(f"• Held for catalog: {held['value']:,} "
-                        f"(as of {held.get('as_of') or 'unknown'})")
+            line += (f" (the last release pass checked {held['value']:,}, "
+                     "not the total)")
+        head.append(line)
     rc = a.get("reconcile")
     if rc:
         if rc.get("stale"):
@@ -1164,7 +1168,7 @@ def _threads(a):
         # [v2.14] the live count; the drain-log figure was its per-pass cap
         # (it read "120 held" for a week while 1,700+ were held)
         t = ["*Catalog holds*",
-             f"{lh_t['value']:,} orders held right now (live count from the Live Queue)"
+             f"{lh_t['value']:,} orders held right now (live count from the Live Queue and the Queue Log)"
              + (f", oldest {lh_t['oldest_days']} day(s)" if lh_t.get("oldest_days") is not None else "")
              + "." + (f" Blocking products: {lh_t['top']}." if lh_t.get("top") else ""),
              "These sit safely in the queue and sync by themselves once their cause is fixed; "

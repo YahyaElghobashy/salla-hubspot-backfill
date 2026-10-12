@@ -745,8 +745,9 @@ class Config:
     # per day while the hold lasts. 0 disables.
     held_escalate_count: int = 0
     escalation_mentions: list = None
-    # [v2.14] the drain skips rows whose products all still fail the gate
-    # (re-checked in HubSpot, no relay fetch) and tries least-tried rows first
+    # [v2.14] the drain skips rows whose recorded product ids all still fail
+    # the gate (re-checked in HubSpot, no relay fetch) and tries the rows
+    # waiting longest since their last try first (v2.14.1)
     drain_skip_known_blocked: bool = False
     # [v2.14] Make scenarios whose silent switch-off must raise a red thread
     # (credit_watch): [id, ...] or [{"id": .., "label": ..}, ...]
@@ -790,6 +791,7 @@ class Config:
     reconcile_day_allowance: int = 2
     reconcile_month_allowance: int = 10
     reconcile_stale_stage_days: int = 14
+    reconcile_stuck_hours: float = 24       # a hold older than this is a pipeline finding
     reconcile_hydrate_max: int = 600
     reconcile_backfill_max: int = 200       # auto-sweep gaps up to this size
     reconcile_autorepair_tier: int = 0      # 0 report / 1 +stage patches / 2 +auto-backfill
@@ -2609,6 +2611,7 @@ class Engine:
         (not group_products AND p==0 AND te==0 AND ta==0) OR
         (not group_products AND te==0 AND ta>0)"""
         unverified = []
+        self.begin_gate(order)                                 # [v2.14.1]
         for item in order.get("items", []) or []:
             ptype = str(item.get("product_type", ""))
             if ptype.lower() == "group_products":
@@ -2624,36 +2627,119 @@ class Engine:
                         [sku, self._legacy_sku(sku)]) > 0:
                     continue
                 unverified.append({"id": item.get("id"), "name": item.get("name", ""),
-                                   "pid": "", "sku": sku, "why": "deleted"})   # [v2.13]
+                                   "pid": "", "sku": sku, "why": "deleted",   # [v2.13]
+                                   "approved": False})
                 continue
             p = self.hs.gate_search_product_approved(pid)      # [M211]
             te = self.hs.gate_search_template(pid, True)       # [M213]
-            ta = self.hs.gate_search_template(pid, False)      # [M214]
-            ta = self.effective_ta(str(pid), p, te, ta, item.get("name", ""))  # [v2.14]
+            raw_ta = self.hs.gate_search_template(pid, False)  # [M214]
+            ta = self.effective_ta(str(pid), p, te, raw_ta, item.get("name", ""))  # [v2.14]
+            if raw_ta and not ta:
+                # [v2.14.1] the line builder reads this, so it never re-decides
+                self.note_gate_exempt(order, pid)
             if (p == 0 and te == 0 and ta == 0) or (te == 0 and ta > 0):
                 unverified.append({"id": item.get("id"), "name": item.get("name", ""),
                                    "pid": str(pid), "sku": str(item.get("sku") or "").strip(),
-                                   "why": "bundle_inactive" if ta > 0 else "unapproved"})
+                                   "why": "bundle_inactive" if ta > 0 else "unapproved",
+                                   # [v2.14.1] the Slack text must not call an
+                                   # unapproved product "already approved"
+                                   "approved": bool(p)})
         return unverified
+
+    def pid_gate_state(self, pid):
+        """[v2.14.1] One Salla product id through the gate's own rule (the
+        same p, te, ta and stray exemption as gate_unverified_items, never
+        alerting): "pass", "held", or None when a read failed."""
+        pid = str(pid)
+        try:
+            p = self.hs.gate_search_product_approved(pid)
+            te = self.hs.gate_search_template(pid, True)
+            ta = self.hs.gate_search_template(pid, False)
+        except Exception as e:
+            log.warning("gate state of product %s unknown (%s)", pid, e)
+            return None
+        if self._exemptable(p, te, ta):
+            verdict = self._stray_cached(pid)
+            if verdict is None:
+                return None
+            ta = 0 if verdict else ta
+        return "held" if (p == 0 and te == 0 and ta == 0) or (te == 0 and ta > 0) else "pass"
+
+    # -- [v2.14.1] the gate's per-order decision, for the line builder ---------
+    # Kept on the engine, never on the order dict: order dicts are dumped to
+    # the audit sheet as JSON. The lock is on the class because some tools
+    # build an engine without __init__ and still run the gate.
+
+    GATE_KEEP = 5000
+    _gate_exempt_lock = threading.Lock()
+
+    def _gate_book(self):
+        return self.__dict__.setdefault("_gate_exempt", {})     # insertion-ordered: oldest first
+
+    def begin_gate(self, order):
+        """A gate evaluation of this order starts: forget its last decision."""
+        oid = str((order or {}).get("id"))
+        with self._gate_exempt_lock:
+            book = self._gate_book()
+            book.pop(oid, None)
+            book[oid] = set()
+            while len(book) > self.GATE_KEEP:
+                del book[next(iter(book))]
+
+    def note_gate_exempt(self, order, pid):
+        """This item passed the gate only because its stray record was exempted."""
+        oid = str((order or {}).get("id"))
+        with self._gate_exempt_lock:
+            book = self._gate_book()
+            book.setdefault(oid, set()).add(str(pid))
+            while len(book) > self.GATE_KEEP:
+                del book[next(iter(book))]
+
+    def gate_exempt(self, order):
+        """The product ids the gate exempted for this order, or None when no
+        gate ran for it in this process."""
+        oid = str((order or {}).get("id"))
+        with self._gate_exempt_lock:
+            got = self._gate_book().get(oid)
+            return set(got) if got is not None else None
+
+    def end_gate(self, order):
+        """The order is finished: drop its gate decision."""
+        with self._gate_exempt_lock:
+            self._gate_book().pop(str((order or {}).get("id")), None)
+
+    def _line_ta(self, order, pid, p, te, ta, name=""):
+        """The template count the line builder routes on: exactly the gate's
+        decision for this order when a gate ran (no fresh stray lookup that
+        could disagree with it), else the shared rule without alerts."""
+        exempt = self.gate_exempt(order)
+        if exempt is None:
+            return self.effective_ta(str(pid), p, te, ta, name, alert=False)
+        return 0 if str(pid) in exempt else ta
 
     # -- [v2.14] stray-template exemption ------------------------------------
 
     STRAY_TTL_S = 300
+    STRAY_FAIL_S = 60
+
+    def _exemptable(self, p, te, ta):
+        """The only shape the exemption can touch: an approved product, no
+        active template, and at least one inactive template record."""
+        return bool(getattr(self.cfg, "stray_template_exemption", False)
+                    and p and int(p) > 0 and int(te or 0) == 0 and int(ta or 0) > 0)
 
     def effective_ta(self, pid, p, te, ta, name="", alert=True):
         """The template count the gate should act on. Unchanged, except when an
         approved product (p > 0) is matched only by EMPTY template records that
         nobody acted on: then those records cannot demote it, and ta counts 0.
 
-        One rule shared by gate_unverified_items, process_item and the drain's
-        gate_cached, so the three can never disagree about the same order."""
-        if not getattr(self.cfg, "stray_template_exemption", False):
-            return ta
-        if not (p and int(p) > 0 and int(te or 0) == 0 and int(ta or 0) > 0):
+        One rule shared by gate_unverified_items, process_item (through
+        _line_ta) and the drain's gate_cached."""
+        if not self._exemptable(p, te, ta):
             return ta
         if not self._stray_only(pid):
             return ta
-        if alert:
+        if alert and self._stray_fresh(pid):     # never alert on a stale or unknown verdict
             noted = self.__dict__.setdefault("_stray_noted", {})
             if time.time() - noted.get(pid, 0) > 6 * 3600:   # once per product per 6 h
                 noted[pid] = time.time()
@@ -2661,43 +2747,83 @@ class Engine:
         return 0
 
     def _stray_only(self, pid):
-        """True when every template keyed to pid is an empty stray: no status
-        (Make's bundle branch never sets one; the sheet's Push and people do),
-        no components, and no row on the Bundles tab (nobody is building it).
-        Cached a few minutes: the answer changes only when someone acts."""
+        """True only when the (cached) stray verdict is True. Unknown holds."""
+        return self._stray_cached(pid) is True
+
+    def _stray_fresh(self, pid):
+        hit = self.__dict__.get("_stray_cache", {}).get(str(pid))
+        return bool(hit and hit[1] is True and time.time() - hit[0] < self.STRAY_TTL_S)
+
+    def _stray_cached(self, pid, recs=None):
+        """stray_verdict, cached a few minutes (the answer changes only when
+        someone acts). A failed read is remembered for STRAY_FAIL_S so the
+        lines of a busy product do not hammer the search pool, and it returns
+        the last verdict when there is one (stale is fine), else None. An
+        unknown is never cached, so it can never count as a stray."""
+        pid = str(pid)
         cache = self.__dict__.setdefault("_stray_cache", {})
+        failed = self.__dict__.setdefault("_stray_failed", {})
         hit = cache.get(pid)
         if hit and time.time() - hit[0] < self.STRAY_TTL_S:
             return hit[1]
+        if time.time() - failed.get(pid, 0) >= self.STRAY_FAIL_S:
+            verdict = self.stray_verdict(pid, recs)
+            if verdict is not None:
+                cache[pid] = (time.time(), verdict)
+                failed.pop(pid, None)
+                return verdict
+            failed[pid] = time.time()
+        return hit[1] if hit else None
+
+    def stray_verdict(self, pid, recs=None):
+        """[v2.14.1] Is every template keyed to pid an empty stray?
+          True   no status (Make's bundle branch never sets one; the sheet's
+                 Push and people do), no component counts, no active
+                 component records, AND the Bundles tab was read and has no
+                 row for it (nobody is building it);
+          False  someone is building it (any of those signals), or there is
+                 no template record at all;
+          None   a read failed (HubSpot or Sheets): unknown, which holds.
+        recs, when given, is the template_records(pid) result already in
+        hand and is not fetched again. Not cached: see _stray_cached."""
+        pid = str(pid)
 
         def empty(v):
             return str(v if v is not None else "").strip() in ("", "0")
 
         try:
-            recs = self.hs.template_records(pid)
-        except Exception as e:  # unknown means hold, exactly as before
-            log.warning("stray check for %s failed (%s): holding as before", pid, e)
-            return False
-        stray = bool(recs) and all(
-            empty((r.get("properties") or {}).get("template_status"))
-            and empty((r.get("properties") or {}).get("component_count"))
-            and empty((r.get("properties") or {}).get("active_component_count"))
-            for r in recs)
-        if stray and self._bundles_row(pid):
-            stray = False
-        cache[pid] = (time.time(), stray)
-        return stray
+            if recs is None:
+                recs = self.hs.template_records(pid)
+            if not recs:
+                return False
+            for r in recs:
+                pr = r.get("properties") or {}
+                if not all(empty(pr.get(k)) for k in
+                           ("template_status", "component_count", "active_component_count")):
+                    return False
+            # the counts are plain numbers a failed activation can leave
+            # blank while the component records exist (tools/fix_catalog_blockers.py)
+            if self.hs.search_active_components(pid):
+                return False
+        except Exception as e:
+            log.warning("stray check for %s failed (%s): holding", pid, e)
+            return None
+        row = self._bundles_row(pid)
+        if row is None:
+            return None
+        return not row
 
     def _bundles_row(self, pid):
-        """Row number of pid on the validation sheet's Bundles tab, or None.
-        A row means a person is building this bundle on purpose. If the sheet
-        cannot be read, None: the exemption only ever applies to an approved
-        product, so the worst case is orders syncing as that product."""
+        """Row number of pid on the validation sheet's Bundles tab; False when
+        the tab was read and has no row for it; None when it could not be
+        read (Sheets error, renamed tab or column, no sheet configured). A
+        row means a person is building this bundle on purpose, and a read
+        that failed proves nothing, so None is never taken as "no row"."""
         try:
             vs = getattr(self.cfg, "validation_spreadsheet_id", "")
             if not vs:
                 return None
-            return self._sheet_index().column(vs, "Bundles", "bundle_template_key").get(str(pid))
+            return self._sheet_index().column(vs, "Bundles", "bundle_template_key").get(str(pid)) or False
         except Exception as e:
             log.info("Bundles tab unreadable for stray check (%s)", e)
             return None
@@ -2720,6 +2846,10 @@ class Engine:
                     "tab), so the engine ignores the record and keeps creating orders against the approved product.")
             todo = [f"In Salla, open this product and remove the \"bundle\" tag (from this product only, do not "
                     "delete the tag from the store) or untick the \"Bundles\" category, then save once.",
+                    # [v2.14.1] removing the tag alone never closes this thread:
+                    # the record has to be set aside
+                    "Then reply in this thread: the integration team sets the empty record aside, and this "
+                    "thread confirms it.",
                     "If this product really is becoming a bundle, add it to the Bundles tab and push it from "
                     "the sheet. Until then its orders keep syncing as the single product.",
                     "Do NOT approve anything for this: the product is already approved."]
@@ -2963,21 +3093,24 @@ class Engine:
             todo = [f"Reply in this thread to ask for SKU {sku or 'this item'} to be added as a legacy product "
                     "(the integration team does this in a few minutes).", done]
             return subject, st.message(what, todo, links)
+        extra = None
         if why == "bundle_inactive":
-            tid = None
+            # [v2.14.1] one read gives the record's id and feeds the stray
+            # check, which the gate has usually cached already
+            recs = None
             try:
-                d = self.hs.search("/crm/v3/objects/2-203847434/search", {"filterGroups": [{"filters": [
-                    {"propertyName": "bundle_template_key", "operator": "EQ", "value": pid}]}],
-                    "properties": ["template_status"], "limit": 1}, "held bundle")
-                tid = ((d.get("results") or [{}])[0] or {}).get("id")
+                recs = self.hs.template_records(pid)
             except Exception:
                 pass
+            tid = ((recs or [{}])[0] or {}).get("id")
             row, found = self._sheet_index().row_link(vs, "Bundles", "bundle_template_key", pid,
                                                       f"{name} on the Bundles tab")
-            if not found:
-                # [v2.14] no Bundles-tab row: nobody is building this bundle. The
-                # record is a stray made by a Salla edit, and "push the bundle"
-                # (or "approve the product") would send people the wrong way.
+            approved = bool(u.get("approved"))
+            if found is False and approved and recs is not None and self._stray_cached(pid, recs) is True:
+                # [v2.14] an approved product, the Bundles tab read with no row,
+                # and an empty record: a stray made by a Salla edit, and "push
+                # the bundle" (or "approve the product") would send people the
+                # wrong way. A failed read or any sign of a build never gets here.
                 subject = (f"🟠 Order #{ref} is on hold: an empty bundle record in HubSpot is blocking "
                            f"{name}, which is sold as a single product")
                 what = (f"Order #{ref} includes {shown}. A listing edit in Salla made the Product Updated "
@@ -2991,15 +3124,22 @@ class Engine:
                         "Do NOT approve anything or use Reclassify on the sheet: the product is already approved."]
                 links += [st.hubspot("bundle_template", tid, "The empty record in HubSpot")]
                 return subject, st.message(what, todo, links)
-            subject = f"🟡 Order #{ref} is on hold: the bundle {name} is not active yet"
-            what = (f"Order #{ref} includes the bundle {shown}. The bundle exists in HubSpot but is not "
-                    "active yet (its parts are not mapped, or it was never pushed), so the order is on hold.")
-            todo = [f"Open the bundle's row: {row}." if found else f"Find the bundle on the Bundles tab: {row}.",
-                    "Check that every part of the bundle is listed on the Components tab.",
-                    "Click the bundle's row, then use the menu *ClaraHair › Bundles › Push to HubSpot…*",
-                    done]
-            links += [st.hubspot("bundle_template", tid, "Bundle in HubSpot"), row]
-            return subject, st.message(what, todo, links)
+            if found is False and not approved:
+                # [v2.14.1] the product itself is not approved (or not in HubSpot):
+                # that is the fix, so the product text below applies, plus the record
+                extra = ("A listing edit in Salla also made an empty bundle record for this product in HubSpot. "
+                         "If it is sold as a single product, say so in this thread and the integration team "
+                         "sets that record aside.")
+            else:
+                subject = f"🟡 Order #{ref} is on hold: the bundle {name} is not active yet"
+                what = (f"Order #{ref} includes the bundle {shown}. The bundle exists in HubSpot but is not "
+                        "active yet (its parts are not mapped, or it was never pushed), so the order is on hold.")
+                todo = [f"Open the bundle's row: {row}." if found else f"Find the bundle on the Bundles tab: {row}.",
+                        "Check that every part of the bundle is listed on the Components tab.",
+                        "Click the bundle's row, then use the menu *ClaraHair › Bundles › Push to HubSpot…*",
+                        done]
+                links += [st.hubspot("bundle_template", tid, "Bundle in HubSpot"), row]
+                return subject, st.message(what, todo, links)
         prod, status = None, None
         try:
             d = self.hs.search("/crm/v3/objects/products/search", {"filterGroups": [{"filters": [
@@ -3034,6 +3174,8 @@ class Engine:
             todo = ["Reply in this thread and the integration team will import the product.",
                     "Then approve it on the Product Validation tab with *ClaraHair › Products › Approve as Standalone*.",
                     done]
+        if extra:
+            todo.insert(len(todo) - 1, extra)
         links += [st.hubspot("product", prod, "Product in HubSpot"), row]
         return subject, st.message(what, todo, links)
 
@@ -3048,8 +3190,12 @@ class Engine:
             key = self.held_key(u)
             meta = {"orders": [oid], "refs": [ref], "name": u.get("name", ""), "pid": u.get("pid", ""),
                     "sku": u.get("sku", ""), "why": u.get("why", "")}
-            rec = notify.issue_get(key)
-            if rec and rec.get("state") == "open":
+            rec = notify.issue_get(key) or {}
+            # [v2.14.1] a thread Slack refused a moment ago ("failed") is retried
+            # by notify once retry_at passes; until then the order only joins
+            # its record, with no catalog reads for a post that cannot happen
+            backing_off = rec.get("state") == "failed" and time.time() < float(rec.get("retry_at") or 0)
+            if rec.get("state") == "open" or backing_off:
                 n = len(set((rec.get("meta") or {}).get("orders") or []) | {oid})
                 notify.issue_update(key, f"Order #{ref} is also waiting for {u.get('name') or 'this product'}. "
                                          f"{st.plural(n, 'order')} waiting in total.", every_s=6 * 3600, meta=meta)
@@ -3057,19 +3203,30 @@ class Engine:
             subject, body = self.held_text(order, u)
             notify.issue_open(key, subject, body, meta=meta)
 
-    def resolve_order_issues(self, oid, hs_id):
+    def resolve_order_issues(self, oid, hs_id, reference=None):
         """[v2.13] An order now exists in HubSpot: answer any thread that was
         waiting for it (a delivery status that could not apply, a Zid number
-        collision). Cheap when nothing is open."""
+        collision). Cheap when nothing is open. [v2.14.1] The answer names the
+        order the way the opener did: "#<reference>", the number the client
+        knows (the thread's own meta first, then the caller's reference)."""
         import notify
         import slack_text as st
         oid = str(oid)
         rec_link = st.hubspot("order", hs_id, "the order in HubSpot")
+
+        def ref_of(key):
+            rec = notify.issue_get(key) or {}
+            return str((rec.get("meta") or {}).get("ref") or reference or "").strip()
+
         notify.issue_resolve(f"status-missing:{oid}",
-                             f"✅ Resolved: order {oid} is in HubSpot now ({rec_link}), with its latest "
-                             "delivery status.")
+                             f"✅ Resolved: order #{ref_of(f'status-missing:{oid}') or oid} is in HubSpot now "
+                             f"({rec_link}), with its latest delivery status.")
+        # the Zid thread is opened by the engine ("Salla order <id>") or by the
+        # status relay ("Order #<reference>"): name both when they differ
+        ref = ref_of(f"zid:{oid}")
+        shown = f"order #{ref} (Salla order {oid})" if ref and ref != oid else f"Salla order {oid}"
         notify.issue_resolve(f"zid:{oid}",
-                             f"✅ Resolved: the old Zid order was moved to its own number and order {oid} "
+                             f"✅ Resolved: the old Zid order was moved to its own number and {shown} "
                              f"is in HubSpot now ({rec_link}).")
 
     def zid_collision(self, oid, zid_hs_id):
@@ -3187,7 +3344,7 @@ class Engine:
             return
         if getattr(self, "live", False) and getattr(self.cfg, "alerts_enabled", True):
             try:
-                self.resolve_order_issues(oid, order_id)       # [v2.13]
+                self.resolve_order_issues(oid, order_id, order.get("reference_id"))   # [v2.13]
             except Exception as e:
                 log.debug("order issue resolve failed for %s: %s", oid, e)
         if not was_fresh:
@@ -3316,9 +3473,10 @@ class Engine:
         ta_total = int(self.hs.item_search_template(pid, False).get("total", 0))
         # [v2.14] the line builder must agree with the gate: an empty stray
         # record on an approved product routes the line as the product, not
-        # into needs_review
-        ta_total = self.effective_ta(str(pid), p_total, te_total, ta_total,
-                                     item.get("name", ""), alert=False)
+        # into needs_review. [v2.14.1] It reuses the gate's decision for this
+        # order, so an expired cache or a failed lookup cannot re-decide it.
+        ta_total = self._line_ta(order, pid, p_total, te_total, ta_total,
+                                 item.get("name", ""))
 
         price = str(dig(item, "amounts.price_without_tax.amount"))
         common = {
@@ -3624,33 +3782,38 @@ class Engine:
         self.mirror.audit_event("arrived_append", audit_row, add, order_id=oid)
 
         # gate [M209..M215] then router [M216]
-        unverified = self.gate_unverified_items(order)
-        if not self.live:
-            plan = "HELD" if unverified else "CREATE"
-            routes = []
-            if not unverified:
-                for item in items:
-                    pid = dig(item, "product.id")
-                    if str(item.get("product_type", "")) == "group_products":
-                        routes.append(f"{item.get('id')}=salla_native({len(item.get('consisted_products') or [])} comps)")
-                        continue
-                    te = int(self.hs.item_search_template(pid, True).get("total", 0))
-                    ta = int(self.hs.item_search_template(pid, False).get("total", 0))
-                    p = int(self.hs.item_search_product(pid).get("total", 0))
-                    if te > 0:
-                        routes.append(f"{item.get('id')}=bundle_template")
-                    elif p > 0 and ta == 0:
-                        routes.append(f"{item.get('id')}=standalone")
-                    else:
-                        routes.append(f"{item.get('id')}=needs_review")
-            log.info("DRY RUN plan for order %s (ref %s): %s%s", oid, ref, plan,
-                     f" [{'; '.join(routes)}]" if routes else
-                     f" unverified={[u['name'] for u in unverified]}")
-            return
-        if unverified:
-            self.route_held(order, audit_row, unverified)
-        else:
-            self.route_create(order, audit_row)
+        try:
+            unverified = self.gate_unverified_items(order)
+            if not self.live:
+                plan = "HELD" if unverified else "CREATE"
+                routes = []
+                if not unverified:
+                    for item in items:
+                        pid = dig(item, "product.id")
+                        if str(item.get("product_type", "")) == "group_products":
+                            routes.append(f"{item.get('id')}=salla_native({len(item.get('consisted_products') or [])} comps)")
+                            continue
+                        te = int(self.hs.item_search_template(pid, True).get("total", 0))
+                        ta = int(self.hs.item_search_template(pid, False).get("total", 0))
+                        p = int(self.hs.item_search_product(pid).get("total", 0))
+                        # [v2.14.1] route as the live line builder would
+                        ta = self._line_ta(order, pid, p, te, ta, item.get("name", ""))
+                        if te > 0:
+                            routes.append(f"{item.get('id')}=bundle_template")
+                        elif p > 0 and ta == 0:
+                            routes.append(f"{item.get('id')}=standalone")
+                        else:
+                            routes.append(f"{item.get('id')}=needs_review")
+                log.info("DRY RUN plan for order %s (ref %s): %s%s", oid, ref, plan,
+                         f" [{'; '.join(routes)}]" if routes else
+                         f" unverified={[u['name'] for u in unverified]}")
+                return
+            if unverified:
+                self.route_held(order, audit_row, unverified)
+            else:
+                self.route_create(order, audit_row)
+        finally:
+            self.end_gate(order)           # [v2.14.1] the gate's decision ends with the order
 
     # -- main loop ---------------------------------------------------------------
 

@@ -71,6 +71,51 @@ QC_ENTRY, QC_OID, QC_REF, QC_QUEUED_AT, QC_REASON, QC_ITEMS, QC_STATUS, \
 
 TERMINAL = {"processed", "duplicate", "gone"}
 
+# [v2.14.1] A blocked row's note records the ids that held it, so the next
+# pass can skip it by id (names are not unique: a relisted Salla product keeps
+# its name under a new id). The record goes LAST so the "blocked: <names> @"
+# head tools/held_inventory.py reads is unchanged:
+#   blocked: <names> @ <YYYY-MM-DD HH:MM:SS> [pids=<id>,sku:<sku>,...]
+PIDS_RE = re.compile(r"\[pids=([^\[\]]*)\]\s*$")
+TRIED_RE = re.compile(r"(?:@|since) (\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2}:\d{2})")
+
+
+def block_key(u):
+    """The key a blocker is tallied under: the Salla product id, or the SKU
+    for a product deleted in Salla (it has no id)."""
+    return u["pid"] or f"sku:{u.get('sku') or '-'}"
+
+
+def pids_note(unverified):
+    """The ' [pids=...]' suffix for a blocked row's note; '' when a key cannot
+    be written back unambiguously (that row is then simply fetched)."""
+    keys = sorted({str(block_key(u)).strip() for u in unverified})
+    if not keys or any(not k or re.search(r"[,\[\]\r\n]", k) for k in keys):
+        return ""
+    return f" [pids={','.join(keys)}]"
+
+
+def recorded_keys(notes):
+    """The blocker keys a blocked row's note recorded, or None when it has no
+    record (a note written before v2.14.1, or not a blocked note)."""
+    notes = str(notes or "").strip()
+    m = PIDS_RE.search(notes) if notes.startswith("blocked") else None
+    keys = frozenset(k.strip() for k in m.group(1).split(",") if k.strip()) if m else None
+    return keys or None
+
+
+def note_names(notes):
+    """The blocker names a blocked row's note carries; '' when none."""
+    m = re.match(r"blocked:\s*(.*?)\s*@ \d{4}-\d{2}-\d{2}", str(notes or "").strip())
+    return m.group(1) if m else ""
+
+
+def last_tried(notes):
+    """When the drain last tried this row ('YYYY-MM-DD HH:MM:SS', from the
+    "@ <ts>" of a blocked note or "processing since <ts>"); '' when never."""
+    found = TRIED_RE.findall(str(notes or ""))
+    return " ".join(found[-1]) if found else ""
+
 
 def load_dotenv(path=".env"):
     """Tiny .env loader (KEY=VALUE lines); never overrides an existing var."""
@@ -303,6 +348,7 @@ class QueueDrainEngine(Engine):
         """gate_unverified_items with a per-product cache. Returns the list of
         unverified items, each with product id + suggested fix."""
         unverified = []
+        self.begin_gate(order)        # [v2.14.1] the line builder reads this decision
         for item in order.get("items", []) or []:
             if str(item.get("product_type", "")).lower() == "group_products":
                 continue
@@ -311,54 +357,74 @@ class QueueDrainEngine(Engine):
                 # Product deleted in Salla: id-based gate would hold forever.
                 # Resolve by SKU against approved legacy records. [M211S]
                 sku = str(item.get("sku") or "").strip()
-                key = "sku:" + (sku or "-")
-                with self._gate_lock:
-                    ok = self._gate_cache.get(key)
-                if ok is None:
-                    ok = bool(sku) and self.hs.gate_search_product_by_sku(
-                        [sku, self._legacy_sku(sku)]) > 0
-                    with self._gate_lock:
-                        self._gate_cache[key] = ok
-                if not ok:
+                if not self._sku_ok(sku):
                     unverified.append({
                         "id": item.get("id"), "pid": "", "sku": sku,
-                        "name": item.get("name", ""),
-                        "why": ("product deleted in Salla -- create+approve a "
-                                "legacy record with hs_sku="
-                                + (self._legacy_sku(sku) if sku else "?"))})
+                        "name": item.get("name", ""), "why": self._deleted_why(sku)})
                 continue
             pid = str(pid_raw)
-            with self._gate_lock:
-                res = self._gate_cache.get(pid)
-            if res is None:
-                p = self.hs.gate_search_product_approved(pid)   # [M211]
-                te = self.hs.gate_search_template(pid, True)    # [M213]
-                ta = self.hs.gate_search_template(pid, False)   # [M214]
-                # [v2.14] same stray-record rule as the live gate and the
-                # line builder (Engine.effective_ta)
-                ta = self.effective_ta(pid, p, te, ta, item.get("name", ""))
-                res = (p, te, ta)
-                with self._gate_lock:
-                    self._gate_cache[pid] = res
-            p, te, ta = res
-            if (p == 0 and te == 0 and ta == 0) or (te == 0 and ta > 0):
-                if ta > 0 and p:
-                    # approved product + a bundle record nothing is active in:
-                    # either a stray made by a listing edit, or a build in progress
-                    why = ("approved product blocked by a bundle record with nothing active: if "
-                           "nobody is building this bundle it is a stray from a Salla edit (bundle "
-                           "tag/category) -- remove the tag in Salla and set the record aside with "
-                           "tools/fix_catalog_blockers.py; if it IS being built, map components and Push")
-                elif ta > 0:
-                    why = ("activate bundle template (exists but draft/inactive "
-                           "or 0 active components)")
-                else:
-                    why = ("product missing or unapproved -- approve as "
-                           "standalone or map as bundle")
+            p, te, raw_ta = self._pid_counts(pid)
+            # [v2.14] same stray-record rule as the live gate, applied per order
+            # on the cached counts (the verdict keeps its own short cache), so
+            # a bundle someone starts building mid-pass holds like it does live
+            ta = self.effective_ta(pid, p, te, raw_ta, item.get("name", ""))
+            if raw_ta and not ta:
+                self.note_gate_exempt(order, pid)     # [v2.14.1] for the line builder
+            if self._fails(p, te, ta):
                 unverified.append({"id": item.get("id"), "pid": pid,
                                    "sku": str(item.get("sku") or "").strip(),
-                                   "name": item.get("name", ""), "why": why})
+                                   "name": item.get("name", ""), "why": self._why(p, ta)})
         return unverified
+
+    def _sku_ok(self, sku):
+        """[M211S] A deleted product's SKU resolves to an approved legacy
+        record. Cached for the pass."""
+        key = "sku:" + (sku or "-")
+        with self._gate_lock:
+            ok = self._gate_cache.get(key)
+        if ok is None:
+            ok = bool(sku) and self.hs.gate_search_product_by_sku(
+                [sku, self._legacy_sku(sku)]) > 0
+            with self._gate_lock:
+                self._gate_cache[key] = ok
+        return ok
+
+    def _pid_counts(self, pid):
+        """(p, te, raw ta) for one product, cached for the pass. Raw, so the
+        stray exemption can be decided (and recorded) per order."""
+        with self._gate_lock:
+            res = self._gate_cache.get(pid)
+        if res is None:
+            res = (self.hs.gate_search_product_approved(pid),    # [M211]
+                   self.hs.gate_search_template(pid, True),      # [M213]
+                   self.hs.gate_search_template(pid, False))     # [M214]
+            with self._gate_lock:
+                self._gate_cache[pid] = res
+        return res
+
+    @staticmethod
+    def _fails(p, te, ta):
+        """The [M215] hold rule on one product's counts."""
+        return (p == 0 and te == 0 and ta == 0) or (te == 0 and ta > 0)
+
+    @staticmethod
+    def _why(p, ta):
+        if ta > 0 and p:
+            # approved product + a bundle record nothing is active in:
+            # either a stray made by a listing edit, or a build in progress
+            return ("approved product blocked by a bundle record with nothing active: if "
+                    "nobody is building this bundle it is a stray from a Salla edit (bundle "
+                    "tag/category) -- remove the tag in Salla and set the record aside with "
+                    "tools/fix_catalog_blockers.py; if it IS being built, map components and Push")
+        if ta > 0:
+            return ("activate bundle template (exists but draft/inactive "
+                    "or 0 active components)")
+        return ("product missing or unapproved -- approve as "
+                "standalone or map as bundle")
+
+    def _deleted_why(self, sku):
+        return ("product deleted in Salla -- create+approve a legacy record with hs_sku="
+                + (self._legacy_sku(sku) if sku else "?"))
 
     def note_blocked(self, order, unverified):
         """Tally blockers so the matrix names one fix per row.
@@ -373,7 +439,7 @@ class QueueDrainEngine(Engine):
         """
         with self._blocked_lock:
             for u in unverified:
-                key = u["pid"] or f"sku:{u.get('sku') or '-'}"
+                key = block_key(u)
                 b = self._blocked.setdefault(key, {
                     "name": u["name"], "why": u["why"], "count": 0,
                     "sku": u.get("sku", ""), "pid": u["pid"], "samples": []})
@@ -384,58 +450,93 @@ class QueueDrainEngine(Engine):
     def _skip_known_blocked(self, rows):
         """[v2.14] Drop rows that can only be blocked, without fetching them.
 
-        The previous pass's blocker matrix names the products that held
-        orders. Each is re-checked now against HubSpot (the same gate rule,
-        no relay call, so no Make credits). A row is skipped only when it was
-        tried before and EVERY product name in its items column belongs to a
-        product that still fails; anything unknown, renamed or approved is
-        fetched normally. Skipped rows are carried into this pass's matrix,
-        so the next pass knows them too."""
-        if not MATRIX_FILE.exists():
-            return rows
-        try:
-            with open(MATRIX_FILE, newline="", encoding="utf-8") as f:
-                prev = [r for r in csv.DictReader(f) if r.get("salla_product_id")]
-        except (OSError, csv.Error) as e:
-            log.warning("blocker matrix unreadable, no pre-filter this pass: %s", e)
+        [v2.14.1] Keyed on the ids drain_one recorded in each blocked row's
+        note, never on names: two Salla listings can share a name, and a name
+        match kept an approved listing's orders skipped (and filed under the
+        old listing's id) for as long as the old one stayed blocked. Each
+        recorded id (a SKU for a product deleted in Salla) is re-checked now
+        with the gate's own rule (HubSpot only, no relay call, so no Make
+        credits), and the counts seed the gate cache. A row is skipped only
+        when it is Queued, was tried before and EVERY id it recorded still
+        fails; a row with no record, or with an id that passes or could not be
+        checked, is fetched normally. Skipped rows are carried into this
+        pass's matrix under their own ids, so the matrix still counts them."""
+        marked = []
+        for r in rows:
+            keys = recorded_keys(r.get("notes"))
+            ok = keys and r.get("status") == "queued" and r.get("attempts", 0) > 0
+            marked.append((r, keys if ok else None))
+        wanted = sorted(frozenset().union(*(k for _, k in marked if k)))
+        if not wanted:
             return rows
         still = {}
-        for b in prev:
-            pid = str(b["salla_product_id"]).strip()
+        for key in wanted:
             try:
-                p = self.hs.gate_search_product_approved(pid)
-                te = self.hs.gate_search_template(pid, True)
-                ta = self.effective_ta(pid, p, te, self.hs.gate_search_template(pid, False),
-                                       b.get("item_name", ""), alert=False)
+                why = self._still_blocked(key)
             except Exception as e:
-                log.warning("pre-filter re-check of %s failed (%s): fetching its rows", pid, e)
+                log.warning("pre-filter re-check of %s failed (%s): fetching its rows", key, e)
                 continue
-            if (p == 0 and te == 0 and ta == 0) or (te == 0 and ta > 0):
-                still[(b.get("item_name") or "").strip()] = b
-        still.pop("", None)
+            if why:
+                still[key] = why
         if not still:
             return rows
+        prev = self._prev_matrix()
         keep, skipped = [], 0
-        for r in rows:
-            names = [n.strip() for n in str(r.get("items") or "").split(", ") if n.strip()]
-            if r["attempts"] > 0 and names and all(n in still for n in names):
-                skipped += 1
-                for n in set(names):
-                    b = still[n]
-                    key = str(b["salla_product_id"])
-                    rec = self._blocked.setdefault(key, {
-                        "name": n, "why": b.get("suggested_action", ""), "count": 0,
-                        "sku": b.get("sku", ""), "pid": key, "samples": []})
+        for r, keys in marked:
+            if not keys or not all(k in still for k in keys):
+                keep.append(r)
+                continue
+            skipped += 1
+            names = note_names(r.get("notes")) if len(keys) == 1 else ""
+            with self._blocked_lock:
+                for k in keys:
+                    m = prev.get(k) or {}
+                    sku = k[4:] if k.startswith("sku:") else None
+                    rec = self._blocked.setdefault(k, {
+                        "name": m.get("item_name") or names, "why": still[k], "count": 0,
+                        "sku": m.get("sku", "") if sku is None else ("" if sku == "-" else sku),
+                        "pid": k if sku is None else "", "samples": []})
                     rec["count"] += 1
                     if len(rec["samples"]) < 5:
                         rec["samples"].append(str(r["order_id"]))
-                continue
-            keep.append(r)
         if skipped:
             self._bump("held", skipped)
             log.info("PRE-FILTER skipped %d row(s) still blocked by %s (no relay fetch)",
                      skipped, ", ".join(sorted(still)))
         return keep
+
+    def _still_blocked(self, key):
+        """The gate's suggested fix when this blocker key still fails the
+        gate now, '' when it passes. Same rule and same cache as gate_cached,
+        never alerting. Raises when a read fails or the stray verdict is
+        unknown (it might pass any minute): the caller fetches those rows."""
+        if key.startswith("sku:"):
+            sku = "" if key == "sku:-" else key[4:]
+            return "" if self._sku_ok(sku) else self._deleted_why(sku)
+        p, te, ta = self._pid_counts(key)
+        if self._exemptable(p, te, ta):
+            verdict = self._stray_cached(key)
+            if verdict is None:
+                raise LookupError("stray verdict unknown")
+            ta = 0 if verdict else ta
+        return self._why(p, ta) if self._fails(p, te, ta) else ""
+
+    def _prev_matrix(self):
+        """Last pass's blocker matrix by blocker key, for the names of rows
+        skipped (so never fetched) this pass. Empty when missing or unreadable."""
+        out = {}
+        try:
+            with open(MATRIX_FILE, newline="", encoding="utf-8") as f:
+                for m in csv.DictReader(f):
+                    if m.get("sku") is None:
+                        continue      # the --scan matrix is by name only, no ids
+                    out[block_key({"pid": (m.get("salla_product_id") or "").strip(),
+                                   "sku": (m.get("sku") or "").strip()})] = m
+        except FileNotFoundError:
+            pass
+        except (OSError, csv.Error) as e:
+            log.warning("blocker matrix unreadable, skipped rows carry no name: %s", e)
+        return out
 
     # -- pre-existing resolution (ledger + dedup + LI verify) ------------------
 
@@ -479,6 +580,12 @@ class QueueDrainEngine(Engine):
 
     def drain_one(self, row, order):
         """Returns (queue_status, result_note, attempts_delta)."""
+        try:
+            return self._drain_one(row, order)
+        finally:
+            self.end_gate(order)   # [v2.14.1] the gate's decision ends with the order
+
+    def _drain_one(self, row, order):
         oid = str(order.get("id"))
         pre = self.resolve_preexisting(oid, len(order.get("items", []) or []))
         if pre:
@@ -490,7 +597,8 @@ class QueueDrainEngine(Engine):
             names = ", ".join(u["name"] for u in unverified)
             log.info("BLOCKED order %s (%d item(s)): %s", oid,
                      len(unverified), names[:160])
-            return ("Queued", f"blocked: {names[:180]} @ {now_str()}", 1)
+            # [v2.14.1] the ids go in too: the next pass skips this row by id
+            return ("Queued", f"blocked: {names[:180]} @ {now_str()}{pids_note(unverified)}", 1)
         if not self.live:
             log.info("READY order %s (verify mode -- not creating)", oid)
             return ("Ready", "", 0)
@@ -612,9 +720,15 @@ class QueueDrainEngine(Engine):
             # [v2.14] During the Oct 2026 hold every pass paid a relay fetch for
             # the same 120 blocked rows (~4k Make credits a day) and never
             # reached the other 1,600. Skip rows that can only be blocked
-            # without fetching them, and try the least-tried rows first.
+            # without fetching them. [v2.14.1] The re-check searches wait for
+            # live like every other drain search, and the rows waiting longest
+            # since their last try go first (never-tried first): lifetime
+            # attempts parked the rows old passes retried ~170 times behind
+            # every row that can never be skipped, for days.
+            self._yield_to_live()
             to_process = self._skip_known_blocked(to_process)
-            to_process.sort(key=lambda r: r["attempts"])   # stable: ties keep sheet order
+            # '' (never tried) sorts first; stable, so ties keep sheet order
+            to_process.sort(key=lambda r: last_tried(r.get("notes")))
 
         # fetch + process in relay-sized waves so a STOP loses little work
         done_counter = 0

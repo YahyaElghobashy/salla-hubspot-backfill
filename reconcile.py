@@ -38,7 +38,8 @@ Phases, in the order the checks earn trust:
                     tier 1: patch ALL stage/status drift (paced, uncapped);
                     tier 2: auto-sweep missing orders up to
                     reconcile_backfill_max in an isolated seeded workspace.
-                    INSANITY CEILING: if any phase was unmeasurable, or a
+                    INSANITY CEILING: if any phase was unmeasurable (the
+                    advisory make queue and catalog sections excepted), or a
                     gap exceeds reconcile_insane_month_pct/_orders, every
                     repair is suppressed and the workspace is prepared
                     emit-only with the exact command in the alert -- a gap
@@ -482,9 +483,10 @@ def phase_pipeline(cfg, now=None):
     if stuck:
         blockers = Counter(b for _, b in stuck.values() if b)
         oldest = max(a for a, _ in stuck.values())
-        detail.append(f"{len(stuck)} order(s) on hold for over {hours:.0f}h (oldest {oldest / 24:.1f} days); "
-                      "blocking products: "
-                      + ", ".join(f"{b} ({n})" for b, n in blockers.most_common(3)))
+        line = f"{len(stuck)} order(s) on hold for over {hours:.0f}h (oldest {oldest / 24:.1f} days)"
+        if blockers:     # a hold that names no product gets no empty list
+            line += "; blocking products: " + ", ".join(f"{b} ({n})" for b, n in blockers.most_common(3))
+        detail.append(line)
     ok = not detail
     return Finding("pipeline", queue_read, ok,
                    "pipeline clean" if ok else f"{len(detail)} pipeline "
@@ -495,7 +497,9 @@ def phase_pipeline(cfg, now=None):
 # [v2.12] Sections nothing repairs from. Unmeasurable still renders NOT
 # RECORDED, but it is no reason to withhold the repairs the data phases
 # earned: a Make API blip on Sunday must not cost a week of stage patches.
-ADVISORY_PHASES = ("make queue",)
+# [v2.14] The catalog phase only reports traps; a relay or search failure in
+# it must not cost the week's repairs either.
+ADVISORY_PHASES = ("make queue", "catalog")
 
 
 def phase_make_queue(cfg, get=None, now=None):
@@ -573,13 +577,18 @@ def phase_make_queue(cfg, get=None, now=None):
 def sheet_time(v):
     """[v2.14] A queue timestamp as a naive datetime, whatever form Sheets
     returned it in: a serial number (days since 1899-12-30, what
-    UNFORMATTED_VALUE gives for a date cell) or text. None when unreadable."""
+    UNFORMATTED_VALUE gives for a date cell) or text. None when unreadable.
+    Only 20000..100000 (1954..2173, the bounds report_digest._when uses) is a
+    serial: a hand-typed epoch or 20261011 overflowed timedelta and failed the
+    whole pipeline phase, and a small number became a year-1900 age."""
     if v is None or v == "":
         return None
     try:
-        return datetime(1899, 12, 30) + timedelta(days=float(v))
-    except (TypeError, ValueError):
-        pass
+        x = float(v)
+    except (TypeError, ValueError, OverflowError):
+        x = None
+    if x is not None and 20000 < x < 100000:
+        return datetime(1899, 12, 30) + timedelta(days=x)
     t = str(v).strip()[:19]
     for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%m/%d/%Y %H:%M:%S", "%Y-%m-%d"):
         try:
@@ -592,24 +601,44 @@ def sheet_time(v):
 def held_index(cfg):
     """[v2.14] {order_id: (since, blocking products)} for every order on hold
     in either queue: Live Queue rows in state held, Queue Log rows queued or
-    held. Raises when a sheet cannot be read (callers report 'not recorded')."""
+    held, one entry per order id. Zid number collisions are not catalog holds
+    and stay out, as report_digest and status_relay keep them out. One
+    unreadable row is skipped, never the whole read. Raises when a sheet
+    cannot be read (callers report 'not recorded'). The daily digest counts
+    held orders with this too, so both reports give the same total."""
     from backfill import GoogleIO
     from queue_drain import DrainGoogleIO
-    out = {}
+    out, skipped = {}, 0
     gio = GoogleIO(cfg, enabled=True)
     for r in gio.queue_read(cfg.queue_spreadsheet_id, start_row=2,
                             tab=getattr(cfg, "live_queue_tab", "Live Queue")) or []:
-        if str(r.get("status") or "") != "held":
-            continue
-        note = str(r.get("note") or "")
-        blocker = note[len("catalog gate:"):].split("--")[0].strip() if note.startswith("catalog gate:") else note[:50]
-        out[str(r.get("order_id"))] = (sheet_time(r.get("received_at")), blocker)
+        try:
+            if str(r.get("status") or "") != "held":
+                continue
+            note = str(r.get("note") or "")
+            if note.startswith("zid collision"):
+                continue
+            if note.startswith("catalog gate:"):
+                blocker = note[len("catalog gate:"):].split("--")[0].strip()
+            else:
+                # "catalog gate -- in review queue" names no product
+                blocker = "" if note.startswith("catalog gate") else note[:50]
+            out[str(r.get("order_id"))] = (sheet_time(r.get("received_at")), blocker)
+        except Exception:
+            skipped += 1
     for r in DrainGoogleIO(cfg, enabled=True).qlog_read() or []:
-        if str(r.get("status") or "").strip().lower() not in ("queued", "held"):
-            continue
-        oid = str(r.get("order_id"))
-        if oid not in out:
-            out[oid] = (sheet_time(r.get("queued_at")), str(r.get("items") or r.get("reason") or "")[:50])
+        try:
+            if str(r.get("status") or "").strip().lower() not in ("queued", "held"):
+                continue
+            oid = str(r.get("order_id"))
+            if oid not in out:
+                # whole product names, like the Live Queue's: the digest
+                # splits them on commas
+                out[oid] = (sheet_time(r.get("queued_at")), str(r.get("items") or r.get("reason") or ""))
+        except Exception:
+            skipped += 1
+    if skipped:
+        log.warning("held index: %d unreadable queue row(s) skipped", skipped)
     return out
 
 
@@ -633,8 +662,9 @@ def explain_missing(findings, cfg, index=None):
     if held:
         top = Counter(index[str(i)][1] for i in held if index[str(i)][1]).most_common(3)
         counts.detail.insert(0, f"{len(held)} of the {len(missing)} missing order(s) are on hold at the catalog "
-                                "gate, not lost; blocking products: "
-                                + ", ".join(f"{b} ({n})" for b, n in top))
+                                "gate, not lost"
+                                + ("; blocking products: " + ", ".join(f"{b} ({n})" for b, n in top)
+                                   if top else ""))
         counts.data["held_of_missing"] = len(held)
         counts.data["unexplained_missing"] = len(missing) - len(held)
         counts.summary += f" ({len(held)} on catalog hold)"
@@ -665,8 +695,12 @@ def phase_catalog(src, cfg):
             page += 1
         approved, after = {}, None
         while True:
+            # Salla products only: legacy and Zid approved records would count
+            # toward the search's 10,000-result cap and are never routed here
             body = {"filterGroups": [{"filters": [{"propertyName": "catalog_approval_status",
-                                                   "operator": "EQ", "value": "approved"}]}],
+                                                   "operator": "EQ", "value": "approved"},
+                                                  {"propertyName": "salla_product_id",
+                                                   "operator": "HAS_PROPERTY"}]}],
                     "properties": ["salla_product_id", "product_class", "name"], "limit": 100}
             if after:
                 body["after"] = after

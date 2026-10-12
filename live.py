@@ -564,41 +564,195 @@ class LiveEngine(Engine):
             log.info("SETTLE %d held/exhausted row(s) whose order now exists marked done", written)
         if getattr(self.cfg, "alerts_enabled", True):
             try:
-                still_held = sum(1 for r in rows if r["status"] == "held") - \
-                    sum(1 for m in marks if "was held" in m[4])
-                self._answer_held_threads(still_held)
+                self._answer_held_threads(rows)
             except Exception as e:
                 log.warning("SETTLE Slack threads failed: %s", e)
         return written
 
-    def _answer_held_threads(self, still_held):
-        """[v2.13] Reply "released" in every held-product thread whose waiting
-        orders are all in HubSpot now, and close the aggregated backlog
-        thread when no order is left on hold."""
+    def _held_now(self, rows):
+        """[v2.14.1] The Live Queue's catalog holds as the held threads must
+        see them. Returns (held, busy, closed, refs):
+          held    orders on hold for the catalog now: a "held" row whose order
+                  is not in HubSpot. Zid number collisions are not catalog
+                  holds and stay out, as the relay and the digest keep them
+                  out: one parked Zid row kept every backlog thread open.
+          busy    orders the live engine still works on (queued, processing,
+                  an error with attempts left)
+          closed  held orders the catalog drain finished with and never
+                  created (deleted in Salla, out of attempts): their Live
+                  Queue row reads "held" for good, so they leave `held`
+          refs    order id -> the Salla reference number the client knows"""
+        cap = self.cfg.live_max_attempts
+        held, busy, refs = set(), set(), {}
+        for r in rows:
+            oid = r["order_id"]
+            if not oid:
+                continue
+            if r.get("reference_id"):
+                refs.setdefault(oid, str(r["reference_id"]))
+            st = r["status"]
+            if st == "held":
+                if (not str(r.get("note") or "").startswith("zid collision")
+                        and not self.created_ledger.get(oid)):
+                    held.add(oid)
+            elif st in ("queued", "processing") or (st == "error" and r["attempts"] < cap):
+                busy.add(oid)               # what _claimable picks up again
+        closed = (held & self._drain_closed()) if held else set()
+        return held - closed, busy, closed, refs
+
+    def _drain_closed(self):
+        """[v2.14.1] Order ids the catalog drain is finished with: every Queue
+        Log row of the order is gone, duplicate, processed, cancelled or out
+        of attempts, so nothing will create it any more. Read with the
+        drain's own reader on this engine's Sheets client (and its limiter).
+        An unreadable Queue Log closes nothing: the threads wait an hour."""
+        from queue_drain import DrainGoogleIO
+        try:
+            rows = DrainGoogleIO.qlog_read(self.gio)
+        except Exception as e:
+            log.warning("SETTLE Queue Log read failed, no held order counts as closed: %s", e)
+            return set()
+        cap = self.cfg.live_max_attempts
+        seen, live_ = set(), set()
+        for r in rows or []:
+            oid, st = r.get("order_id"), r.get("status") or ""
+            if not oid:
+                continue
+            seen.add(oid)
+            if st in ("queued", "processing", "held", "") or (st == "error" and r.get("attempts", 0) < cap):
+                live_.add(oid)
+        return seen - live_
+
+    def _thread_gate(self, key):
+        """[v2.14.1] "pass" | "held" | None (a read failed) for the product
+        behind a held:<pid> or held:sku:<sku> thread, by the gate's own rule."""
+        ident = key.split(":", 1)[1]
+        if not ident.startswith("sku:"):
+            return self.pid_gate_state(ident)
+        sku = ident[len("sku:"):]
+        if not sku or sku == "-":
+            return "held"           # no id and no SKU: the gate can never match it
+        try:                        # a product deleted in Salla: the gate's SKU rule
+            return "pass" if self.hs.gate_search_product_by_sku([sku, self._legacy_sku(sku)]) > 0 else "held"
+        except Exception as e:
+            log.warning("gate state of %s unknown (%s)", key, e)
+            return None
+
+    @staticmethod
+    def _drop_thread_orders(key, oids, ref_of):
+        """[v2.14.1] Take orders that will never be created off a held thread
+        (notify's merge only ever adds), so its "waiting in total" count and
+        the relay's thread lookup stop counting them. Their reference numbers
+        are kept under "closed" for the Released reply."""
+        import notify
+        try:
+            with notify._issues() as d:     # the registry's own lock and atomic save
+                rec = d.get(key)
+                if not rec or rec.get("state") != "open":
+                    return
+                m = rec.setdefault("meta", {})
+                orders = [str(o) for o in (m.get("orders") or [])]
+                keep = [i for i, o in enumerate(orders) if o not in oids]
+                if len(m.get("refs") or []) == len(orders):
+                    m["refs"] = [m["refs"][i] for i in keep]
+                m["orders"] = [orders[i] for i in keep]
+                closed = m.setdefault("closed", [])
+                for o in oids:
+                    if ref_of(o) not in closed:
+                        closed.append(ref_of(o))
+        except Exception as e:
+            log.warning("held thread %s: closed orders not dropped: %s", key, e)
+
+    def _answer_held_threads(self, rows):
+        """[v2.13] Reply "released" in every held-product thread whose product
+        passes the gate now, and close the aggregated backlog thread when no
+        order is left on hold.
+
+        [v2.14.1] A product thread no longer waits for every order it ever
+        listed. Orders that will never be created (deleted in Salla, out of
+        attempts, no longer held) are dropped from it, and an order that also
+        waits for another product that still fails is that product's thread's
+        business. The thread closes when its product passes the gate and no
+        order waits for it alone (those are created by the hourly drain)."""
         import notify
         import slack_text as st
-        for key, rec in notify.issues_open("held:").items():
-            m = rec.get("meta") or {}
-            orders = [str(o) for o in (m.get("orders") or [])]
-            if not orders:
-                continue
-            made = {o: self.created_ledger.get(o) for o in orders}
-            if not all(made.values()):
-                continue
-            refs = [str(x) for x in (m.get("refs") or [])]
-            refs = refs if len(refs) == len(orders) else orders
-            shown = ", ".join(st.hubspot("order", made[o], f"#{r}") for o, r in list(zip(orders, refs))[:5])
-            more = f" and {len(orders) - 5} more" if len(orders) > 5 else ""
-            n = len(orders)
-            notify.issue_resolve(
-                key, f"✅ Released: {m.get('name') or 'the product'} passes the catalog check now, and "
-                     f"{st.plural(n, 'order')} that waited for it {'is' if n == 1 else 'are'} in HubSpot: "
-                     f"{shown}{more}.")
-        if still_held <= 0:
-            notify.issue_resolve("held-backlog", "✅ Resolved: no order is on hold for catalog approval "
-                                                 "any more. Every one of them is in HubSpot now.")
-            for key in notify.issues_open("held-escalation:"):       # [v2.14]
-                notify.issue_resolve(key, "✅ Resolved: the hold has cleared, every held order is in HubSpot now.")
+        opened = notify.issues_open("held")     # held:<product>, held-backlog, held-escalation:<day>
+        if opened:
+            held, busy, closed, live_refs = self._held_now(rows)
+            threads = {k: v for k, v in opened.items() if k.startswith("held:")}
+            listed = {k: [str(o) for o in ((v.get("meta") or {}).get("orders") or [])]
+                      for k, v in threads.items()}
+            member = {k: set(v) for k, v in listed.items()}   # a hold can list ~1,800 orders
+            gate = {}
+
+            def gate_of(k):                       # one read per product per settle
+                if k not in gate:
+                    gate[k] = self._thread_gate(k)
+                return gate[k]
+
+            for key, rec in threads.items():
+                m = rec.get("meta") or {}
+                orders = listed[key]
+                refs = [str(x) for x in (m.get("refs") or [])]
+                by_ref = dict(zip(orders, refs)) if len(refs) == len(orders) else {}
+
+                def ref(o):                       # "#<reference>", as the opener named it
+                    return by_ref.get(o) or live_refs.get(o) or o
+
+                made = {o: self.created_ledger.get(o) for o in orders}
+                waiting = [o for o in orders if not made[o] and (o in held or o in busy)]
+                gone = [o for o in orders if not made[o] and o not in held and o not in busy]
+                if gone:
+                    self._drop_thread_orders(key, set(gone), ref)
+                # an order no other thread lists waits for this product alone (or
+                # for the drain, once it passes): nothing to say yet
+                if any(not any(o in member[k] for k in threads if k != key) for o in waiting):
+                    continue
+                if gate_of(key) != "pass":
+                    continue
+                elsewhere = [o for o in waiting
+                             if any(o in member[k] and gate_of(k) == "held" for k in threads if k != key)]
+                if len(elsewhere) < len(waiting):
+                    continue                      # shared, but its other product passes too: the drain is due
+                name = m.get("name") or "the product"
+                done = [o for o in orders if made[o]]
+                text = f"✅ Released: {name} passes the catalog check now"
+                if done:
+                    shown = ", ".join(st.hubspot("order", made[o], f"#{ref(o)}") for o in done[:5])
+                    more = f" and {len(done) - 5} more" if len(done) > 5 else ""
+                    n = len(done)
+                    text += (f", and {st.plural(n, 'order')} that waited for it {'is' if n == 1 else 'are'} "
+                             f"in HubSpot: {shown}{more}.")
+                else:
+                    text += "."
+                if elsewhere:
+                    k = len(elsewhere)
+                    text += (f" Still waiting for another product: {', '.join(f'#{ref(o)}' for o in elsewhere[:5])}"
+                             f"{f' and {k - 5} more' if k > 5 else ''}. That product's own thread confirms "
+                             f"{'it' if k == 1 else 'them'}.")
+                listed_refs = {ref(o) for o in orders}
+                left = [c for c in (m.get("closed") or []) if c not in listed_refs]
+                left += [ref(o) for o in gone if ref(o) not in left]
+                if left:
+                    k = len(left)
+                    text += (f" {'Order' if k == 1 else 'Orders'} {', '.join(f'#{c}' for c in left[:5])}"
+                             f"{f' and {k - 5} more' if k > 5 else ''} {'was' if k == 1 else 'were'} not "
+                             f"created: {'it' if k == 1 else 'they'} left the queue without reaching HubSpot "
+                             f"(for example, deleted in Salla).")
+                if not (done or elsewhere or left):
+                    text += " No order is waiting for it any more."
+                notify.issue_resolve(key, text)
+            if not held:
+                k = len(closed)
+                but = (f", except {st.plural(k, 'order')} that left the queue without being created "
+                       "(for example, deleted in Salla)") if k else ""
+                if "held-backlog" in opened:
+                    notify.issue_resolve("held-backlog", "✅ Resolved: no order is on hold for catalog approval "
+                                                         f"any more. Every one of them is in HubSpot now{but}.")
+                for key in opened:                                        # [v2.14]
+                    if key.startswith("held-escalation:"):
+                        notify.issue_resolve(key, "✅ Resolved: the hold has cleared, every held order is in "
+                                                  f"HubSpot now{but}.")
         # [v2.14] close a stray-record thread once the empty record is gone,
         # or once someone starts building that bundle on purpose
         for key, rec in notify.issues_open("stray:").items():
@@ -609,11 +763,16 @@ class LiveEngine(Engine):
             except Exception as e:
                 log.warning("stray thread %s: template read failed: %s", key, e)
                 continue
-            self.__dict__.setdefault("_stray_cache", {}).pop(pid, None)
             if not recs:
                 notify.issue_resolve(key, f"✅ Resolved: the empty bundle record for {name} has been set "
                                           "aside. Nothing was held while it existed.")
-            elif not self._stray_only(pid):
+                continue
+            # [v2.14.1] judged from the records in hand: a second read that
+            # failed used to read as "someone is building it" and closed the
+            # thread with a false reply. Only a positive sign of a build
+            # (False) closes it; a stray (True) or an unknown (None) stays open.
+            if self.stray_verdict(pid, recs=recs) is False:
+                self.__dict__.setdefault("_stray_cache", {}).pop(pid, None)   # the gate re-checks now
                 notify.issue_resolve(key, f"✅ Closed: someone has started building {name} as a bundle "
                                           "(it has a status, components or a Bundles-tab row), so it now "
                                           "follows the normal bundle approval.")

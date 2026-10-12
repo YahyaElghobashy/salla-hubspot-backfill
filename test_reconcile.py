@@ -468,5 +468,166 @@ class V214(unittest.TestCase):
         self.assertFalse(f.measured)
 
 
+def _sheets(live_rows, qlog_rows):
+    """Both queue reads served from one fake, as held_index makes them."""
+    gio = mock.MagicMock()
+    gio.queue_read.return_value = live_rows
+    gio.qlog_read.return_value = qlog_rows
+    import contextlib
+
+    @contextlib.contextmanager
+    def both():
+        with mock.patch("queue_drain.DrainGoogleIO", return_value=gio), \
+             mock.patch("backfill.GoogleIO", return_value=gio):
+            yield
+    return both()
+
+
+class ReviewFixes(unittest.TestCase):
+    """v2.14 review: an advisory section, or one bad sheet cell, must never
+    withhold a week of repairs; Zid number collisions are not catalog holds."""
+
+    NOW = datetime(2026, 10, 11, 3, 33, tzinfo=RIYADH)
+
+    def setUp(self):
+        _chdir_tmp(self)
+
+    def _repairable(self, catalog):
+        return [Finding("counts", True, True, "all days match",
+                        data={"missing_total": 0, "gaps": []}),
+                Finding("properties", True, False, "3 stale stage(s)",
+                        data={"stale": [{}, {}, {}]}),
+                catalog,
+                Finding("make queue", True, True, "clear")]
+
+    # -- #35 the catalog phase is advisory ---------------------------------
+    def test_unmeasured_catalog_phase_does_not_hold_back_repairs(self):
+        from reconcile import phase_catalog
+        src = FakeSource()
+        src.relay = mock.MagicMock()
+        src.relay.get_path.side_effect = RelayError("down")
+        cat = phase_catalog(src, _cfg())
+        self.assertFalse(cat.measured)
+        fs = self._repairable(cat)
+        self.assertIsNone(insane(fs, _cfg()))
+        head, body = render(fs, _cfg(), held_back=insane(fs, _cfg()))
+        self.assertNotIn("Automatic repair held back", head)
+        self.assertIn("*catalog* -- NOT RECORDED", body)   # still shown, never hidden
+
+    def test_a_data_phase_still_holds_back_repairs(self):
+        fs = self._repairable(Finding("catalog", True, True, "no latent catalog traps"))
+        fs[0] = Finding("counts", False, False, "count parity not recorded")
+        self.assertEqual(insane(fs, _cfg()), "a phase was unmeasurable")
+
+    def test_approved_search_only_reads_salla_products(self):
+        from reconcile import phase_catalog
+        src = FakeSource()
+        src.relay = mock.MagicMock()
+        src.relay.get_path.return_value = {"data": [], "pagination": {"totalPages": 1}}
+        src.hs = mock.MagicMock()
+        src.hs.search.return_value = {"results": []}
+        self.assertTrue(phase_catalog(src, _cfg()).measured)
+        body = src.hs.search.call_args[0][1]
+        filters = body["filterGroups"][0]["filters"]
+        self.assertEqual(len(body["filterGroups"]), 1)      # AND, not OR
+        self.assertIn({"propertyName": "salla_product_id", "operator": "HAS_PROPERTY"}, filters)
+        self.assertIn({"propertyName": "catalog_approval_status", "operator": "EQ",
+                       "value": "approved"}, filters)
+
+    # -- #36 sheet_time only reads a number as a date when it is one --------
+    def test_out_of_range_numbers_are_unreadable_not_errors(self):
+        from reconcile import sheet_time
+        for v in ("1760171234", "20261011", "1760171234000", "inf", "-inf", "nan",
+                  1760171234, 10 ** 400, "1e400", "45", "0.4166", 999999, "-46300"):
+            self.assertIsNone(sheet_time(v), repr(v))
+        self.assertEqual(sheet_time("46303.5").strftime("%Y-%m-%d %H:%M"), "2026-10-08 12:00")
+        self.assertEqual(sheet_time(46300).year, 2026)
+
+    def test_a_bad_date_cell_does_not_cost_the_pipeline_phase(self):
+        live = [{"order_id": "1", "status": "held", "received_at": "1760171234",
+                 "note": "catalog gate: Dryer -- in review queue"},
+                {"order_id": "2", "status": "held", "received_at": "46300.68",
+                 "note": "catalog gate: Dryer -- in review queue"}]
+        qlog = [{"order_id": "3", "status": "queued", "queued_at": "20261011", "items": "Brush"}]
+        with _sheets(live, qlog):
+            f = phase_pipeline(_cfg(), now=self.NOW)
+        self.assertTrue(f.measured)
+        self.assertEqual(f.data["stuck"], 1)            # the readable row; the others have no age
+        self.assertFalse(any("not recorded" in d for d in f.detail))
+        fs = self._repairable(Finding("catalog", True, True, "no latent catalog traps")) + [f]
+        self.assertIsNone(insane(fs, _cfg()))
+
+    def test_one_unreadable_row_is_skipped_not_the_read(self):
+        real = reconcile.sheet_time
+
+        def flaky(v):
+            if v == "boom":
+                raise OverflowError("date value out of range")
+            return real(v)
+        live = [{"order_id": "1", "status": "held", "received_at": "boom", "note": "catalog gate: A -- x"},
+                {"order_id": "2", "status": "held", "received_at": "46300.68", "note": "catalog gate: B -- x"}]
+        qlog = [{"order_id": "3", "status": "queued", "queued_at": "boom", "items": "C"},
+                {"order_id": "4", "status": "queued", "queued_at": "46300.5", "items": "D"}]
+        with _sheets(live, qlog), mock.patch.object(reconcile, "sheet_time", side_effect=flaky):
+            with self.assertLogs("backfill", "WARNING"):
+                idx = reconcile.held_index(_cfg())
+        self.assertEqual(sorted(idx), ["2", "4"])
+
+    # -- #37 Zid number collisions are not catalog holds --------------------
+    def test_zid_collision_holds_stay_out_of_the_catalog_wording(self):
+        from reconcile import explain_missing
+        zid = ("zid collision: salla_order_id 222 is held by Zid order HS 9; "
+               "re-key the Zid record")
+        live = [{"order_id": "111", "status": "held", "received_at": "46300.68",
+                 "note": "catalog gate: Dryer X -- in review queue"},
+                {"order_id": "222", "status": "held", "received_at": "46300.68", "note": zid}]
+        with _sheets(live, []):
+            idx = reconcile.held_index(_cfg())
+            f = phase_pipeline(_cfg(), now=self.NOW)
+        self.assertEqual(sorted(idx), ["111"])
+        self.assertEqual(f.data["stuck"], 1)
+        self.assertFalse(any("zid collision" in d for d in f.detail))
+        counts = Finding("counts", True, False, "1 window(s) off, 3 named missing order(s)",
+                         data={"gaps": [{"day": "2026-10-06", "missing_ids": ["111", "222", "333"]}],
+                               "missing_total": 3})
+        explain_missing([counts], _cfg(), index=idx)
+        self.assertEqual(counts.data["held_of_missing"], 1)
+        self.assertEqual(counts.data["unexplained_missing"], 2)
+        self.assertIn("blocking products: Dryer X (1)", counts.detail[0])
+        self.assertNotIn("zid collision", counts.detail[0])
+
+    def test_held_index_dedupes_both_queues_by_order_id(self):
+        live = [{"order_id": "1", "status": "held", "received_at": "46300.68",
+                 "note": "catalog gate: Dryer -- in review queue"},
+                {"order_id": "5", "status": "held", "received_at": "46300.68",
+                 "note": "catalog gate -- in review queue"},
+                {"order_id": "2", "status": "done", "received_at": "46300.68", "note": "HS 7"}]
+        long_items = "Multi Styler Pro, Dryer Brush Professional Edition 2000W"
+        qlog = [{"order_id": "1", "status": "queued", "queued_at": "46290.5", "items": "Dryer"},
+                {"order_id": "3", "status": "queued", "queued_at": "46290.5", "items": long_items},
+                {"order_id": "4", "status": "processed", "queued_at": "46290.5", "items": "Brush"},
+                {"order_id": "6", "status": "error", "queued_at": "46290.5", "items": "zid collision"}]
+        with _sheets(live, qlog):
+            idx = reconcile.held_index(_cfg())
+        self.assertEqual(sorted(idx), ["1", "3", "5"])
+        self.assertEqual(idx["1"][1], "Dryer")              # Live Queue row wins
+        self.assertEqual(idx["3"][1], long_items)           # whole product names, never half of one
+        self.assertEqual(idx["5"][1], "")                   # no product named: no blocker
+
+    def test_a_hold_naming_no_product_gets_no_empty_product_list(self):
+        from reconcile import explain_missing
+        live = [{"order_id": "5", "status": "held", "received_at": "46300.68",
+                 "note": "catalog gate -- in review queue"}]
+        with _sheets(live, []):
+            f = phase_pipeline(_cfg(), now=self.NOW)
+        self.assertEqual(f.data["stuck"], 1)
+        self.assertTrue(f.detail[0].endswith("days)"), f.detail[0])
+        self.assertNotIn("catalog gate -- in review queue", f.detail[0])
+        counts = Finding("counts", True, False, "1 window(s) off, 1 named missing order(s)",
+                         data={"gaps": [{"day": "2026-10-06", "missing_ids": ["5"]}], "missing_total": 1})
+        explain_missing([counts], _cfg(), index={"5": (None, "")})
+        self.assertEqual(counts.detail[0], "1 of the 1 missing order(s) are on hold at the catalog gate, not lost")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=1)

@@ -99,6 +99,7 @@
   "reconcile_day_allowance": 2,
   "reconcile_month_allowance": 10,
   "reconcile_stale_stage_days": 14,
+  "reconcile_stuck_hours": 24,
   "reconcile_hydrate_max": 600,
   "reconcile_backfill_max": 200,
   "reconcile_autorepair_tier": 0,

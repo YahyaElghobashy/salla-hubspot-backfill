@@ -12,6 +12,7 @@
 import os
 import tempfile
 import unittest
+from datetime import datetime
 from pathlib import Path
 from unittest import mock
 
@@ -57,6 +58,87 @@ class CatalogHolds(unittest.TestCase):
         _, replies = render(a)
         block = [r for r in replies if r.startswith("*Catalog holds*")][0]
         self.assertIn("per-pass sample", block)
+
+
+UNREAD = {"value": None, "as_of": None, "oldest_days": None, "top": ""}   # _live_held on a failed read
+
+
+class HeldCountUnreadable(unittest.TestCase):
+    """v2.14 review: with the live count unreadable the headline quoted the
+    drain's per-pass cap (120) as the held total and the verdict said
+    Healthy while about 1,700 orders were held."""
+
+    def test_headline_never_quotes_the_pass_cap_as_the_total(self):
+        for period in ("daily", "weekly"):
+            for lh in (UNREAD, None):
+                a = digest(None, period=period)
+                a["live_held"] = lh
+                a["now"] = {"held": {"value": 120, "as_of": "2026-10-11"}}
+                head, replies = render(a)
+                with self.subTest(period=period, live_held=lh):
+                    self.assertNotIn("Healthy.", head)
+                    self.assertIn("Needs a look: held count not recorded.", head)
+                    self.assertIn("• Held for catalog: held count not recorded (the last release "
+                                  "pass checked 120, not the total)", head)
+                    self.assertNotIn("Held for catalog: 120", head)
+                    self.assertNotIn("—", head)
+                    block = [r for r in replies if r.startswith("*Catalog holds*")][0]
+                    self.assertIn("per-pass sample", block)
+
+    def test_failed_read_without_a_pass_figure_still_says_not_recorded(self):
+        a = digest(None)
+        a["live_held"] = UNREAD
+        head, _ = render(a)
+        self.assertIn("• Held for catalog: held count not recorded\n", head)
+        self.assertIn("Needs a look: held count not recorded.", head)
+
+    def test_no_held_figure_at_all_adds_nothing(self):
+        head, _ = render(digest(None))          # live_held None, no drain figure
+        self.assertIn("Healthy.", head)
+        self.assertNotIn("Held for catalog", head)
+
+
+class LiveHeldCount(unittest.TestCase):
+    """_live_held counts what the Sunday certificate counts (reconcile.held_index)."""
+
+    def _serial(self, days_ago):
+        return str((datetime.now() - datetime(1899, 12, 30)).days - days_ago)
+
+    def test_counts_both_queues_once_each_without_zid_collisions(self):
+        import reconcile
+        from backfill import Config
+        from test_reconcile import _sheets
+        live = [{"order_id": "1", "status": "held", "received_at": self._serial(10),
+                 "note": "catalog gate: Dryer, Brush -- in review queue"},
+                {"order_id": "2", "status": "held", "received_at": self._serial(30),
+                 "note": "zid collision: salla_order_id 2 is held by Zid order HS 9; re-key it"},
+                {"order_id": "3", "status": "done", "received_at": self._serial(40), "note": "HS 7"}]
+        qlog = [{"order_id": "1", "status": "queued", "queued_at": self._serial(12), "items": "Dryer"},
+                {"order_id": "4", "status": "queued", "queued_at": self._serial(20), "items": "Dryer"},
+                {"order_id": "5", "status": "processed", "queued_at": self._serial(50), "items": "Iron"}]
+        cfg = Config()
+        with mock.patch("backfill.Config.load", return_value=cfg), _sheets(live, qlog):
+            lh = rd._live_held()
+            certificate = reconcile.held_index(cfg)
+        self.assertEqual(lh["value"], 2)
+        self.assertEqual(lh["value"], len(certificate))
+        self.assertEqual(lh["oldest_days"], 20)
+        self.assertEqual(lh["top"], "Dryer (2), Brush (1)")
+        self.assertEqual(lh["as_of"], "live")
+
+    def test_failed_read_is_marked_not_recorded(self):
+        with mock.patch("backfill.Config.load", side_effect=RuntimeError("no config")), \
+                self.assertLogs("digest", "WARNING"):
+            lh = rd._live_held()
+        self.assertIsNotNone(lh)
+        self.assertIsNone(lh["value"])
+
+    def test_thread_names_both_queues(self):
+        a = digest(None)
+        a["live_held"] = HELD
+        _, replies = render(a)
+        block = [r for r in replies if r.startswith("*Catalog holds*")][0]
+        self.assertIn("Live Queue and the Queue Log", block)
 
 
 class Backfill(unittest.TestCase):

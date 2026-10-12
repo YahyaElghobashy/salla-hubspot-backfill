@@ -114,17 +114,21 @@ class SheetIndex:
         return tabs
 
     def column(self, sheet_id, tab, header):
-        """{value: row} for the column whose header row names `header`."""
+        """{value: row} for the column whose header row names `header`.
+        Raises LookupError when no header names it: a renamed column is a
+        lookup that failed, not a column with no rows. [v2.14.1]"""
         key = (sheet_id, tab, header)
         hit = self._cols.get(key)
         if hit and time.time() - hit[0] < self.ttl:
+            if hit[1] is None:
+                raise LookupError(f"no '{header}' column on the {tab} tab")
             return hit[1]
         head = self.gio._gexec(self.gio.sheets.values().get(spreadsheetId=sheet_id, range=f"'{tab}'!1:1"),
                                "sheet header", self.gio.sheets_rl).get("values") or [[]]
         names = [str(h).strip() for h in head[0]]
         if header not in names:
-            self._cols[key] = (time.time(), {})
-            return {}
+            self._cols[key] = (time.time(), None)    # cached, so a renamed column is not re-read per call
+            raise LookupError(f"no '{header}' column on the {tab} tab")
         col = _col_letter(names.index(header))
         vals = self.gio._gexec(self.gio.sheets.values().get(spreadsheetId=sheet_id, range=f"'{tab}'!{col}:{col}",
                                                             valueRenderOption="UNFORMATTED_VALUE"),
@@ -137,14 +141,21 @@ class SheetIndex:
         return out
 
     def row_link(self, sheet_id, tab, header, value, label):
-        """A link to the row whose `header` column equals value; to the tab
-        when the value is not found; never raises."""
+        """(link, found): a link to the row whose `header` column equals
+        value, or to the tab when the value is not there; never raises.
+        found is True or False when the column was read, and None when the
+        lookup itself failed (Sheets error, renamed tab or column), so "no
+        row" is never claimed on a read that did not happen. None is falsy:
+        callers that only test found keep working. [v2.14.1]"""
         try:
             gid = self.tabs(sheet_id).get(tab)
-            row = self.column(sheet_id, tab, header).get(str(value)) if value else None
-            return sheet(sheet_id, label, gid, row), bool(row)
         except Exception:
-            return sheet(sheet_id, label), False
+            gid = None
+        try:
+            row = self.column(sheet_id, tab, header).get(str(value)) if value else None
+        except Exception:
+            return sheet(sheet_id, label, gid), None
+        return sheet(sheet_id, label, gid, row), bool(row)
 
 
 def _col_letter(i):

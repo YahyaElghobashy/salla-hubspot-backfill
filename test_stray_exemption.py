@@ -14,6 +14,7 @@ import unittest
 from unittest import mock
 
 import backfill
+import slack_text
 from test_queue_drain import chdir_tmp, make_cfg, make_engine, order
 
 PID = "1982906533"
@@ -21,7 +22,45 @@ EMPTY = [{"id": "454482395354", "properties": {
     "template_status": None, "component_count": None, "active_component_count": None}}]
 
 
-def engine(tmp, flag=True, recs=EMPTY, p=1, te=0, ta=1, live=False):
+class SheetGio:
+    """Just enough GoogleIO for slack_text.SheetIndex: the validation sheet's
+    tabs as {tab: (header, [values])}. fail raises on every read. [v2.14.1]
+    The stray check now needs the Bundles tab READ (no row there is a fact;
+    a read that failed is unknown), so the tests give it a real tab."""
+
+    def __init__(self, tabs=None, fail=None):
+        self.tabs = tabs if tabs is not None else {"Bundles": ("bundle_template_key", []),
+                                                   "Product Validation": ("salla_product_id", [])}
+        self.fail = fail
+        self.reads = []
+        self.sheets_rl = None
+        self.sheets = self
+
+    # the googleapiclient request builders, returning their own kwargs
+    def get(self, **kw):
+        return dict(kw, kind="meta") if "fields" in kw else dict(kw)
+
+    def values(self):
+        return self
+
+    def _gexec(self, request, what, limiter):
+        self.reads.append(what)
+        if self.fail:
+            raise self.fail
+        if what == "sheet tabs":
+            return {"sheets": [{"properties": {"title": t, "sheetId": n}}
+                               for n, t in enumerate(self.tabs, 7)]}
+        tab = request["range"].split("!")[0].strip("'")
+        if tab not in self.tabs:
+            raise RuntimeError(f"HttpError 400: Unable to parse range: {request['range']}")
+        header, vals = self.tabs[tab]
+        if what == "sheet header":
+            return {"values": [[header]]}
+        return {"values": [[header]] + [[v] for v in vals]}
+
+
+def engine(tmp, flag=True, recs=EMPTY, p=1, te=0, ta=1, live=False, bundles=(), sheet_fail=None,
+           components=()):
     cfg = make_cfg(tmp)
     cfg.stray_template_exemption = flag
     eng, hs, relay, gio = make_engine(tmp, live=live, cfg=cfg)
@@ -31,6 +70,10 @@ def engine(tmp, flag=True, recs=EMPTY, p=1, te=0, ta=1, live=False):
         hs.template_records.side_effect = recs
     else:
         hs.template_records.return_value = recs
+    hs.search_active_components.return_value = list(components)
+    eng.sheet_gio = SheetGio({"Bundles": ("bundle_template_key", list(bundles)),
+                              "Product Validation": ("salla_product_id", [])}, fail=sheet_fail)
+    eng._sheets = slack_text.SheetIndex(eng.sheet_gio)
     return eng, hs
 
 

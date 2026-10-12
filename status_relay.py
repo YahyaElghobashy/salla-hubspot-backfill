@@ -48,6 +48,10 @@ log = logging.getLogger("backfill")
 
 LEDGER = Path("mirror/status_applied.csv")
 EXCEPTIONS_TAB = "Delivery Status Exceptions"
+# [v2.14.1] the one shared thread for give-ups the relay cannot classify
+UNCLASSIFIED_KEY = "status-unclassified"
+UNCLASSIFIED_KEEP = 500          # orders remembered in its meta
+UNCLASSIFIED_QUIET_S = 24 * 3600  # closed after a day with nothing new
 
 
 def _sheet_url(sheet_id):
@@ -129,6 +133,7 @@ class StatusRelay(RealtimeConsumer):
         # stories (held / live-order-missing / awaiting-backfill).
         self._live_index = {}          # order_id -> (state, note)
         self._live_index_at = 0.0
+        self._live_index_snap = 0.0    # start of the last read that succeeded
         self._digest = []              # backfill-era give-ups awaiting flush
         self._digest_sent_day = ""
 
@@ -181,6 +186,7 @@ class StatusRelay(RealtimeConsumer):
                                 (str(r.get("status") or r.get("state") or ""),
                                  str(r.get("note") or ""))
                                 for r in rows if r.get("order_id")}
+            self._live_index_snap = self._live_index_at
         except Exception as e:
             log.warning("live-queue index refresh failed: %s", e)
 
@@ -275,15 +281,21 @@ class StatusRelay(RealtimeConsumer):
         miss. Past `held_escalate_count` held orders, post a red thread that
         tags the named owners (and email it when email is configured). Keyed
         per day, so it repeats daily while the hold lasts, once per day even
-        across restarts; the live settle step closes it when the hold clears."""
+        across restarts; the live settle step closes it when the hold clears.
+        [v2.14.1] Runs from every held give-up and from periodic(): the live sync
+        puts every order it holds in its product's thread, and the give-up for
+        such an order used to return before ever getting here. The email goes
+        once per day's thread, with no Slack mention markup in its subject,
+        and also when Slack refused the thread (email is then the only way the
+        owners hear of it)."""
         threshold = int(getattr(self.cfg, "held_escalate_count", 0) or 0)
         if not threshold or count < threshold:
             return
         if not (self.live and getattr(self.cfg, "alerts_enabled", True)):
             return
         mentions = " ".join(f"<@{u}>" for u in (getattr(self.cfg, "escalation_mentions", None) or []))
-        subject = (f"🔴 {mentions + ' ' if mentions else ''}{count} orders are on hold and not in HubSpot. "
-                   "This needs a person today.")
+        headline = f"{count} orders are on hold and not in HubSpot. This needs a person today."
+        subject = f"🔴 {mentions + ' ' if mentions else ''}{headline}"
         body = st.message(
             f"The catalog hold has passed {threshold} orders. Nothing is lost (the orders wait safely and "
             "sync by themselves once the cause is fixed), but every hour adds more."
@@ -291,34 +303,53 @@ class StatusRelay(RealtimeConsumer):
             ["Open each blocking product's own thread in this channel and follow its fix.",
              "If nobody on your side can act on it today, reply here and the integration team will."],
             [])
+        key = f"held-escalation:{datetime.now().strftime('%Y-%m-%d')}"
         try:
             import notify
-            if notify.issue_open(f"held-escalation:{datetime.now().strftime('%Y-%m-%d')}", subject, body,
-                                 meta={"count": count}):
-                if notify.email_enabled():
-                    notify.send_email(subject, body)
+            rec = notify.issue_get(key) or {}
+            if (rec.get("state") == "closed"
+                    and float(rec.get("closed_at") or 0) >= getattr(self, "_live_index_snap", 0.0)):
+                # the live settle closed it after our Live Queue read: the count
+                # predates the all-clear, so wait for a fresh read
+                return
+            opened = notify.issue_open(key, subject, body, meta={"count": count}, email=False)
+            rec = notify.issue_get(key) or {}
+            if ((opened or rec.get("state") == "failed")
+                    and not (rec.get("meta") or {}).get("emailed") and notify.email_enabled()):
+                if notify.send_email(f"🔴 {headline}", body):
+                    # an open or failed key only merges this; a retried
+                    # open keeps it, so the email never goes twice
+                    notify.issue_open(key, subject, body, meta={"emailed": True}, email=False)
         except Exception as e:
             log.warning("held escalation failed: %s", e)
 
     def _giveup_alert(self, kind, oid, reference_id, slug, attempts):
         """[v2.13] Every give-up becomes (or joins) a Slack thread that is
         answered when the order finally exists: held orders join their
-        product's thread, a missing live order gets its own."""
+        product's thread, a missing live order gets its own. [v2.14.1] With
+        classification off, give-ups share one thread (_unclassified_giveup)."""
         import notify
         ref = reference_id or oid
         exceptions = self._tab_link(self.cfg.spreadsheet_id, EXCEPTIONS_TAB, "Delivery Status Exceptions tab")
         if kind == "held":
             if not (self.live and getattr(self.cfg, "alerts_enabled", True)):
                 return
-            for key, rec in notify.issues_open("held:").items():
-                if str(oid) in ((rec.get("meta") or {}).get("orders") or []):
-                    notify.issue_update(key, f"Order #{ref} also got a delivery update (“{slug}”). It applies "
-                                             "by itself once the order is created.", every_s=6 * 3600)
-                    return
             self._refresh_live_index()
             count, top = self._held_summary()
+            joined = False
+            try:
+                for key, rec in notify.issues_open("held:").items():
+                    if str(oid) in ((rec.get("meta") or {}).get("orders") or []):
+                        notify.issue_update(key, f"Order #{ref} also got a delivery update (“{slug}”). It "
+                                                 "applies by itself once the order is created.", every_s=6 * 3600)
+                        joined = True
+                        break
+            except Exception as e:
+                # [v2.14.1] a registry fault must not turn the give-up into a
+                # retried error that appends an exceptions row on every attempt
+                log.warning("held thread lookup for order %s failed: %s", oid, e)
             vs = getattr(self.cfg, "validation_spreadsheet_id", "") or st.VALIDATION_SHEET
-            if not self._issue(
+            if not joined and not self._issue(
                     "held-backlog",
                     f"🟡 {st.plural(count, 'order')} on hold for catalog approval "
                     f"{'is' if count == 1 else 'are'} getting delivery updates",
@@ -337,16 +368,24 @@ class StatusRelay(RealtimeConsumer):
                          f"Approvals themselves happen on the {st.sheet(vs, 'Bundle & Product Validation sheet')}. "
                          "This thread confirms when no order is left on hold."],
                         [exceptions])):
-                notify.issue_update("held-backlog", f"Now {st.plural(count, 'order')} on hold. Latest: order "
-                                                    f"#{ref} got “{slug}”.", every_s=6 * 3600)
+                try:
+                    notify.issue_update("held-backlog", f"Now {st.plural(count, 'order')} on hold. Latest: order "
+                                                        f"#{ref} got “{slug}”.", every_s=6 * 3600)
+                except Exception as e:
+                    log.warning("held-backlog update failed: %s", e)
+            # [v2.14.1] checked on every held give-up, including an order that
+            # joined its product's thread above (the live sync puts every order
+            # it holds in one, and that early return used to skip this for good)
             self._escalate_held(count, top)
             return
         if kind == "backfill":
             self._digest.append((oid, slug))
             self._flush_digest()
             return
-        # "recent", or an unconfigured deployment (kind None): a live order
-        # whose creation was lost
+        if kind is None:
+            self._unclassified_giveup(oid, ref, slug, exceptions)
+            return
+        # "recent": a live order whose creation was lost
         self._issue(
             f"status-missing:{oid}",
             f"🔴 Order #{ref} is getting delivery updates but is not in HubSpot",
@@ -359,9 +398,52 @@ class StatusRelay(RealtimeConsumer):
                 [exceptions, st.hubspot_search(oid, "Search HubSpot for it")]),
             meta={"ref": str(ref), "slug": slug})
 
+    def _unclassified_giveup(self, oid, ref, slug, exceptions):
+        """[v2.14.1] Classification off (live_min_reference unset): the relay
+        cannot tell a held order from a lost one. A red thread per order (as
+        "recent" gets) would open one per held order, about 1,700 in a hold
+        like Oct 2026's, each saying "not on hold". So these share one thread
+        with neutral wording; later orders join its meta and post news at most
+        every 6 hours. periodic() closes it after a quiet day."""
+        if not (self.live and getattr(self.cfg, "alerts_enabled", True)):
+            return
+        try:
+            import notify
+            rec = notify.issue_get(UNCLASSIFIED_KEY) or {}
+            m = (rec.get("meta") or {}) if rec.get("state") in ("open", "opening", "failed") else {}
+            orders = [str(o) for o in (m.get("orders") or [])]
+            seen = str(oid) in orders
+            # past the cap orders are counted but not listed (an order with
+            # several updates may then count twice)
+            n = int(m.get("count") or len(orders)) + (0 if seen else 1)
+            meta = {"count": n, "last": time.time()}
+            if not seen and len(orders) < UNCLASSIFIED_KEEP:
+                meta.update(orders=[str(oid)], refs=[str(ref)])
+            if notify.issue_open(
+                    UNCLASSIFIED_KEY,
+                    "🟠 Delivery updates are arriving for orders that are not in HubSpot",
+                    st.message(
+                        f"Salla has sent delivery updates for order #{ref} (latest: “{slug}”) for about "
+                        f"{max(1, round(sum(self.ladder) / 3600))} hours, but the order is not in HubSpot. It may "
+                        "be on hold for the catalog, waiting for older orders to be imported, or lost on the way "
+                        "in. Nothing is lost for an order that is created later: it gets its latest status then.",
+                        ["Nothing for now: the integration team is alerted and checks these orders.",
+                         "Other orders like this join this thread, with news at most every 6 hours."],
+                        [exceptions]),
+                    meta=meta):
+                return
+            notify.issue_update(UNCLASSIFIED_KEY, f"Order #{ref} also got a delivery update (“{slug}”) and "
+                                                  f"is not in HubSpot. {st.plural(n, 'order')} like this so far.",
+                                every_s=6 * 3600, meta=meta)
+        except Exception as e:
+            log.warning("status issue %s failed: %s", UNCLASSIFIED_KEY, e)
+
     def periodic(self):
         """[v2.13] Every 10 minutes: answer "unmapped status" threads whose
-        status now has a stage (the mapping was added and the relay restarted)."""
+        status now has a stage (the mapping was added and the relay restarted).
+        [v2.14.1] Also check the held escalation, so a hold escalates even when
+        no delivery update gives up, and close the shared "not in HubSpot"
+        thread once a day passes with nothing new."""
         if time.time() - getattr(self, "_periodic_at", 0) < 600:
             return
         self._periodic_at = time.time()
@@ -376,6 +458,22 @@ class StatusRelay(RealtimeConsumer):
                                               "HubSpot stage. New updates with this status apply by themselves.")
         except Exception as e:
             log.warning("status periodic failed: %s", e)
+        if not getattr(self.cfg, "alerts_enabled", True):
+            return
+        if int(getattr(self.cfg, "held_escalate_count", 0) or 0) > 0:
+            # the Live Queue read is cached for held_index_refresh_s, and the
+            # escalation key is per day, so a lasting hold posts once a day
+            self._refresh_live_index()
+            self._escalate_held(*self._held_summary())
+        try:
+            import notify
+            m = (notify.issues_open(UNCLASSIFIED_KEY).get(UNCLASSIFIED_KEY) or {}).get("meta") or {}
+            if m and time.time() - float(m.get("last") or 0) > UNCLASSIFIED_QUIET_S:
+                notify.issue_resolve(UNCLASSIFIED_KEY, "✅ Closed: no new delivery updates for orders missing "
+                                                       "from HubSpot in the last day. An order listed here that "
+                                                       "is created later gets its latest status then.")
+        except Exception as e:
+            log.warning("status periodic close of %s failed: %s", UNCLASSIFIED_KEY, e)
 
     def _alert(self, key, subject, body):
         """Cooldown-respecting Slack alert (per key, alert_cooldown_minutes)."""
