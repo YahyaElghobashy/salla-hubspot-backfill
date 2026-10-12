@@ -670,6 +670,46 @@ class CreditWatch:
         org = str(getattr(self.cfg, "make_org_id", "") or "")
         return st.link(f"https://eu1.make.com/organization/{org}/dashboard", label) if org else ""
 
+    # ------------- scenario on/off watch (v2.14) -------------
+
+    def check_scenarios_active(self, get=None):
+        """[v2.14] Make switches a scenario off after repeated errors and says
+        nothing. "Salla | Product Updated" was off for 23 days from 30 Aug
+        2026 (a duplicate-SKU 400) before anyone noticed, and while it is off
+        new or edited products never reach the validation sheet, so their
+        orders get held as unknown. One red thread per watched scenario when
+        it goes off; it closes itself when the scenario is on again.
+        cfg.make_watch_scenarios: [id, ...] or [{"id": .., "label": ..}, ...]."""
+        get = get or _get
+        for entry in getattr(self.cfg, "make_watch_scenarios", None) or []:
+            sid = str(entry.get("id") if isinstance(entry, dict) else entry)
+            try:
+                sc = (get(f"/scenarios/{sid}") or {}).get("scenario") or {}
+            except Exception as e:
+                log.warning("scenario %s on/off read failed: %s", sid, _safe_err(e))
+                continue
+            label = (entry.get("label") if isinstance(entry, dict) else None) or sc.get("name") or f"scenario {sid}"
+            key = f"make-off:{sid}"
+            link = scenario_link(self.cfg, sid)
+            shown = st.link(link, label) if link.startswith("http") else label
+            if sc.get("isActive") is False:
+                self._alert(
+                    f"🔴 The Make automation \"{label}\" has switched itself off. Until it is back on, "
+                    "its Salla events are not reaching HubSpot.",
+                    st.message(
+                        "Make turns a scenario off after repeated errors and sends no warning of its own. "
+                        "In August 2026 a duplicate-SKU error turned the Product Updated automation off for "
+                        "23 days, and new or edited products never reached the validation sheet, so their "
+                        "orders were held as unknown.",
+                        ["Open the scenario's History in Make and read the last error.",
+                         "Fix the cause (usually a HubSpot validation error, such as a duplicate SKU), then "
+                         "switch the scenario back on.",
+                         "This thread closes by itself once it is on again."],
+                        [shown]),
+                    key=key)
+            elif sc.get("isActive") is True:
+                self._resolve(key, f"✅ {label} is switched on again.")
+
     # ------------- retry-queue watch (v2.8, widened v2.12) -------------
 
     def check_relay_dlq(self, get=None, now=None):
@@ -853,6 +893,10 @@ class CreditWatch:
             self.check_relay_dlq()
         except Exception as e:
             log.warning("retry-queue watch skipped: %s", _safe_err(e))
+        try:
+            self.check_scenarios_active()            # [v2.14]
+        except Exception as e:
+            log.warning("scenario on/off watch skipped: %s", _safe_err(e))
 
         prev = self.state.get("org") or {}
         remaining = org["remaining"]

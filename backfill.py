@@ -748,6 +748,9 @@ class Config:
     # [v2.14] the drain skips rows whose products all still fail the gate
     # (re-checked in HubSpot, no relay fetch) and tries least-tried rows first
     drain_skip_known_blocked: bool = False
+    # [v2.14] Make scenarios whose silent switch-off must raise a red thread
+    # (credit_watch): [id, ...] or [{"id": .., "label": ..}, ...]
+    make_watch_scenarios: list = None
     # [v2.12] when a Zid-import order holds a new Salla order's number, move
     # that record to Z<number> (zid_rekey.py) and create the Salla order,
     # instead of parking the row. Dry runs never re-key.
