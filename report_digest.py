@@ -185,7 +185,8 @@ def aggregate(period):
     stalled = False
     bf_now = (live_now.get("backfill") or {})
     bf_prev = ((days[-1].get("backfill") if days else None) or {})
-    if (period == "daily" and bf_now.get("window") and bf_prev.get("window")
+    parked = _backfill_parked()          # [v2.14] STOP present: parked on purpose
+    if (period == "daily" and not parked and bf_now.get("window") and bf_prev.get("window")
             and bf_now.get("window") == bf_prev.get("window")
             and bf_now.get("page") == bf_prev.get("page")
             and str(bf_now.get("status") or "").lower() not in
@@ -193,13 +194,16 @@ def aggregate(period):
         stalled = True
 
     return {
-        "live_held": _live_held() if period == "daily" else None,
+        # [v2.14] every period reads the live held count: on 11 Oct 2026 the
+        # weekly verdict said "Healthy" while 1,649 orders were held
+        "live_held": _live_held(),
         "gift_watch": _gift_watch() if period == "daily" else None,
         "reconcile": _reconcile_watch() if period == "daily" else None,
         # [v2.12] realtime queues, customers, capacity, audit misses (daily)
         "ops": (_safe("realtime lines", _ops_watch, start, end)
                 if period == "daily" else None),
         "backfill_stalled": stalled,
+        "backfill_parked": parked,
         "period": period, "start": start, "end": end, "label": label,
         "days_recorded": len(days), "days_expected": span,
         "created": created, "prev_created": prev_created,
@@ -229,6 +233,21 @@ def _engine_config_path():
     if env:
         return env
     return "config.live.json" if Path("config.live.json").exists() else "config.json"
+
+
+def _backfill_parked():
+    """[v2.14] The backfill reads the plain STOP file. When it is present the
+    backfill is parked on purpose, so its frozen cursor is not a stall: the
+    report said "page 15 of 29, unchanged" every day for two months while the
+    backfill had been deliberately stopped on 2026-08-09. Returns the date the
+    STOP file appeared, or "" when the backfill is not parked."""
+    try:
+        stop = ROOT / "STOP"
+        if not stop.exists():
+            return ""
+        return datetime.fromtimestamp(stop.stat().st_mtime).strftime("%Y-%m-%d")
+    except OSError:
+        return ""
 
 
 def _live_held():
@@ -1017,7 +1036,9 @@ def render(a):
                          f"(chase list)")
             head.append(line)
     bf = (q.get("backfill") or {})
-    if bf.get("window"):
+    if a.get("backfill_parked"):
+        head.append(f"• Backfill: parked since {a['backfill_parked']} (STOP file present), not running")
+    elif bf.get("window"):
         line = (f"• Backfill: {bf['window']}, page {bf.get('page')} "
                 f"of {bf.get('total_pages')}")
         if a.get("backfill_stalled"):
@@ -1121,7 +1142,11 @@ def _threads(a):
 
     # --- backfill --------------------------------------------------------
     bf = q.get("backfill") or {}
-    if bf.get("window"):
+    if a.get("backfill_parked"):
+        out.append("\n".join(["*Backfill*",
+                              f"Parked since {a['backfill_parked']}: the STOP file is present, so the "
+                              "historical backfill is deliberately not running. Nothing is stuck."]))
+    elif bf.get("window"):
         t = ["*Backfill*",
              f"Currently sweeping {bf['window']}, page {bf.get('page')} of "
              f"{bf.get('total_pages')} (status: {bf.get('status')})."]
@@ -1134,9 +1159,21 @@ def _threads(a):
 
     # --- catalog holds ---------------------------------------------------
     held = q.get("held") or {}
-    if held.get("value") is not None:
+    lh_t = a.get("live_held") or {}
+    if lh_t.get("value") is not None:
+        # [v2.14] the live count; the drain-log figure was its per-pass cap
+        # (it read "120 held" for a week while 1,700+ were held)
         t = ["*Catalog holds*",
-             f"{held['value']:,} orders held, measured {held.get('as_of')}."]
+             f"{lh_t['value']:,} orders held right now (live count from the Live Queue)"
+             + (f", oldest {lh_t['oldest_days']} day(s)" if lh_t.get("oldest_days") is not None else "")
+             + "." + (f" Blocking products: {lh_t['top']}." if lh_t.get("top") else ""),
+             "These sit safely in the queue and sync by themselves once their cause is fixed; "
+             "each blocking product has its own Slack thread with the fix."]
+        out.append("\n".join(t))
+    elif held.get("value") is not None:
+        t = ["*Catalog holds*",
+             f"The last release pass checked {held['value']:,} held order(s), measured {held.get('as_of')} "
+             "(a per-pass sample, not the total backlog)."]
         if q.get("blocker_products"):
             t.append(f"{q['blocker_products']} product(s) account for all of "
                      f"them — see mirror/blocker_matrix.csv. These are catalog "
@@ -1159,15 +1196,15 @@ def _threads(a):
                         and len(a["credits_daily"] or []) > 1 else "") + ".")
         by = c.get("by_engine") or {}
         if by:
-            t.append(f"Split today: live {by.get('live', 0):,}, backfill "
-                     f"{by.get('backfill', 0):,}, other {by.get('other', 0):,}. "
+            t.append(f"Split today: live intake {by.get('live', 0):,}, fetch relay "
+                     f"{by.get('backfill', 0):,} (shared by every engine: live sync, status relay, "
+                     f"release passes, gift refresh, sweeps), other {by.get('other', 0):,}. "
                      f"Most live-sync consumption is the intake poll itself "
                      f"rather than order volume, so the floor cost is roughly "
                      f"constant regardless of how busy the store is.")
         if c.get("plan") and a["credits_burned"]:
             t.append(f"Plan allowance is {c['plan']}; consumption at this rate "
-                     f"is the structural constraint on how fast the backfill "
-                     f"can run.")
+                     f"sets the runway shown above.")
         out.append("\n".join(t))
 
     # --- data quality ----------------------------------------------------
