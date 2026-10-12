@@ -14,12 +14,17 @@ WorkingDirectory=/home/integrations_claragroup_com/app
 # Sep 22, Oct 4 and Oct 5 (the last one held 1,760 orders for a week).
 #
 # Stopgap until the tags are removed in Salla and the catalog-change guardrail
-# ships: every 15 minutes, re-run the proven fixer for the listed products. It
-# refuses any template that has components (a real build in progress), refuses
-# when more than one template matches, does nothing when none exists, and
-# repoints the key to a VOID- sentinel instead of deleting, ledgering the old
-# value in mirror/catalog_blocker_fixes.csv so every change is reversible.
-ExecStart=/bin/bash -lc 'set -a; . /home/integrations_claragroup_com/app/.env; set +a; exec /home/integrations_claragroup_com/app/venv/bin/python3 tools/fix_catalog_blockers.py --config config.live.json --apply'
+# ships: every 15 minutes, re-run the proven fixer for the two listed products
+# (NEUTRALISE_STUB in tools/fix_catalog_blockers.py), neutralise step only.
+# It refuses any template that has components or has ever had a status set
+# (a bundle being built on purpose), refuses when more than one template
+# matches, does nothing when none exists, and repoints the key to a VOID-
+# sentinel instead of deleting, ledgering the old value in
+# mirror/catalog_blocker_fixes.csv so every change is reversible.
+# It writes nothing else: --neutralise-only skips the approve-existing step,
+# because an unattended job must never re-approve a product a person
+# un-approved.
+ExecStart=/bin/bash -lc 'set -a; . /home/integrations_claragroup_com/app/.env; set +a; exec /home/integrations_claragroup_com/app/venv/bin/python3 tools/fix_catalog_blockers.py --config config.live.json --apply --neutralise-only'
 Restart=no
 TimeoutStartSec=600
 

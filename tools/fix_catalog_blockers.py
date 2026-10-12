@@ -66,6 +66,12 @@ LEDGER = Path("mirror/catalog_blocker_fixes.csv")
 
 # (salla_product_id, expected_sku, human label)
 APPROVE_EXISTING = [("2142608306", "C031", "فرشاة الشعر الكيرلي / Curly Hair Brush")]
+# The salla-catalog-sentinel timer re-runs this list every 15 minutes. If the
+# client decides one of these products really IS becoming a bundle, remove it
+# from this list FIRST (and pull + restart nothing: the timer re-reads the
+# file each run), or the sentinel will keep setting its empty draft aside.
+# Rolling back a neutralisation follows the same order: remove the pid here,
+# then PATCH bundle_template_key back from mirror/catalog_blocker_fixes.csv.
 NEUTRALISE_STUB = [
     ("2113977878", "CH12", "Clara Daily Hydrating Shampoo & Conditioner"),
     # Relisted 21 Sep as a single product but tagged "bundle" in Salla, so the
@@ -141,8 +147,11 @@ def neutralise_stub(hs, pid, sku, label, apply_):
     if not results:
         log.info("  pid %-12s no template -- nothing to neutralise", pid)
         return None
-    if len(results) > 1:
-        log.error("  pid %s: %d templates; refusing to guess", pid, len(results))
+    # the search returns at most one record (limit 1), so the count of
+    # matches has to come from total, not from len(results)
+    n_match = int(found.get("total") or len(results))
+    if n_match > 1:
+        log.error("  pid %s: %d templates; refusing to guess", pid, n_match)
         return None
 
     tpl_id = results[0]["id"]
@@ -165,6 +174,15 @@ def neutralise_stub(hs, pid, sku, label, apply_):
     if hs.search_active_components(pid):
         log.error("  pid %s: template %s still has active components -- refusing",
                   pid, tpl_id)
+        return None
+    # A status means the sheet's Push or a person has acted on this template
+    # (Make's bundle branch never sets one). That is a bundle being built on
+    # purpose, even with zero components so far, and it is not ours to set
+    # aside. Make's own real bundles carry the same integration source as the
+    # strays, so the source id cannot tell them apart; the status can.
+    if str(p.get("template_status") or "").strip():
+        log.error("  pid %s: template %s has status %r -- a human or the sheet "
+                  "has acted on it; refusing", pid, tpl_id, p.get("template_status"))
         return None
 
     old_key = p.get("bundle_template_key") or ""
@@ -206,6 +224,10 @@ def main():
     ap.add_argument("--config", default="config.json")
     ap.add_argument("--apply", action="store_true")
     ap.add_argument("--verbose", action="store_true")
+    ap.add_argument("--neutralise-only", action="store_true",
+                    help="skip the approve-existing step (the sentinel timer "
+                         "uses this: an unattended job must never re-approve a "
+                         "product a person may have deliberately un-approved)")
     args = ap.parse_args()
 
     setup_logging(args.verbose, logfile="fix_catalog_blockers.log")
@@ -219,12 +241,13 @@ def main():
     log.info("mode=%s", "APPLY" if args.apply else "DRY RUN")
     written = []
 
-    log.info("")
-    log.info("ROW 2 -- approve products that already exist but sit at pending_review")
-    for pid, sku, label in APPROVE_EXISTING:
-        r = approve_existing(hs, pid, sku, label, args.apply)
-        if r:
-            written.append(r)
+    if not args.neutralise_only:
+        log.info("")
+        log.info("ROW 2 -- approve products that already exist but sit at pending_review")
+        for pid, sku, label in APPROVE_EXISTING:
+            r = approve_existing(hs, pid, sku, label, args.apply)
+            if r:
+                written.append(r)
 
     log.info("")
     log.info("ROW 3 -- neutralise empty bundle templates that block an approved product")
