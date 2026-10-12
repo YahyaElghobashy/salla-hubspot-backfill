@@ -381,6 +381,62 @@ class QueueDrainEngine(Engine):
                 if len(b["samples"]) < 5:
                     b["samples"].append(str(order.get("id")))
 
+    def _skip_known_blocked(self, rows):
+        """[v2.14] Drop rows that can only be blocked, without fetching them.
+
+        The previous pass's blocker matrix names the products that held
+        orders. Each is re-checked now against HubSpot (the same gate rule,
+        no relay call, so no Make credits). A row is skipped only when it was
+        tried before and EVERY product name in its items column belongs to a
+        product that still fails; anything unknown, renamed or approved is
+        fetched normally. Skipped rows are carried into this pass's matrix,
+        so the next pass knows them too."""
+        if not MATRIX_FILE.exists():
+            return rows
+        try:
+            with open(MATRIX_FILE, newline="", encoding="utf-8") as f:
+                prev = [r for r in csv.DictReader(f) if r.get("salla_product_id")]
+        except (OSError, csv.Error) as e:
+            log.warning("blocker matrix unreadable, no pre-filter this pass: %s", e)
+            return rows
+        still = {}
+        for b in prev:
+            pid = str(b["salla_product_id"]).strip()
+            try:
+                p = self.hs.gate_search_product_approved(pid)
+                te = self.hs.gate_search_template(pid, True)
+                ta = self.effective_ta(pid, p, te, self.hs.gate_search_template(pid, False),
+                                       b.get("item_name", ""), alert=False)
+            except Exception as e:
+                log.warning("pre-filter re-check of %s failed (%s): fetching its rows", pid, e)
+                continue
+            if (p == 0 and te == 0 and ta == 0) or (te == 0 and ta > 0):
+                still[(b.get("item_name") or "").strip()] = b
+        still.pop("", None)
+        if not still:
+            return rows
+        keep, skipped = [], 0
+        for r in rows:
+            names = [n.strip() for n in str(r.get("items") or "").split(", ") if n.strip()]
+            if r["attempts"] > 0 and names and all(n in still for n in names):
+                skipped += 1
+                for n in set(names):
+                    b = still[n]
+                    key = str(b["salla_product_id"])
+                    rec = self._blocked.setdefault(key, {
+                        "name": n, "why": b.get("suggested_action", ""), "count": 0,
+                        "sku": b.get("sku", ""), "pid": key, "samples": []})
+                    rec["count"] += 1
+                    if len(rec["samples"]) < 5:
+                        rec["samples"].append(str(r["order_id"]))
+                continue
+            keep.append(r)
+        if skipped:
+            self._bump("held", skipped)
+            log.info("PRE-FILTER skipped %d row(s) still blocked by %s (no relay fetch)",
+                     skipped, ", ".join(sorted(still)))
+        return keep
+
     # -- pre-existing resolution (ledger + dedup + LI verify) ------------------
 
     def resolve_preexisting(self, oid, expected_items):
@@ -551,6 +607,14 @@ class QueueDrainEngine(Engine):
         if self.live and marks:
             self.gio.qlog_mark_batch(marks)
             log.info("ledger short-circuit settled %d row(s)", len(marks))
+
+        if getattr(self.cfg, "drain_skip_known_blocked", False):
+            # [v2.14] During the Oct 2026 hold every pass paid a relay fetch for
+            # the same 120 blocked rows (~4k Make credits a day) and never
+            # reached the other 1,600. Skip rows that can only be blocked
+            # without fetching them, and try the least-tried rows first.
+            to_process = self._skip_known_blocked(to_process)
+            to_process.sort(key=lambda r: r["attempts"])   # stable: ties keep sheet order
 
         # fetch + process in relay-sized waves so a STOP loses little work
         done_counter = 0

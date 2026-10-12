@@ -745,6 +745,9 @@ class Config:
     # per day while the hold lasts. 0 disables.
     held_escalate_count: int = 0
     escalation_mentions: list = None
+    # [v2.14] the drain skips rows whose products all still fail the gate
+    # (re-checked in HubSpot, no relay fetch) and tries least-tried rows first
+    drain_skip_known_blocked: bool = False
     # [v2.12] when a Zid-import order holds a new Salla order's number, move
     # that record to Z<number> (zid_rekey.py) and create the Salla order,
     # instead of parking the row. Dry runs never re-key.
