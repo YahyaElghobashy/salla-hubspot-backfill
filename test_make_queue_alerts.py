@@ -434,9 +434,15 @@ class Alert(unittest.TestCase):
     def setUp(self):
         _chdir_tmp(self)
         fresh_config_warnings(self)
-        self.sent = []
-        p = mock.patch.object(cw.notify, "send_alert",
-                              side_effect=lambda s, b, **k: self.sent.append((s, b)))
+        self.sent, self.resolved = [], []
+        # [v2.13] alerts are issue threads now; every new post is recorded
+        # here the same way (subject, body), resolutions separately
+        p = mock.patch.multiple(
+            cw.notify,
+            send_alert=mock.Mock(side_effect=lambda s, b, **k: self.sent.append((s, b))),
+            issue_is_open=mock.Mock(return_value=False),
+            issue_open=mock.Mock(side_effect=lambda k, s, b, **kw: self.sent.append((s, b)) or True),
+            issue_resolve=mock.Mock(side_effect=lambda k, t, **kw: self.resolved.append((k, t)) or True))
         p.start()
         self.addCleanup(p.stop)
 

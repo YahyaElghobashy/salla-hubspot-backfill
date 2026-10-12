@@ -22,19 +22,24 @@ Secrets are read from the environment only (populated from .env by run.py):
 Nothing here ever logs a secret value.
 """
 
+import fcntl
 import json
 import logging
 import os
 import smtplib
 import socket
 import ssl
+import time
+from contextlib import contextmanager
 from email.message import EmailMessage
+from pathlib import Path
 
 from backfill import http_request, with_retries, now_str
 
 log = logging.getLogger("backfill")
 
 SLACK_API = "https://slack.com/api/chat.postMessage"
+SLACK_REACT = "https://slack.com/api/reactions.add"
 
 # smtplib blocks forever by default. A hanging alert path is worse than a failing
 # one -- it wedges the engine loop that called it.
@@ -65,8 +70,10 @@ def email_enabled():
     return bool(_env("SMTP_HOST") and _env("SMTP_FROM") and _env("SMTP_TO"))
 
 
-def post_slack(text, blocks=None, thread_ts=None, dry_run=False, channel=None):
+def post_slack(text, blocks=None, thread_ts=None, dry_run=False, channel=None,
+               reply_broadcast=False):
     """Post to one Slack channel. Returns the message ts (for threading) or None.
+    [v2.13] reply_broadcast=True on a thread reply also shows it in the channel.
 
     Slack returns HTTP 200 even for application errors -- the same trap as Make's
     `200 Accepted`. The JSON `ok` field is the real status and must be checked.
@@ -80,6 +87,9 @@ def post_slack(text, blocks=None, thread_ts=None, dry_run=False, channel=None):
         payload["blocks"] = blocks
     if thread_ts:
         payload["thread_ts"] = thread_ts
+        if reply_broadcast:
+            payload["reply_broadcast"] = True
+    payload["unfurl_links"] = False      # links stay one line, not preview cards
     if dry_run:
         log.info("DRY RUN slack payload: %s", json.dumps(
             {k: v for k, v in payload.items() if k != "channel"})[:400])
@@ -197,3 +207,194 @@ def channels_summary():
     n = len(slack_channels()) if slack_enabled() else 0
     return (f"slack={'on x' + str(n) + ' channel' + ('s' if n != 1 else '') if n else 'off'} "
             f"email={'on' if email_enabled() else 'off'}")
+
+
+# ---------------------------------------------------------------------------
+# [v2.13] Issue threads: one Slack thread per problem, answered when it clears
+# ---------------------------------------------------------------------------
+#
+# Every problem alert is opened under a stable key ("held:<product>",
+# "customer-held:<id>", "status-missing:<order>", "make-queue:<scenario>",
+# ...). The parent message and its detail reply are posted once per channel
+# and their ts stored in mirror/slack_issues.json. While the problem lasts,
+# news goes into the same thread (throttled). When the code that owns the
+# problem sees it clear, it resolves the key: a "Resolved" reply lands in the
+# same thread (optionally also shown in the channel), the parent gets a
+# check-mark reaction, and the record is closed. Several services share the
+# file, so every read-modify-write holds an exclusive lock.
+
+ISSUES = Path("mirror/slack_issues.json")
+ISSUES_LOCK = Path("mirror/slack_issues.lock")
+CLOSED_KEEP_S = 30 * 86400
+OPENING_TTL_S = 180
+
+
+@contextmanager
+def _issues():
+    ISSUES.parent.mkdir(parents=True, exist_ok=True)
+    with open(ISSUES_LOCK, "a+") as lk:
+        fcntl.flock(lk, fcntl.LOCK_EX)
+        try:
+            try:
+                data = json.loads(ISSUES.read_text()) if ISSUES.exists() else {}
+            except (ValueError, OSError):
+                data = {}
+            before = json.dumps(data, sort_keys=True)
+            yield data
+            now = time.time()
+            for k in [k for k, v in data.items()
+                      if v.get("state") == "closed" and now - float(v.get("closed_at") or 0) > CLOSED_KEEP_S]:
+                data.pop(k, None)
+            if json.dumps(data, sort_keys=True) != before:
+                tmp = ISSUES.with_suffix(".tmp")
+                tmp.write_text(json.dumps(data, indent=1, ensure_ascii=False, sort_keys=True))
+                tmp.replace(ISSUES)
+        finally:
+            fcntl.flock(lk, fcntl.LOCK_UN)
+
+
+def _merge_meta(rec, meta):
+    if not meta:
+        return
+    m = rec.setdefault("meta", {})
+    for k, v in meta.items():
+        if isinstance(v, list):
+            have = m.setdefault(k, [])
+            for x in v:
+                if x not in have:
+                    have.append(x)
+        else:
+            m[k] = v
+
+
+def add_reaction(channel, ts, name="white_check_mark"):
+    """Best effort: needs the reactions:write scope; a missing scope is logged
+    once per process and never raised."""
+    if not slack_enabled() or not ts:
+        return False
+    try:
+        status, _, body = http_request(
+            "POST", SLACK_REACT,
+            headers={"Authorization": f"Bearer {_env('SLACK_BOT_TOKEN')}",
+                     "Content-Type": "application/json; charset=utf-8"},
+            body=json.dumps({"channel": channel, "timestamp": ts, "name": name}), timeout=15)
+        parsed = json.loads(body or "{}")
+        if not parsed.get("ok") and parsed.get("error") not in ("already_reacted",):
+            if not getattr(add_reaction, "_warned", False):
+                log.info("slack reaction skipped: %s", parsed.get("error"))
+                add_reaction._warned = True
+            return False
+        return True
+    except Exception as e:
+        log.debug("slack reaction failed: %s", e)
+        return False
+
+
+def issue_get(key):
+    with _issues() as d:
+        rec = d.get(key)
+        return json.loads(json.dumps(rec)) if rec else None
+
+
+def issue_is_open(key):
+    rec = issue_get(key)
+    return bool(rec and rec.get("state") == "open")
+
+
+def issues_open(prefix=""):
+    with _issues() as d:
+        return {k: json.loads(json.dumps(v)) for k, v in d.items()
+                if k.startswith(prefix) and v.get("state") == "open"}
+
+
+def issue_open(key, subject, body, meta=None, dry_run=False):
+    """Open a problem thread. Returns True when a new thread was posted; when
+    the key is already open its meta is merged and nothing is posted."""
+    now = time.time()
+    with _issues() as d:
+        rec = d.get(key)
+        if rec and rec.get("state") == "open":
+            _merge_meta(rec, meta)
+            return False
+        if rec and rec.get("state") == "opening" and now - float(rec.get("t") or 0) < OPENING_TTL_S:
+            _merge_meta(rec, meta)
+            return False
+        if dry_run:
+            log.info("DRY RUN issue open %s: %s", key, subject)
+            return False
+        d[key] = {"state": "opening", "t": now, "subject": subject}
+        _merge_meta(d[key], meta)
+    threads = {}
+    for ch in (slack_channels() if slack_enabled() else []):
+        try:
+            ts = post_slack(subject, channel=ch)
+            if ts:
+                threads[ch] = ts
+                if body:
+                    post_slack(body, thread_ts=ts, channel=ch)
+        except Exception as e:
+            log.warning("issue %s: slack post to %s failed: %s", key, ch, e)
+    try:
+        send_email(subject, body)
+    except Exception as e:
+        log.warning("issue %s: email failed: %s", key, e)
+    if not slack_enabled() and not email_enabled():
+        log.warning("ALERT (no channel configured): %s -- %s", subject, (body or "")[:300])
+    with _issues() as d:
+        rec = d.get(key) or {"meta": {}}
+        rec.update({"state": "open", "opened_at": now, "last_update": now, "subject": subject,
+                    "threads": threads})
+        rec.pop("t", None)
+        d[key] = rec
+    log.info("ISSUE opened %s: %s", key, subject)
+    return True
+
+
+def issue_update(key, text, every_s=0, meta=None, dry_run=False, broadcast=False):
+    """News for an open thread, at most once per every_s. Returns True when
+    posted. broadcast=True also shows the reply in the channel (for news that
+    makes the problem more urgent)."""
+    now = time.time()
+    with _issues() as d:
+        rec = d.get(key)
+        if not rec or rec.get("state") != "open":
+            return False
+        _merge_meta(rec, meta)
+        if now - float(rec.get("last_update") or 0) < every_s:
+            return False
+        if dry_run:
+            return False
+        rec["last_update"] = now
+        threads = dict(rec.get("threads") or {})
+    for ch, ts in threads.items():
+        try:
+            post_slack(text, thread_ts=ts, channel=ch, reply_broadcast=broadcast)
+        except Exception as e:
+            log.warning("issue %s: update to %s failed: %s", key, ch, e)
+    return True
+
+
+def issue_resolve(key, text, broadcast=False, dry_run=False):
+    """Answer the thread that raised `key` and close it. Returns True when an
+    open issue was resolved; False (and nothing posted) otherwise."""
+    with _issues() as d:
+        rec = d.get(key)
+        if not rec or rec.get("state") != "open":
+            return False
+        if dry_run:
+            log.info("DRY RUN issue resolve %s", key)
+            return False
+        rec.update({"state": "closed", "closed_at": time.time(), "resolution": text[:300]})
+        threads, subject = dict(rec.get("threads") or {}), rec.get("subject", key)
+    for ch, ts in threads.items():
+        try:
+            post_slack(text, thread_ts=ts, channel=ch, reply_broadcast=broadcast)
+            add_reaction(ch, ts)
+        except Exception as e:
+            log.warning("issue %s: resolve post to %s failed: %s", key, ch, e)
+    try:
+        send_email(f"Resolved: {subject}", text)
+    except Exception as e:
+        log.warning("issue %s: resolve email failed: %s", key, e)
+    log.info("ISSUE resolved %s", key)
+    return True

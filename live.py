@@ -562,7 +562,41 @@ class LiveEngine(Engine):
             written += self.gio.queue_mark_batch(self.qsid, marks[i:i + 500])
         if marks:
             log.info("SETTLE %d held/exhausted row(s) whose order now exists marked done", written)
+        if getattr(self.cfg, "alerts_enabled", True):
+            try:
+                still_held = sum(1 for r in rows if r["status"] == "held") - \
+                    sum(1 for m in marks if "was held" in m[4])
+                self._answer_held_threads(still_held)
+            except Exception as e:
+                log.warning("SETTLE Slack threads failed: %s", e)
         return written
+
+    def _answer_held_threads(self, still_held):
+        """[v2.13] Reply "released" in every held-product thread whose waiting
+        orders are all in HubSpot now, and close the aggregated backlog
+        thread when no order is left on hold."""
+        import notify
+        import slack_text as st
+        for key, rec in notify.issues_open("held:").items():
+            m = rec.get("meta") or {}
+            orders = [str(o) for o in (m.get("orders") or [])]
+            if not orders:
+                continue
+            made = {o: self.created_ledger.get(o) for o in orders}
+            if not all(made.values()):
+                continue
+            refs = [str(x) for x in (m.get("refs") or [])]
+            refs = refs if len(refs) == len(orders) else orders
+            shown = ", ".join(st.hubspot("order", made[o], f"#{r}") for o, r in list(zip(orders, refs))[:5])
+            more = f" and {len(orders) - 5} more" if len(orders) > 5 else ""
+            n = len(orders)
+            notify.issue_resolve(
+                key, f"✅ Released: {m.get('name') or 'the product'} passes the catalog check now, and "
+                     f"{st.plural(n, 'order')} that waited for it {'is' if n == 1 else 'are'} in HubSpot: "
+                     f"{shown}{more}.")
+        if still_held <= 0:
+            notify.issue_resolve("held-backlog", "✅ Resolved: no order is on hold for catalog approval "
+                                                 "any more. Every one of them is in HubSpot now.")
 
     def run_live(self, max_orders=None, once=False):
         log.info("LIVE SYNC start instance=%s queue=%s poll=%ss workers=%d live=%s",

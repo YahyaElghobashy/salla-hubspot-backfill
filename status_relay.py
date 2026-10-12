@@ -42,6 +42,7 @@ from pathlib import Path
 from backfill import (Config, HubSpot, GoogleIO, dig, is_zid_order, now_str,
                       setup_logging)
 from realtime_base import RealtimeConsumer, TabLock
+import slack_text as st
 
 log = logging.getLogger("backfill")
 
@@ -240,61 +241,105 @@ class StatusRelay(RealtimeConsumer):
         more = f" and {len(items) - 10} more" if len(items) > 10 else ""
         self._alert(
             "backfill-digest",
-            f"🟠 {len(items)} status event(s) waiting on historical backfill",
-            f"These orders predate the live sync and their backfill window "
-            f"has not run yet, so their delivery statuses cannot apply: "
-            f"{sample}{more}. No action needed: each stage is baked in "
-            f"automatically when its order is created by the backfill. If "
-            f"this number grows day over day, check that the backfill is "
-            f"actually progressing.\n{self._links_line()}")
+            f"🟠 {len(items)} delivery updates are waiting for older orders to be imported",
+            st.message(
+                f"These orders are older than the live sync and are not in HubSpot yet, so their "
+                f"delivery updates cannot apply: {sample}{more}. Nothing is lost: each order gets "
+                f"its latest status when it is imported.",
+                "Nothing to do. If this number grows every day, tell the integration team.",
+                [self._tab_link(self.cfg.spreadsheet_id, EXCEPTIONS_TAB, "Delivery Status Exceptions tab")]))
+
+    def _tab_link(self, sheet_id, tab, label):
+        """[v2.13] A link straight to a tab of a sheet; the sheet when the tab
+        id cannot be read."""
+        try:
+            if getattr(self, "_sheets", None) is None:
+                self._sheets = st.SheetIndex(self.gio)
+            return st.sheet(sheet_id, label, self._sheets.tabs(sheet_id).get(tab))
+        except Exception:
+            return st.sheet(sheet_id, label)
+
+    def _issue(self, key, subject, body, meta=None):
+        if not (self.live and getattr(self.cfg, "alerts_enabled", True)):
+            return False
+        try:
+            import notify
+            return notify.issue_open(key, subject, body, meta=meta)
+        except Exception as e:
+            log.warning("status issue %s failed: %s", key, e)
+            return False
 
     def _giveup_alert(self, kind, oid, reference_id, slug, attempts):
-        """One give-up, three honest stories. kind=None preserves the pre-v2.8
-        single orange alert so an unconfigured deployment behaves as before."""
-        hs_link = _slack_link(_hubspot_search_url(oid), "search HubSpot")
+        """[v2.13] Every give-up becomes (or joins) a Slack thread that is
+        answered when the order finally exists: held orders join their
+        product's thread, a missing live order gets its own."""
+        import notify
+        ref = reference_id or oid
+        exceptions = self._tab_link(self.cfg.spreadsheet_id, EXCEPTIONS_TAB, "Delivery Status Exceptions tab")
         if kind == "held":
+            if not (self.live and getattr(self.cfg, "alerts_enabled", True)):
+                return
+            for key, rec in notify.issues_open("held:").items():
+                if str(oid) in ((rec.get("meta") or {}).get("orders") or []):
+                    notify.issue_update(key, f"Order #{ref} also got a delivery update (“{slug}”). It applies "
+                                             "by itself once the order is created.", every_s=6 * 3600)
+                    return
             self._refresh_live_index()
             count, top = self._held_summary()
-            blockers = f" Blocking products: {top}." if top else ""
-            self._alert(
-                "held-backlog",
-                f"🟡 {count} order(s) held for catalog approval are getting "
-                f"delivery updates",
-                f"Latest: order {oid} (status “{slug}”). It cannot be created "
-                f"until its products are approved in the catalog review, so "
-                f"its delivery status cannot apply yet.{blockers} Once "
-                f"approved and drained, the order is created with the CURRENT "
-                f"status baked in, so nothing is lost. The backlog ages "
-                f"until someone approves: that is the action.\n"
-                f"{self._links_line()}  ·  {hs_link}")
-            return
-        if kind == "recent":
-            self._alert(
-                f"missing:{oid}",
-                f"🔴 Live order {oid} is missing from HubSpot",
-                f"This order is from the live era (reference "
-                f"{reference_id or '?'}), its delivery status “{slug}” has "
-                f"been arriving for ~8 hours, and the order itself is not in "
-                f"HubSpot. This is NOT catalog-hold and NOT backfill lag: "
-                f"the intake likely lost the creation event. Check the Live "
-                f"Queue row and mirror/errors.csv on the server, then "
-                f"re-drain or create manually.\n"
-                f"{self._links_line()}  ·  {hs_link}")
+            vs = getattr(self.cfg, "validation_spreadsheet_id", "") or st.VALIDATION_SHEET
+            if not self._issue(
+                    "held-backlog",
+                    f"🟡 {st.plural(count, 'order')} on hold for catalog approval "
+                    f"{'is' if count == 1 else 'are'} getting delivery updates",
+                    st.message(
+                        "These orders include products that are not approved in the catalog, so they are "
+                        "not in HubSpot yet and their delivery updates cannot apply. Nothing is lost: when "
+                        "an order is created it gets its latest status."
+                        + (f" Products holding the most orders: {top}." if top else ""),
+                        [f"Open the {st.sheet(vs, 'Bundle & Product Validation sheet')}.",
+                         "Approve each product listed above: *ClaraHair › Products › Approve as Standalone*, "
+                         "or for a bundle *ClaraHair › Bundles › Push to HubSpot…*",
+                         "Orders are created within the hour after approval. This thread confirms when no "
+                         "order is left on hold."],
+                        [exceptions])):
+                notify.issue_update("held-backlog", f"Now {st.plural(count, 'order')} on hold. Latest: order "
+                                                    f"#{ref} got “{slug}”.", every_s=6 * 3600)
             return
         if kind == "backfill":
             self._digest.append((oid, slug))
             self._flush_digest()
             return
-        self._alert("order-missing",
-                    "🟠 Status events arriving for orders HubSpot "
-                    "does not have",
-                    f"Latest: order {oid} (status “{slug}”). Retried "
-                    f"{attempts} times over ~8 hours. Usual causes: "
-                    f"the order is catalog-held, or its creation "
-                    f"failed. The event is logged in the exceptions "
-                    f"tab and will apply automatically if the order "
-                    f"appears later via drain/backfill (stage is "
-                    f"baked in at creation).")
+        # "recent", or an unconfigured deployment (kind None): a live order
+        # whose creation was lost
+        self._issue(
+            f"status-missing:{oid}",
+            f"🔴 Order #{ref} is getting delivery updates but is not in HubSpot",
+            st.message(
+                f"Salla has sent delivery updates for order #{ref} (latest: “{slug}”) for about "
+                f"{max(1, round(sum(self.ladder) / 3600))} hours, but the order itself never reached HubSpot. "
+                "It is not on hold for the catalog, so its creation was most likely lost on the way in.",
+                ["Nothing for now: the integration team is alerted and will re-create it.",
+                 "This thread confirms when the order is in HubSpot. Its latest status is applied then."],
+                [exceptions, st.hubspot_search(oid, "Search HubSpot for it")]),
+            meta={"ref": str(ref), "slug": slug})
+
+    def periodic(self):
+        """[v2.13] Every 10 minutes: answer "unmapped status" threads whose
+        status now has a stage (the mapping was added and the relay restarted)."""
+        if time.time() - getattr(self, "_periodic_at", 0) < 600:
+            return
+        self._periodic_at = time.time()
+        if not self.live:
+            return
+        try:
+            import notify
+            for key in notify.issues_open("unmapped:"):
+                slug = key.split(":", 1)[1]
+                if self.stage_map.get(slug):
+                    notify.issue_resolve(key, f"✅ Resolved: the Salla status “{slug}” now moves orders to a "
+                                              "HubSpot stage. New updates with this status apply by themselves.")
+        except Exception as e:
+            log.warning("status periodic failed: %s", e)
 
     def _alert(self, key, subject, body):
         """Cooldown-respecting Slack alert (per key, alert_cooldown_minutes)."""
@@ -341,13 +386,18 @@ class StatusRelay(RealtimeConsumer):
         if not stage:
             self._exception_row(row, slug, "Unmapped status",
                                 "Review mapping or fix manually")
-            self._alert(f"unmapped:{slug}",
-                        f"🟠 Delivery status “{slug}” has no stage mapping",
-                        f"Order {oid} arrived with status “{slug}”, which is "
-                        f"not in status_stage_map. It is logged in the "
-                        f"Delivery Status Exceptions tab; the stage was NOT "
-                        f"changed. Add the mapping and the next event will "
-                        f"apply cleanly.")
+            self._issue(
+                f"unmapped:{slug}",
+                f"🟠 Salla sent a delivery status the sync does not know: “{slug}”",
+                st.message(
+                    f"Order #{row.get('reference_id') or oid} moved to the Salla status “{slug}”. This status "
+                    "has no matching stage in HubSpot yet, so the order's stage was not changed. Every order "
+                    "that gets this status is listed on the Delivery Status Exceptions tab.",
+                    ["Reply in this thread with the HubSpot stage this status should use (for example "
+                     "Processed, Shipped or Delivered).",
+                     "The integration team adds it. This thread confirms when it is live, and new updates "
+                     "then apply by themselves."],
+                    [self._tab_link(self.cfg.spreadsheet_id, EXCEPTIONS_TAB, "Delivery Status Exceptions tab")]))
             log.error("STATUS unmapped slug %r on order %s -- logged to the "
                       "exceptions tab, stage unchanged", slug, oid)
             return "error-final", f"unmapped status {slug}"
@@ -364,12 +414,17 @@ class StatusRelay(RealtimeConsumer):
             self._exception_row(row, slug, "Order number held by an imported Zid "
                                 "order", "Salla order is created after the Zid "
                                 "order is re-keyed; nothing changed", hs_order_id="")
-            self._alert(f"zid:{oid}",
-                        "🟠 Delivery status for an order blocked by a Zid number",
-                        f"Order {oid} got status “{slug}”, but HubSpot order {zid} "
-                        f"is the imported Zid order with the same number, so the "
-                        f"Salla order is not in HubSpot yet. Nothing was changed "
-                        f"on the Zid order.\n{self._links_line()}")
+            self._issue(
+                f"zid:{oid}",
+                f"🟠 Order #{row.get('reference_id') or oid} is not in HubSpot yet: an old Zid order uses its number",
+                st.message(
+                    f"Salla order {oid} got the status “{slug}”, but the only HubSpot order with that number is "
+                    "an imported Zid order, so the Salla order has not been created yet. Nothing was changed on "
+                    "the Zid order.",
+                    "Nothing to do: the sync moves the Zid order to its own number and creates the Salla "
+                    "order. This thread confirms when it is in HubSpot.",
+                    [st.hubspot("order", zid, "Zid order in HubSpot")]),
+                meta={"zid_hs_id": str(zid)})
             return "error-final", f"zid collision: number held by Zid HS {zid}"
         if hs_order is None:
             attempts = int(row["attempts"] or 0)
@@ -407,6 +462,14 @@ class StatusRelay(RealtimeConsumer):
             return "error", f"PATCH failed HTTP {status}"
         if self.live:
             self.ledger.record(oid, slug, stage, hs_id, event_ts)
+            if getattr(self.cfg, "alerts_enabled", True):
+                try:
+                    import notify
+                    notify.issue_resolve(f"status-missing:{oid}",
+                                         f"✅ Resolved: order #{row.get('reference_id') or oid} is in HubSpot now "
+                                         f"({st.hubspot('order', hs_id, 'open it')}) and its stage is “{slug}”.")
+                except Exception as e:
+                    log.debug("status-missing resolve failed: %s", e)
         log.info("STATUS applied %s -> %s (HS %s, stage %s)",
                  oid, slug, hs_id, stage[:12])
         return "done", f"{slug} applied"

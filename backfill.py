@@ -730,6 +730,7 @@ class Config:
     dlq_min_age_minutes: int = 45
     # Workbook capacity guard (Google caps a workbook at 10,000,000 cells).
     capacity_alert_pct: float = 80.0
+    validation_spreadsheet_id: str = "1VdvXPDvlI6O1qq6jIFMhIVU7PvVIr5_JMlr374NXRKg"  # [v2.13] Bundle & Product Validation
     # [v2.12] when a Zid-import order holds a new Salla order's number, move
     # that record to Z<number> (zid_rekey.py) and create the Salla order,
     # instead of parking the row. Dry runs never re-key.
@@ -2590,14 +2591,16 @@ class Engine:
                 if sku and self.hs.gate_search_product_by_sku(
                         [sku, self._legacy_sku(sku)]) > 0:
                     continue
-                unverified.append({"id": item.get("id"),
-                                   "name": item.get("name", "")})
+                unverified.append({"id": item.get("id"), "name": item.get("name", ""),
+                                   "pid": "", "sku": sku, "why": "deleted"})   # [v2.13]
                 continue
             p = self.hs.gate_search_product_approved(pid)      # [M211]
             te = self.hs.gate_search_template(pid, True)       # [M213]
             ta = self.hs.gate_search_template(pid, False)      # [M214]
             if (p == 0 and te == 0 and ta == 0) or (te == 0 and ta > 0):
-                unverified.append({"id": item.get("id"), "name": item.get("name", "")})
+                unverified.append({"id": item.get("id"), "name": item.get("name", ""),
+                                   "pid": str(pid), "sku": str(item.get("sku") or "").strip(),
+                                   "why": "bundle_inactive" if ta > 0 else "unapproved"})
         return unverified
 
     # -- HELD route [M244/M222/M224] ------------------------------------------
@@ -2643,6 +2646,11 @@ class Engine:
                     headers={"Content-Type": "application/json"}, body=body)
                 if status != 200:
                     log.warning("Held notify webhook returned %s: %s", status, text[:200])
+        if self.live and self.is_live_sync and getattr(self.cfg, "alerts_enabled", True):
+            try:
+                self.held_issue(order, unverified)     # [v2.13] one thread per product
+            except Exception as e:
+                log.warning("held Slack thread failed for %s: %s", order.get("id"), e)
         # v2.8: carry the blocking item names into the outcome so the live
         # queue note (and therefore the status relay and the daily report) can
         # say WHICH products are holding the order, not just that one is.
@@ -2797,6 +2805,129 @@ class Engine:
             log.error("ZID COLLISION on salla %s: re-key of Zid HS %s failed: %s", oid, zid_hs_id, e)
             return False
 
+    # -- [v2.13] Slack threads for held orders and order problems --------------
+
+    @staticmethod
+    def held_key(u):
+        return "held:" + (u.get("pid") or ("sku:" + (u.get("sku") or "-")))
+
+    def _sheet_index(self):
+        import slack_text
+        if getattr(self, "_sheets", None) is None:
+            self._sheets = slack_text.SheetIndex(self.gio)
+        return self._sheets
+
+    def held_text(self, order, u):
+        """Headline and thread text for a product that holds orders: what
+        happened, the exact steps on the Bundle & Product Validation sheet,
+        and links to the sheet row, the HubSpot record and the Salla order."""
+        import slack_text as st
+        ref = str(order.get("reference_id") or order.get("id"))
+        name, sku, pid, why = u.get("name") or "a product", u.get("sku") or "", u.get("pid") or "", u.get("why")
+        shown = f"{name} (SKU {sku})" if sku else name
+        vs = getattr(self.cfg, "validation_spreadsheet_id", "") or st.VALIDATION_SHEET
+        done = ("That's all. Orders waiting for it are created automatically within the hour, "
+                "and this thread will confirm when they are in HubSpot.")
+        links = [st.salla_order(order, f"Order #{ref} in Salla")]
+        if why == "deleted":
+            subject = f"🟡 Order #{ref} is on hold: {name} was deleted in Salla"
+            what = (f"Order #{ref} includes {shown}. This product was deleted in Salla, so the catalog "
+                    "cannot match it, and the order is on hold until it can.")
+            todo = [f"Reply in this thread to ask for SKU {sku or 'this item'} to be added as a legacy product "
+                    "(the integration team does this in a few minutes).", done]
+            return subject, st.message(what, todo, links)
+        if why == "bundle_inactive":
+            tid = None
+            try:
+                d = self.hs.search("/crm/v3/objects/2-203847434/search", {"filterGroups": [{"filters": [
+                    {"propertyName": "bundle_template_key", "operator": "EQ", "value": pid}]}],
+                    "properties": ["template_status"], "limit": 1}, "held bundle")
+                tid = ((d.get("results") or [{}])[0] or {}).get("id")
+            except Exception:
+                pass
+            row, found = self._sheet_index().row_link(vs, "Bundles", "bundle_template_key", pid,
+                                                      f"{name} on the Bundles tab")
+            subject = f"🟡 Order #{ref} is on hold: the bundle {name} is not active yet"
+            what = (f"Order #{ref} includes the bundle {shown}. The bundle exists in HubSpot but is not "
+                    "active yet (its parts are not mapped, or it was never pushed), so the order is on hold.")
+            todo = [f"Open the bundle's row: {row}." if found else f"Find the bundle on the Bundles tab: {row}.",
+                    "Check that every part of the bundle is listed on the Components tab.",
+                    "Click the bundle's row, then use the menu *ClaraHair › Bundles › Push to HubSpot…*",
+                    done]
+            links += [st.hubspot("bundle_template", tid, "Bundle in HubSpot"), row]
+            return subject, st.message(what, todo, links)
+        prod, status = None, None
+        try:
+            d = self.hs.search("/crm/v3/objects/products/search", {"filterGroups": [{"filters": [
+                {"propertyName": "salla_product_id", "operator": "EQ", "value": pid}]}],
+                "properties": ["catalog_approval_status"], "limit": 1}, "held product")
+            r = (d.get("results") or [None])[0]
+            if r:
+                prod, status = r.get("id"), (r.get("properties") or {}).get("catalog_approval_status")
+        except Exception:
+            pass
+        row, found = self._sheet_index().row_link(vs, "Product Validation", "salla_product_id", pid,
+                                                  f"{name} on the Product Validation tab")
+        subject = f"🟡 Order #{ref} is on hold: {name} is not approved in the catalog yet"
+        if prod:
+            what = (f"Order #{ref} includes {shown}. The product is in HubSpot but not approved in the "
+                    f"catalog yet (status: {status or 'not set'}), so the order is on hold.")
+            todo = [f"Open the product's row: {row}." if found else f"Find the product on the Product Validation tab: {row}.",
+                    "Click the row, then use the menu *ClaraHair › Products › Approve as Standalone*. "
+                    "If it is really a bundle, use *ClaraHair › Products › Reclassify as Bundle…* instead.",
+                    done]
+        elif found:
+            what = (f"Order #{ref} includes {shown}. The product is on the sheet but has not reached "
+                    "HubSpot yet, so the order is on hold.")
+            todo = [f"Open the product's row: {row}.",
+                    "Approve it with *ClaraHair › Products › Approve as Standalone* (it is approved as soon as "
+                    "it reaches HubSpot).",
+                    "If this thread has not confirmed within a day, reply here and the integration team "
+                    "will import the product.", done]
+        else:
+            what = (f"Order #{ref} includes {shown}. This product is not on the validation sheet and not "
+                    "in HubSpot yet (it may be a relisted or copied Salla product), so the order is on hold.")
+            todo = ["Reply in this thread and the integration team will import the product.",
+                    "Then approve it on the Product Validation tab with *ClaraHair › Products › Approve as Standalone*.",
+                    done]
+        links += [st.hubspot("product", prod, "Product in HubSpot"), row]
+        return subject, st.message(what, todo, links)
+
+    def held_issue(self, order, unverified):
+        """One Slack thread per blocking product (not per order): the first
+        held order opens it, later ones join it quietly (news at most every 6 h)."""
+        import notify
+        import slack_text as st
+        oid = str(order.get("id"))
+        ref = str(order.get("reference_id") or oid)
+        for u in unverified:
+            key = self.held_key(u)
+            meta = {"orders": [oid], "refs": [ref], "name": u.get("name", ""), "pid": u.get("pid", ""),
+                    "sku": u.get("sku", ""), "why": u.get("why", "")}
+            rec = notify.issue_get(key)
+            if rec and rec.get("state") == "open":
+                n = len(set((rec.get("meta") or {}).get("orders") or []) | {oid})
+                notify.issue_update(key, f"Order #{ref} is also waiting for {u.get('name') or 'this product'}. "
+                                         f"{st.plural(n, 'order')} waiting in total.", every_s=6 * 3600, meta=meta)
+                continue
+            subject, body = self.held_text(order, u)
+            notify.issue_open(key, subject, body, meta=meta)
+
+    def resolve_order_issues(self, oid, hs_id):
+        """[v2.13] An order now exists in HubSpot: answer any thread that was
+        waiting for it (a delivery status that could not apply, a Zid number
+        collision). Cheap when nothing is open."""
+        import notify
+        import slack_text as st
+        oid = str(oid)
+        rec_link = st.hubspot("order", hs_id, "the order in HubSpot")
+        notify.issue_resolve(f"status-missing:{oid}",
+                             f"✅ Resolved: order {oid} is in HubSpot now ({rec_link}), with its latest "
+                             "delivery status.")
+        notify.issue_resolve(f"zid:{oid}",
+                             f"✅ Resolved: the old Zid order was moved to its own number and order {oid} "
+                             f"is in HubSpot now ({rec_link}).")
+
     def zid_collision(self, oid, zid_hs_id):
         """[v2.12] Record a Salla order whose id is held by a Zid-import
         order and return the queue note. Callers park the row as terminal
@@ -2842,13 +2973,19 @@ class Engine:
         if getattr(self.cfg, "alerts_enabled", False):
             try:
                 import notify
-                notify.send_alert(
-                    "Salla order blocked by a Zid order number",
-                    f"Salla order {oid} was not created: HubSpot order {zid_hs_id} "
-                    f"is the imported Zid order with the same number, and order "
-                    f"numbers must be unique. The queue row is parked and nothing "
-                    f"was written to the Zid order. The Salla order is created "
-                    f"once the Zid order is re-keyed.")
+                import slack_text as st
+                notify.issue_open(
+                    f"zid:{oid}",
+                    f"🟠 Salla order {oid} could not be created: an old Zid order uses the same number",
+                    st.message(
+                        f"Salla order {oid} came in, but an imported Zid order ({st.hubspot('order', zid_hs_id, 'this one')}) "
+                        "already uses the same order number, and HubSpot allows each number only once. The "
+                        "sync normally moves the old Zid order to its own number and carries on; this time "
+                        "that step failed, so the Salla order is waiting.",
+                        "Nothing yet: the integration team is alerted and will re-run it. This thread "
+                        "will confirm when the order is in HubSpot.",
+                        [st.hubspot("order", zid_hs_id, "Zid order in HubSpot")]),
+                    meta={"zid_hs_id": str(zid_hs_id)})
             except Exception as e:
                 log.warning("zid collision alert failed: %s", e)
         return note
@@ -2904,6 +3041,11 @@ class Engine:
             self.mirror.error(oid, "order_create", "createAnOrder failed after retries")
             self._bump("errors")
             return
+        if getattr(self, "live", False) and getattr(self.cfg, "alerts_enabled", True):
+            try:
+                self.resolve_order_issues(oid, order_id)       # [v2.13]
+            except Exception as e:
+                log.debug("order issue resolve failed for %s: %s", oid, e)
         if not was_fresh:
             # v1.6: a concurrent or earlier writer created this order between
             # our search and our create. v2.11: most often that writer is our

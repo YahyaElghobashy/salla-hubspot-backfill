@@ -54,6 +54,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 from backfill import Config, now_str  # noqa: E402
 import notify  # noqa: E402
+import slack_text as st  # noqa: E402
 
 log = logging.getLogger("backfill")
 
@@ -63,6 +64,10 @@ MAKE_API = "https://eu1.make.com/api/v2"
 UA = "SallaHubSpotSync/2.2 (+credit-watch)"
 
 STATE_FILE = Path("mirror/credit_state.json")
+# [v2.13] Slack issue-thread keys (notify.issue_open / issue_resolve)
+DLQ_KEY = "make-queue"
+LOW_KEY = "credits-low"
+OUT_KEY = "credits-out"
 LOCK_FILE = Path("credit_watch.lock")
 STOP_FILE = Path("STOP.credits")
 
@@ -389,6 +394,18 @@ def scan_dlq(cfg, get=None, now=None, quiet=False):
     return out
 
 
+def _plain(line):
+    """The ETA line without its emoji and bold marks, for a sentence."""
+    return re.sub(r"^\W+\s*", "", (line or "").replace("*", "")).strip()
+
+
+def notify_open(key):
+    try:
+        return notify.issue_is_open(key)
+    except Exception:
+        return False
+
+
 def fmt_age(minutes):
     if minutes is None:
         return "unknown"
@@ -617,7 +634,10 @@ class CreditWatch:
             return f"⏳ At the current pace this runs out in roughly *{hours:.0f} hours*."
         return "⏳ At the current pace this runs out in *under an hour*."
 
-    def _alert(self, subject, body):
+    def _alert(self, subject, body, key=None, broadcast=False):
+        """[v2.13] With a key the alert is a Slack issue thread: the first one
+        opens it, later ones are posted into it (broadcast=True also shows
+        that reply in the channel), and _resolve answers it when it clears."""
         if self.dry_run:
             log.info("DRY RUN alert: %s", subject)
             return
@@ -625,10 +645,30 @@ class CreditWatch:
             log.warning("ALERT (suppressed): %s", subject)
             return
         try:
-            notify.send_alert(subject, body)
+            if key and notify.issue_is_open(key):
+                notify.issue_update(key, f"*{subject}*\n{body}", broadcast=broadcast)
+            elif key:
+                notify.issue_open(key, subject, body)
+            else:
+                notify.send_alert(subject, body)
         except Exception as e:
             log.warning("credit alert dispatch failed: %s", e)
         log.error("ALERT: %s", subject)
+
+    def _resolve(self, key, text, broadcast=False):
+        """Answer the open thread `key`. False when none was open (the caller
+        may then post a plain notice), in a dry run, or with alerts off."""
+        if self.dry_run or not getattr(self.cfg, "alerts_enabled", True):
+            return False
+        try:
+            return notify.issue_resolve(key, text, broadcast=broadcast)
+        except Exception as e:
+            log.warning("credit resolve %s failed: %s", key, e)
+            return False
+
+    def _make_link(self, label="Make credits"):
+        org = str(getattr(self.cfg, "make_org_id", "") or "")
+        return st.link(f"https://eu1.make.com/organization/{org}/dashboard", label) if org else ""
 
     # ------------- retry-queue watch (v2.8, widened v2.12) -------------
 
@@ -679,6 +719,9 @@ class CreditWatch:
             # re-alert
             if not unread:
                 self.state.pop("dlq_alerted_at", None)
+                # [v2.13] answer the thread that reported them
+                self._resolve(DLQ_KEY, "✅ Resolved: every Make retry queue reads clear now. "
+                                       "No failed runs are waiting.")
             return
         last = float(self.state.get("dlq_alerted_at") or 0)
         if time.time() - last < DLQ_COOLDOWN_S:
@@ -705,7 +748,7 @@ class CreditWatch:
                 subject,
                 "The watcher cannot see whether these scenarios have failed "
                 "runs waiting, so a stuck run would go unnoticed. "
-                + token_hint + "\n" + "\n".join(fail_lines))
+                + token_hint + "\n" + "\n".join(fail_lines), key=DLQ_KEY)
             return
 
         total = sum(r["count"] for r in found)
@@ -729,8 +772,9 @@ class CreditWatch:
             "Make has not been able to finish these runs on its own. Each "
             "one stays undone until it is replayed in Make: open "
             "the scenario, then Incomplete executions, then Retry. Read the "
-            "note on each line before you replay.\n"
-            + "\n".join(lines))
+            "note on each line before you replay. This thread confirms when "
+            "every queue is clear.\n"
+            + "\n".join(lines), key=DLQ_KEY)
 
     def _streak(self, p, t):
         """(ticks, since) carrying on the failure streak in state entry `p`,
@@ -815,82 +859,78 @@ class CreditWatch:
         label = getattr(self.cfg, "store_label", "the store")
 
         # -- 1. billing cycle renewed ------------------------------------
+        # [v2.13] plain words, and the news goes into any open credit thread
+        thresholds = sorted(
+            (int(t) for t in getattr(self.cfg, "credit_alert_thresholds", None)
+             or (50000, 10000, 1000)), reverse=True)
+        link = self._make_link()
         if prev.get("last_reset") and org["last_reset"] != prev["last_reset"]:
             self.state["fired"] = {}          # thresholds re-arm each cycle
             self.state["out"] = False
-            self._alert(
-                f"🔄 New Make.com billing month — "
-                f"{self._fmt(org['plan'])} fresh credits",
-                "\n".join([
-                    "📋 *A new billing cycle just started.*", "",
-                    f"✅  The {label} Make.com account now has its full monthly "
-                    f"allowance of *{self._fmt(org['plan'])} credits*.",
-                    f"📊  Last cycle ended with "
-                    f"*{self._fmt(prev.get('consumed', 0))} credits consumed*"
-                    + (f" (of which {self._fmt(prev.get('extra', 0))} were "
-                       f"extra purchases)." if prev.get("extra") else "."),
-                    "",
-                    "No action needed — this is just the monthly reset notice.",
-                ]))
+            text = (f"✅ Resolved: a new billing month started, so the {label} Make account "
+                    f"has its full {self._fmt(org['plan'])} credits again. Syncing runs normally.")
+            answered = self._resolve(OUT_KEY, text, broadcast=True)
+            answered = self._resolve(LOW_KEY, text, broadcast=not answered) or answered
+            if not answered:
+                self._alert(
+                    f"🔄 New Make billing month: {self._fmt(org['plan'])} credits available",
+                    st.message(
+                        f"The monthly allowance of the {label} Make account renewed. Last month "
+                        f"used {self._fmt(prev.get('consumed', 0))} credits"
+                        + (f", {self._fmt(prev.get('extra', 0))} of them bought as extra."
+                           if prev.get("extra") else "."),
+                        "Nothing. This is the monthly notice.", [link]))
 
         # -- 2. refill detected (exact, via the extra-credits counter) ---
         elif prev and org["extra"] > prev.get("extra", 0) + 0.5:
             bought = org["extra"] - prev.get("extra", 0)
-            self._alert(
-                f"💳 Credits topped up — +{self._fmt(bought)} added",
-                "\n".join([
-                    "📋 *A credit purchase just landed.*", "",
-                    f"➕  *{self._fmt(bought)} credits* were added "
-                    f"({'auto-purchase' if org['auto_purchase_on'] else 'manual top-up'}).",
-                    f"📊  Balance went from *{self._fmt(prev.get('remaining', 0))}* "
-                    f"to *{self._fmt(remaining)}* credits.",
-                    self._eta_line(remaining), "",
-                    "Everything that was waiting resumes automatically.",
-                ]))
+            how = "automatic purchase" if org["auto_purchase_on"] else "top-up"
+            news = (f"{self._fmt(bought)} credits were added ({how}). The balance went from "
+                    f"{self._fmt(prev.get('remaining', 0))} to {self._fmt(remaining)}. "
+                    + _plain(self._eta_line(remaining)))
             # re-arm any thresholds the refill climbed back above
             self.state["fired"] = {
                 t: ts for t, ts in self.state.get("fired", {}).items()
                 if float(t) >= remaining}
+            if remaining > thresholds[0]:
+                answered = self._resolve(LOW_KEY, "✅ Resolved: " + news, broadcast=True)
+            elif notify_open(LOW_KEY):
+                self._alert(f"💳 {self._fmt(bought)} credits added", news, key=LOW_KEY)
+                answered = True
+            else:
+                answered = False
+            if not answered:
+                self._alert(f"💳 {self._fmt(bought)} Make credits were added: "
+                            f"{self._fmt(remaining)} available now",
+                            st.message(news, "Nothing. Anything that was waiting carries on by itself.",
+                                       [link]))
 
         # -- 3. out of credits / back online -----------------------------
         if remaining <= 0 and not self.state.get("out"):
             self.state["out"] = True
             self.state["out_since"] = time.time()
             self._alert(
-                "🔴 Make.com is OUT of credits — order syncing is paused",
-                "\n".join([
-                    "📋 *The credit balance just hit zero.*", "",
-                    "⛔  Make.com has paused every automation, so orders have "
-                    "stopped flowing into HubSpot.",
-                    "🛟  *Nothing is lost* — new orders are caught in a safety "
-                    "buffer and will sync themselves once credits return.",
-                    "",
-                    "🛠️ *What to do*", "",
-                    f"1️⃣  Top up credits for the {label} Make.com account.",
-                    "2️⃣  That's it — everything resumes and catches up on its own.",
-                    "",
-                    "⏳ I'll keep checking every few minutes and post here the "
-                    "moment we're back.",
-                ]))
+                "🔴 Make is out of credits, so new orders are not reaching HubSpot",
+                st.message(
+                    f"The {label} Make account has 0 credits left, so Make paused its "
+                    "scenarios. New orders, customers and delivery updates are waiting. "
+                    "Nothing is lost: they are kept and sync on their own once credits are back.",
+                    [f"Add credits to the {label} Make account.",
+                     "Nothing else. Everything catches up by itself, and this thread "
+                     "confirms when it has."],
+                    [link]),
+                key=OUT_KEY)
         elif remaining > 0 and self.state.get("out"):
             mins = (time.time() - float(self.state.get("out_since", time.time()))) / 60
             self.state["out"] = False
-            self._alert(
-                "🟢 Credits are back — order syncing has resumed",
-                "\n".join([
-                    "📋 *Good news — the balance is positive again.*", "",
-                    f"💰  Current balance: *{self._fmt(remaining)} credits*.",
-                    f"⏱️  We were out for about *{int(mins)} minutes*.",
-                    "✅  Everything that queued up is processing automatically. "
-                    "Nothing was lost, nothing needs re-running.",
-                    "",
-                    "You can relax — it healed itself, exactly as designed. 🧘",
-                ]))
+            text = (f"✅ Resolved: credits are back ({self._fmt(remaining)} available) after "
+                    f"about {int(mins)} minutes. Syncing restarted and everything that waited "
+                    "is catching up on its own. Nothing needs to be re-run.")
+            if not self._resolve(OUT_KEY, text, broadcast=True):
+                self._alert("🟢 Make credits are back and syncing restarted",
+                            st.message(text.replace("✅ Resolved: c", "C", 1), "Nothing.", [link]))
 
         # -- 4. threshold crossings (descending, once per cycle each) ----
-        thresholds = sorted(
-            (int(t) for t in getattr(self.cfg, "credit_alert_thresholds", None)
-             or (50000, 10000, 1000)), reverse=True)
         sev = {0: "🟡", 1: "🟠", 2: "🔴"}
         for i, t in enumerate(thresholds):
             key = str(t)
@@ -901,25 +941,21 @@ class CreditWatch:
             if remaining <= t and was_above and key not in self.state.get("fired", {}):
                 self.state.setdefault("fired", {})[key] = int(time.time())
                 icon = sev.get(i, "🔴")
-                urgency = ("Plenty of runway left, but worth planning the top-up."
-                           if i == 0 else
-                           "Getting tight — top up soon to stay ahead of it."
-                           if i == 1 else
-                           "*Critical* — top up now to avoid an interruption.")
+                todo = ("No rush. Plan a top-up if the renewal date is far away."
+                        if i == 0 else "Top up soon to stay ahead of it."
+                        if i == 1 else "Top up now to avoid a pause in syncing.")
+                used = (f"{self._fmt(org['consumed'])} used this month"
+                        + (f", including {self._fmt(org['extra'])} bought as extra."
+                           if org["extra"] else "."))
+                renew = org["next_reset"][:10] or "an unknown date"
                 self._alert(
-                    f"{icon} Make.com credits below {self._fmt(t)} — "
+                    f"{icon} Make credits are below {self._fmt(t)}: "
                     f"{self._fmt(remaining)} left",
-                    "\n".join([
-                        "📋 *Credit balance check-in.*", "",
-                        f"💰  Remaining: *{self._fmt(remaining)}* credits.",
-                        f"📊  Consumed this cycle: {self._fmt(org['consumed'])}"
-                        + (f" (incl. {self._fmt(org['extra'])} purchased extra)."
-                           if org["extra"] else "."),
-                        self._eta_line(remaining),
-                        f"🗓️  Cycle renews: {org['next_reset'][:10] or 'unknown'}.",
-                        "",
-                        urgency,
-                    ]))
+                    st.message(
+                        f"The {label} Make account has {self._fmt(remaining)} credits left. "
+                        f"{used} {_plain(self._eta_line(remaining))} The allowance renews on {renew}.",
+                        todo, [link], "This thread confirms when credits are topped up or renew."),
+                    key=LOW_KEY, broadcast=i >= 1)
                 break  # one alert per tick, highest applicable
 
         self.state["org"] = org

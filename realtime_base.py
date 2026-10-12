@@ -406,6 +406,10 @@ class RealtimeConsumer:
         """Process one row. Returns (state, note). Must be idempotent."""
         raise NotImplementedError
 
+    def periodic(self):
+        """[v2.13] Called once per cycle; subclasses throttle their own work."""
+        return None
+
     def on_exhausted(self, row, note):
         """[v2.11] Called once when an `error` row hits the attempt cap.
         Subclasses record it wherever a human will look."""
@@ -572,6 +576,10 @@ class RealtimeConsumer:
                     if st and self.live:
                         self._mark(r, st, r["attempts"], f"twin: {note}")
                 self._maybe_trim()
+                try:
+                    self.periodic()          # [v2.13]
+                except Exception as e:
+                    log.warning("%s periodic failed: %s", self.name, e)
                 if once:
                     break
             except Exception as e:

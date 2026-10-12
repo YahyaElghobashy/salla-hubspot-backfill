@@ -156,7 +156,7 @@ class TestPark(unittest.TestCase):
         e.cfg.zid_auto_rekey = False
         e.hs.create_order = mock.Mock(side_effect=backfill.ZidCollision("4938528", "Z1"))
         e.top_up_items = mock.Mock()
-        with mock.patch("notify.send_alert", create=True) as alert:
+        with mock.patch("notify.issue_open") as alert:
             e._finish_create(ORDER, -1, None, 1)
             e2 = FakeEngine()
             e2.cfg.zid_auto_rekey = False
@@ -166,6 +166,7 @@ class TestPark(unittest.TestCase):
         self.assertEqual(state, "held")
         self.assertTrue(note.startswith("zid collision"))
         self.assertEqual(alert.call_count, 1)                 # once across processes
+        self.assertEqual(alert.call_args[0][0], "zid:4938528")
         e.top_up_items.assert_not_called()
         seen = json.loads(Path("mirror/zid_collisions.json").read_text())
         self.assertEqual(seen["4938528"]["zid_hs_id"], "Z1")
@@ -173,7 +174,7 @@ class TestPark(unittest.TestCase):
 
     def test_dry_run_writes_no_worklist_and_no_alert(self):
         e = FakeEngine(live_mode=False)
-        with mock.patch("notify.send_alert", create=True) as alert:
+        with mock.patch("notify.issue_open") as alert:
             e.zid_collision("1", "Z1")
         alert.assert_not_called()
         self.assertFalse(Path("mirror/zid_collisions.json").exists())
@@ -215,7 +216,7 @@ class TestStatusRelay(unittest.TestCase):
                                   ledger=types.SimpleNamespace(newer_than_applied=lambda o, t: True),
                                   parse_event=status_relay.StatusRelay.parse_event,
                                   _exception_row=mock.Mock(), _alert=mock.Mock(),
-                                  _links_line=lambda: "")
+                                  _issue=mock.Mock(), _links_line=lambda: "")
         f._find_order = lambda oid, ref: status_relay.StatusRelay._find_order(f, oid, ref)
         row = {"order_id": "4938528", "reference_id": "287459205",
                "event": "status:shipped@2026-09-26 04:00:00", "attempts": 0}
@@ -223,7 +224,8 @@ class TestStatusRelay(unittest.TestCase):
         self.assertEqual(state, "error-final")
         self.assertIn("zid collision", note)
         f._exception_row.assert_called_once()
-        f._alert.assert_called_once()
+        f._issue.assert_called_once()
+        self.assertEqual(f._issue.call_args[0][0], "zid:4938528")
 
     def test_zid_match_is_ignored(self):
         f = types.SimpleNamespace(hs=hs_with([ZID]))

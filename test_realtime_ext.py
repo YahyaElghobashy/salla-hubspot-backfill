@@ -175,11 +175,19 @@ class TestStatusRelay(unittest.TestCase):
     def test_unmapped_slug_is_final_exception(self):
         r, hs = self.mk()
         hs.orders["101"] = {"id": "H1", "stage": "st-OLD"}
-        with mock.patch.object(r, "_alert") as al:
+        slack = FakeSlack()
+        with slack.patch():
             state, _ = r.handle_row(_row(event="status:weird@2026"))
+            r.handle_row(_row(event="status:weird@2026-2"))          # same status again
         self.assertEqual(state, "error-final")
-        self.assertTrue(al.called)
+        self.assertEqual(len(slack.sent), 1)                            # one thread per status
+        self.assertIn("“weird”", slack.sent[0][0])
         self.assertEqual(hs.patches, [])
+        # once the status is mapped, the periodic pass answers the thread
+        r.stage_map["weird"] = "st-NEW"
+        with slack.patch():
+            r.periodic()
+        self.assertTrue(any("Resolved" in t for _, t, _ in slack.replies))
 
     def test_ledger_survives_restart(self):
         r, hs = self.mk()
@@ -404,6 +412,33 @@ class IndexedGIO(FakeGIO):
         return []
 
 
+class FakeSlack:
+    """[v2.13] A Slack that records what the real issue threads post:
+    `sent` holds [headline, detail] per new thread, `replies` everything
+    posted into an existing thread afterwards."""
+
+    def __init__(self):
+        self.sent, self.replies, self.parent, self.n = [], [], {}, 0
+
+    def post(self, text, blocks=None, thread_ts=None, dry_run=False, channel=None, reply_broadcast=False):
+        self.n += 1
+        ts = f"t{self.n}"
+        if thread_ts is None:
+            self.sent.append([text, ""])
+            self.parent[ts] = len(self.sent) - 1
+        elif thread_ts in self.parent and not self.sent[self.parent[thread_ts]][1]:
+            self.sent[self.parent[thread_ts]][1] = text
+        else:
+            self.replies.append((thread_ts, text, reply_broadcast))
+        return ts
+
+    def patch(self):
+        import notify
+        return mock.patch.multiple(notify, slack_enabled=lambda: True, slack_channels=lambda: ["C1"],
+                                   post_slack=self.post, send_email=lambda *a, **k: False,
+                                   add_reaction=lambda *a, **k: True)
+
+
 class TestStatusClassification(unittest.TestCase):
     def mk(self, live_rows=None, **cfg_kw):
         _chdir_tmp(self)
@@ -417,11 +452,8 @@ class TestStatusClassification(unittest.TestCase):
         return r, hs
 
     def _patch_alerts(self):
-        import notify
-        sent = []
-        return sent, mock.patch.object(
-            notify, "send_alert",
-            side_effect=lambda s, b, **k: sent.append((s, b)))
+        self.slack = FakeSlack()
+        return self.slack.sent, self.slack.patch()
 
     def test_held_order_gets_held_story_not_legacy(self):
         rows = [{"order_id": "101", "status": "held",
@@ -436,8 +468,8 @@ class TestStatusClassification(unittest.TestCase):
         self.assertEqual(state, "error-final")
         self.assertEqual(len(sent), 1)
         subj, body = sent[0]
-        self.assertIn("held for catalog", subj)
-        self.assertIn("2 order(s)", subj)
+        self.assertIn("on hold for catalog approval", subj)
+        self.assertIn("2 orders", subj)
         self.assertIn("Airbrush Combo (2)", body)
         self.assertIn("docs.google.com", body)
         self.assertIn("catalog-held", r.gio.appends[0][1][0][5])
@@ -451,8 +483,9 @@ class TestStatusClassification(unittest.TestCase):
         self.assertEqual(state, "error-final")
         self.assertEqual(len(sent), 1)
         self.assertIn("\U0001F534", sent[0][0])
-        self.assertIn("909", sent[0][0])
-        self.assertIn("NOT catalog-hold", sent[0][1])
+        self.assertIn("284123456", sent[0][0])
+        self.assertIn("not on hold for the catalog", sent[0][1])
+        self.assertIn("*What to do*", sent[0][1])
 
     def test_engine_seen_but_absent_is_red_even_with_old_reference(self):
         rows = [{"order_id": "777", "status": "done", "note": "HS 123"}]
@@ -480,7 +513,7 @@ class TestStatusClassification(unittest.TestCase):
             self.assertEqual(len(r._digest), 4)
             r._flush_digest(force=True)
         self.assertEqual(len(sent), 1)
-        self.assertIn("4 status event(s)", sent[0][0])
+        self.assertIn("4 delivery updates are waiting", sent[0][0])
         self.assertEqual(r._digest, [])
 
     def test_zero_min_reference_preserves_legacy_alert(self):
@@ -489,7 +522,7 @@ class TestStatusClassification(unittest.TestCase):
         with patcher:
             r.handle_row(_row(oid="101", ref="284000001", attempts=5))
         self.assertEqual(len(sent), 1)
-        self.assertIn("Status events arriving", sent[0][0])
+        self.assertIn("not in HubSpot", sent[0][0])
 
     def test_held_backlog_cooldown_suppresses_second_alert(self):
         rows = [{"order_id": "101", "status": "held", "note": "catalog gate"},
@@ -499,7 +532,8 @@ class TestStatusClassification(unittest.TestCase):
         with patcher:
             r.handle_row(_row(oid="101", ref="284000001", attempts=5))
             r.handle_row(_row(oid="102", ref="284000002", attempts=5))
-        self.assertEqual(len(sent), 1)
+        self.assertEqual(len(sent), 1)                 # one thread, no second headline
+        self.assertEqual(self.slack.replies, [])       # news throttled to every 6 h
 
     def test_held_outcome_carries_names(self):
         _chdir_tmp(self)
@@ -533,10 +567,9 @@ class TestStatusStress(unittest.TestCase):
         cfg = _cfg(live_min_reference=280000000, live_queue_tab="Live Queue")
         r = status_relay.StatusRelay(cfg, FakeHS(), IndexedGIO(rows),
                                      live=True)
-        sent = []
+        slack = FakeSlack()
         t0 = time.time()
-        with mock.patch.object(notify, "send_alert",
-                               side_effect=lambda s, b, **k: sent.append(s)):
+        with slack.patch():
             for i in range(400):
                 r.handle_row(_row(oid=str(20000 + i), ref="250000000",
                                   attempts=5))
@@ -549,10 +582,11 @@ class TestStatusStress(unittest.TestCase):
             r._flush_digest(force=True)
         took = time.time() - t0
         self.assertLess(took, 10, f"stress took {took:.1f}s")
+        sent = [h for h, _ in slack.sent]
         self.assertEqual(len(sent), 52, sent[:5])
         self.assertEqual(len([s for s in sent if "\U0001F534" in s]), 50)
-        self.assertEqual(len([s for s in sent if "held for catalog" in s]), 1)
-        self.assertEqual(len([s for s in sent if "backfill" in s]), 1)
+        self.assertEqual(len([s for s in sent if "on hold for catalog approval" in s]), 1)
+        self.assertEqual(len([s for s in sent if "older orders to be imported" in s]), 1)
         self.assertEqual(sum(len(a[1]) for a in r.gio.appends
                              if a[0] == "Delivery Status Exceptions"), 500)
 
