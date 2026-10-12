@@ -25,7 +25,9 @@ MAX_PASSES=${1:-20}
 cd "$APP" || exit 1
 LOG=drain_backtoback.log
 say() { echo "$(date '+%F %T') $*" | tee -a "$LOG"; }
-n429() { local n; n=$(grep -c " 429" "$1" 2>/dev/null); echo "${n:-0}"; }
+# Real throttles log as "... got 429 (attempt 1/5) ...". A bare " 429" also
+# matches order numbers like 429992396, which falsely aborted a run on 12 Oct.
+n429() { local n; n=$(grep -c "got 429 (attempt" "$1" 2>/dev/null); echo "${n:-0}"; }
 state() { systemctl show -p ActiveState --value salla-queue-drain.service; }
 
 say "start: up to $MAX_PASSES passes"
