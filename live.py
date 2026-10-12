@@ -597,6 +597,24 @@ class LiveEngine(Engine):
         if still_held <= 0:
             notify.issue_resolve("held-backlog", "✅ Resolved: no order is on hold for catalog approval "
                                                  "any more. Every one of them is in HubSpot now.")
+        # [v2.14] close a stray-record thread once the empty record is gone,
+        # or once someone starts building that bundle on purpose
+        for key, rec in notify.issues_open("stray:").items():
+            pid = str((rec.get("meta") or {}).get("pid") or key.split(":", 1)[1])
+            name = (rec.get("meta") or {}).get("name") or f"Salla product {pid}"
+            try:
+                recs = self.hs.template_records(pid)
+            except Exception as e:
+                log.warning("stray thread %s: template read failed: %s", key, e)
+                continue
+            self.__dict__.setdefault("_stray_cache", {}).pop(pid, None)
+            if not recs:
+                notify.issue_resolve(key, f"✅ Resolved: the empty bundle record for {name} has been set "
+                                          "aside. Nothing was held while it existed.")
+            elif not self._stray_only(pid):
+                notify.issue_resolve(key, f"✅ Closed: someone has started building {name} as a bundle "
+                                          "(it has a status, components or a Bundles-tab row), so it now "
+                                          "follows the normal bundle approval.")
 
     def run_live(self, max_orders=None, once=False):
         log.info("LIVE SYNC start instance=%s queue=%s poll=%ss workers=%d live=%s",

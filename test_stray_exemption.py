@@ -1,0 +1,176 @@
+#!/usr/bin/env python3
+"""v2.14 stray-template exemption: an approved single product can no longer be
+held by an EMPTY bundle record that nobody acted on.
+
+The replayed incident: Multi Styler 1982906533, approved standalone, gets an
+empty template from Make's bundle branch (no status, no components, no
+Bundles-tab row). Before v2.14 the gate rule (te == 0 and ta > 0) held every
+order of it (1,760 orders, 5 to 12 Oct 2026) and the line builder routed its
+lines to needs_review. Under the exemption both treat it as the approved
+product. Everything a person touched (a status, components, a Bundles row)
+still holds exactly as before, and an unapproved product is never exempt.
+"""
+import unittest
+from unittest import mock
+
+import backfill
+from test_queue_drain import chdir_tmp, make_cfg, make_engine, order
+
+PID = "1982906533"
+EMPTY = [{"id": "454482395354", "properties": {
+    "template_status": None, "component_count": None, "active_component_count": None}}]
+
+
+def engine(tmp, flag=True, recs=EMPTY, p=1, te=0, ta=1, live=False):
+    cfg = make_cfg(tmp)
+    cfg.stray_template_exemption = flag
+    eng, hs, relay, gio = make_engine(tmp, live=live, cfg=cfg)
+    hs.gate_search_product_approved.return_value = p
+    hs.gate_search_template.side_effect = lambda pid, elig: te if elig else ta
+    if isinstance(recs, Exception):
+        hs.template_records.side_effect = recs
+    else:
+        hs.template_records.return_value = recs
+    return eng, hs
+
+
+def dryer_order():
+    return order("900000001", [(PID, "product")])
+
+
+class Gate(unittest.TestCase):
+    def setUp(self):
+        self.tmp = chdir_tmp(self)
+
+    def test_flag_off_holds_as_before(self):
+        eng, _ = engine(self.tmp, flag=False)
+        self.assertEqual(len(eng.gate_unverified_items(dryer_order())), 1)
+
+    def test_empty_stray_on_approved_product_passes(self):
+        eng, hs = engine(self.tmp)
+        self.assertEqual(eng.gate_unverified_items(dryer_order()), [])
+        hs.template_records.assert_called_with(PID)
+
+    def test_status_means_a_human_acted_so_it_holds(self):
+        recs = [{"id": "1", "properties": {"template_status": "draft",
+                                           "component_count": None, "active_component_count": None}}]
+        eng, _ = engine(self.tmp, recs=recs)
+        self.assertEqual(len(eng.gate_unverified_items(dryer_order())), 1)
+
+    def test_components_mean_a_build_in_progress_so_it_holds(self):
+        recs = [{"id": "1", "properties": {"template_status": None,
+                                           "component_count": "3", "active_component_count": "0"}}]
+        eng, _ = engine(self.tmp, recs=recs)
+        self.assertEqual(len(eng.gate_unverified_items(dryer_order())), 1)
+
+    def test_bundles_tab_row_means_deliberate_build_so_it_holds(self):
+        eng, _ = engine(self.tmp)
+        with mock.patch.object(type(eng), "_bundles_row", return_value=7):
+            self.assertEqual(len(eng.gate_unverified_items(dryer_order())), 1)
+
+    def test_one_stray_plus_one_real_record_holds(self):
+        recs = EMPTY + [{"id": "2", "properties": {"template_status": "inactive",
+                                                   "component_count": "2", "active_component_count": "0"}}]
+        eng, _ = engine(self.tmp, recs=recs, ta=2)
+        self.assertEqual(len(eng.gate_unverified_items(dryer_order())), 1)
+
+    def test_unapproved_product_is_never_exempt(self):
+        eng, hs = engine(self.tmp, p=0)
+        self.assertEqual(len(eng.gate_unverified_items(dryer_order())), 1)
+        hs.template_records.assert_not_called()
+
+    def test_active_template_path_untouched(self):
+        eng, hs = engine(self.tmp, te=1, ta=1)
+        self.assertEqual(eng.gate_unverified_items(dryer_order()), [])
+        hs.template_records.assert_not_called()
+
+    def test_lookup_failure_holds_as_before(self):
+        eng, _ = engine(self.tmp, recs=RuntimeError("HubSpot 500"))
+        self.assertEqual(len(eng.gate_unverified_items(dryer_order())), 1)
+
+    def test_no_records_returned_holds(self):
+        # ta > 0 but the record search came back empty (index lag): unknown, hold
+        eng, _ = engine(self.tmp, recs=[])
+        self.assertEqual(len(eng.gate_unverified_items(dryer_order())), 1)
+
+    def test_verdict_is_cached(self):
+        eng, hs = engine(self.tmp)
+        for _ in range(5):
+            eng.gate_unverified_items(dryer_order())
+        self.assertEqual(hs.template_records.call_count, 1)
+
+
+class DrainAgrees(unittest.TestCase):
+    def setUp(self):
+        self.tmp = chdir_tmp(self)
+
+    def test_drain_gate_matches_live_gate(self):
+        for flag in (False, True):
+            eng, _ = engine(self.tmp, flag=flag)
+            live_verdict = len(eng.gate_unverified_items(dryer_order()))
+            eng2, _ = engine(self.tmp, flag=flag)
+            drain_verdict = len(eng2.gate_cached(dryer_order()))
+            self.assertEqual(live_verdict, drain_verdict, f"flag={flag}")
+
+
+class LineBuilder(unittest.TestCase):
+    def setUp(self):
+        self.tmp = chdir_tmp(self)
+
+    def _build(self, flag):
+        eng, hs = engine(self.tmp, flag=flag)
+        hs.item_search_product.return_value = {"total": 1, "results": [
+            {"id": "434196269276", "properties": {"name": "Multi Styler", "product_class": "device",
+                                                  "warranty_months": "24"}}]}
+        hs.item_search_template.side_effect = lambda pid, elig: (
+            {"total": 0, "results": []} if elig else {"total": 1, "results": EMPTY})
+        hs.create_line_item.return_value = "LI1"
+        o = dryer_order()
+        eng.process_item(o, "HS-ORDER", o["items"][0])
+        return hs.create_line_item.call_args
+
+    def test_stray_routes_line_as_the_product(self):
+        args = self._build(True)
+        props = args[0][0]
+        self.assertEqual(props.get("sale_context") or props.get("properties", {}).get("sale_context"),
+                         "standalone_product")
+
+    def test_flag_off_still_needs_review(self):
+        args = self._build(False)
+        props = args[0][0]
+        self.assertEqual(props.get("sale_context") or props.get("properties", {}).get("sale_context"),
+                         "needs_review")
+
+
+class Alert(unittest.TestCase):
+    def setUp(self):
+        self.tmp = chdir_tmp(self)
+
+    def test_live_run_opens_one_keyed_thread(self):
+        eng, _ = engine(self.tmp, live=True)
+        with mock.patch("notify.issue_open", return_value=True) as io:
+            eng.gate_unverified_items(dryer_order())
+        self.assertEqual(io.call_count, 1)
+        self.assertEqual(io.call_args[0][0], f"stray:{PID}")
+        self.assertIn("Do NOT approve", io.call_args[0][2])
+
+    def test_dry_run_posts_nothing(self):
+        eng, _ = engine(self.tmp, live=False)
+        with mock.patch("notify.issue_open") as io:
+            eng.gate_unverified_items(dryer_order())
+        io.assert_not_called()
+
+    def test_line_builder_never_alerts(self):
+        eng, _ = engine(self.tmp, live=True)
+        with mock.patch("notify.issue_open") as io:
+            eng.effective_ta(PID, 1, 0, 1, "x", alert=False)
+        io.assert_not_called()
+
+
+class Defaults(unittest.TestCase):
+    def test_off_by_default(self):
+        self.assertFalse(backfill.Config.__dataclass_fields__["stray_template_exemption"].default)
+
+
+if __name__ == "__main__":
+    unittest.main()

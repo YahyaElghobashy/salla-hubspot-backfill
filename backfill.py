@@ -731,6 +731,15 @@ class Config:
     # Workbook capacity guard (Google caps a workbook at 10,000,000 cells).
     capacity_alert_pct: float = 80.0
     validation_spreadsheet_id: str = "1VdvXPDvlI6O1qq6jIFMhIVU7PvVIr5_JMlr374NXRKg"  # [v2.13] Bundle & Product Validation
+    # [v2.14] An approved single product can no longer be held by an EMPTY
+    # bundle record that nobody acted on (no status, no components, no row on
+    # the Bundles tab). Make's Product Updated scenario mints one on every
+    # edit of a listing that carries Salla's "bundle" tag or Bundles category;
+    # that held 1,760 Multi Styler orders from 2026-10-05 to 2026-10-12. When
+    # on, such a record is ignored by the gate, the drain and the line builder
+    # (orders sync as the approved product) and one Slack thread names the
+    # real cause. Anything a person touched still holds, as before.
+    stray_template_exemption: bool = False
     # [v2.12] when a Zid-import order holds a new Salla order's number, move
     # that record to Z<number> (zid_rekey.py) and create the Salla order,
     # instead of parking the row. Dry runs never re-key.
@@ -1326,6 +1335,18 @@ class HubSpot:
             "filterGroups": [{"filters": filters}], "properties": props, "limit": 1},
             "item template")
         return data
+
+    def template_records(self, salla_product_id, limit=10):
+        """[v2.14] Every template keyed to this product, with the fields that
+        tell a deliberate bundle build from an empty stray record."""
+        if not OBJ_BUNDLE_TEMPLATE:
+            return []
+        data = self.search(f"/crm/v3/objects/{OBJ_BUNDLE_TEMPLATE}/search", {
+            "filterGroups": [{"filters": [{"propertyName": "bundle_template_key", "operator": "EQ",
+                                           "value": str(salla_product_id)}]}],
+            "properties": ["template_status", "component_count", "active_component_count"],
+            "limit": limit}, "stray check")
+        return data.get("results") or []
 
     def search_active_components(self, template_key):
         """[M126] components on the component custom object, active, limit 100."""
@@ -2597,11 +2618,106 @@ class Engine:
             p = self.hs.gate_search_product_approved(pid)      # [M211]
             te = self.hs.gate_search_template(pid, True)       # [M213]
             ta = self.hs.gate_search_template(pid, False)      # [M214]
+            ta = self.effective_ta(str(pid), p, te, ta, item.get("name", ""))  # [v2.14]
             if (p == 0 and te == 0 and ta == 0) or (te == 0 and ta > 0):
                 unverified.append({"id": item.get("id"), "name": item.get("name", ""),
                                    "pid": str(pid), "sku": str(item.get("sku") or "").strip(),
                                    "why": "bundle_inactive" if ta > 0 else "unapproved"})
         return unverified
+
+    # -- [v2.14] stray-template exemption ------------------------------------
+
+    STRAY_TTL_S = 300
+
+    def effective_ta(self, pid, p, te, ta, name="", alert=True):
+        """The template count the gate should act on. Unchanged, except when an
+        approved product (p > 0) is matched only by EMPTY template records that
+        nobody acted on: then those records cannot demote it, and ta counts 0.
+
+        One rule shared by gate_unverified_items, process_item and the drain's
+        gate_cached, so the three can never disagree about the same order."""
+        if not getattr(self.cfg, "stray_template_exemption", False):
+            return ta
+        if not (p and int(p) > 0 and int(te or 0) == 0 and int(ta or 0) > 0):
+            return ta
+        if not self._stray_only(pid):
+            return ta
+        if alert:
+            noted = self.__dict__.setdefault("_stray_noted", {})
+            if time.time() - noted.get(pid, 0) > 6 * 3600:   # once per product per 6 h
+                noted[pid] = time.time()
+                self._note_stray(pid, name)
+        return 0
+
+    def _stray_only(self, pid):
+        """True when every template keyed to pid is an empty stray: no status
+        (Make's bundle branch never sets one; the sheet's Push and people do),
+        no components, and no row on the Bundles tab (nobody is building it).
+        Cached a few minutes: the answer changes only when someone acts."""
+        cache = self.__dict__.setdefault("_stray_cache", {})
+        hit = cache.get(pid)
+        if hit and time.time() - hit[0] < self.STRAY_TTL_S:
+            return hit[1]
+
+        def empty(v):
+            return str(v if v is not None else "").strip() in ("", "0")
+
+        try:
+            recs = self.hs.template_records(pid)
+        except Exception as e:  # unknown means hold, exactly as before
+            log.warning("stray check for %s failed (%s): holding as before", pid, e)
+            return False
+        stray = bool(recs) and all(
+            empty((r.get("properties") or {}).get("template_status"))
+            and empty((r.get("properties") or {}).get("component_count"))
+            and empty((r.get("properties") or {}).get("active_component_count"))
+            for r in recs)
+        if stray and self._bundles_row(pid):
+            stray = False
+        cache[pid] = (time.time(), stray)
+        return stray
+
+    def _bundles_row(self, pid):
+        """Row number of pid on the validation sheet's Bundles tab, or None.
+        A row means a person is building this bundle on purpose. If the sheet
+        cannot be read, None: the exemption only ever applies to an approved
+        product, so the worst case is orders syncing as that product."""
+        try:
+            vs = getattr(self.cfg, "validation_spreadsheet_id", "")
+            if not vs:
+                return None
+            return self._sheet_index().column(vs, "Bundles", "bundle_template_key").get(str(pid))
+        except Exception as e:
+            log.info("Bundles tab unreadable for stray check (%s)", e)
+            return None
+
+    def _note_stray(self, pid, name=""):
+        """One Slack thread per product, opened once; the live settle step
+        closes it when the record is gone or someone starts building it."""
+        log.warning("STRAY bundle record ignored for approved product %s (%s)", pid, name)
+        if not self.live or not getattr(self.cfg, "alerts_enabled", True):
+            return
+        try:
+            import notify
+            import slack_text as st
+            shown = name or f"Salla product {pid}"
+            subject = (f"🟠 An empty bundle record appeared in HubSpot for {shown}, which is approved "
+                       "as a single product. Its orders keep syncing normally.")
+            what = (f"{shown} still carries Salla's \"bundle\" tag or sits in the \"Bundles\" category, so a "
+                    "listing edit made the Product Updated automation create an empty bundle record for it. "
+                    "Nobody has started building this bundle (no components, no status, no row on the Bundles "
+                    "tab), so the engine ignores the record and keeps creating orders against the approved product.")
+            todo = [f"In Salla, open this product and remove the \"bundle\" tag (from this product only, do not "
+                    "delete the tag from the store) or untick the \"Bundles\" category, then save once.",
+                    "If this product really is becoming a bundle, add it to the Bundles tab and push it from "
+                    "the sheet. Until then its orders keep syncing as the single product.",
+                    "Do NOT approve anything for this: the product is already approved."]
+            links = [st.link(f"https://s.salla.sa/products/{pid}", "Product in Salla"),
+                     st.hubspot_search(pid, "Find the empty record in HubSpot")]
+            notify.issue_open(f"stray:{pid}", subject, st.message(what, todo, links),
+                              meta={"pid": str(pid), "name": name})
+        except Exception as e:
+            log.warning("stray alert for %s failed: %s", pid, e)
 
     # -- HELD route [M244/M222/M224] ------------------------------------------
 
@@ -3170,6 +3286,11 @@ class Engine:
         te_total = int(te.get("total", 0))
         tpl = (te.get("results") or [{}])[0]  # [M103] first eligible template
         ta_total = int(self.hs.item_search_template(pid, False).get("total", 0))
+        # [v2.14] the line builder must agree with the gate: an empty stray
+        # record on an approved product routes the line as the product, not
+        # into needs_review
+        ta_total = self.effective_ta(str(pid), p_total, te_total, ta_total,
+                                     item.get("name", ""), alert=False)
 
         price = str(dig(item, "amounts.price_without_tax.amount"))
         common = {

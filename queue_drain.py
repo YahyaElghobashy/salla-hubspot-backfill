@@ -334,15 +334,27 @@ class QueueDrainEngine(Engine):
                 p = self.hs.gate_search_product_approved(pid)   # [M211]
                 te = self.hs.gate_search_template(pid, True)    # [M213]
                 ta = self.hs.gate_search_template(pid, False)   # [M214]
+                # [v2.14] same stray-record rule as the live gate and the
+                # line builder (Engine.effective_ta)
+                ta = self.effective_ta(pid, p, te, ta, item.get("name", ""))
                 res = (p, te, ta)
                 with self._gate_lock:
                     self._gate_cache[pid] = res
             p, te, ta = res
             if (p == 0 and te == 0 and ta == 0) or (te == 0 and ta > 0):
-                why = ("activate bundle template (exists but draft/inactive "
-                       "or 0 active components)" if ta > 0
-                       else "product missing or unapproved -- approve as "
-                            "standalone or map as bundle")
+                if ta > 0 and p:
+                    # approved product + a bundle record nothing is active in:
+                    # either a stray made by a listing edit, or a build in progress
+                    why = ("approved product blocked by a bundle record with nothing active: if "
+                           "nobody is building this bundle it is a stray from a Salla edit (bundle "
+                           "tag/category) -- remove the tag in Salla and set the record aside with "
+                           "tools/fix_catalog_blockers.py; if it IS being built, map components and Push")
+                elif ta > 0:
+                    why = ("activate bundle template (exists but draft/inactive "
+                           "or 0 active components)")
+                else:
+                    why = ("product missing or unapproved -- approve as "
+                           "standalone or map as bundle")
                 unverified.append({"id": item.get("id"), "pid": pid,
                                    "sku": str(item.get("sku") or "").strip(),
                                    "name": item.get("name", ""), "why": why})
