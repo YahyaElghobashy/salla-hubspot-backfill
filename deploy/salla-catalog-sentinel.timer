@@ -1,0 +1,12 @@
+[Unit]
+Description=Catalog sentinel every 15 minutes
+
+[Timer]
+# :04/:19/:34/:49 -- off the drain (:17), gift refresh (:09/:39) and the
+# Sunday reconciler (03:33)
+OnCalendar=*-*-* *:04,19,34,49:00
+Persistent=true
+RandomizedDelaySec=30
+
+[Install]
+WantedBy=timers.target

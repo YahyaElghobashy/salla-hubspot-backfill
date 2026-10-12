@@ -1,0 +1,27 @@
+[Unit]
+Description=Catalog sentinel: neutralise empty bundle templates minted for approved standalone products
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=integrations_claragroup_com
+WorkingDirectory=/home/integrations_claragroup_com/app
+# Why this exists: products tagged "bundle" in Salla (the multi-styler dryer,
+# the Daily Hydrating Shampoo & Conditioner) are routed down Make's bundle
+# branch on every listing edit, which mints an EMPTY bundle template keyed to
+# the product. The catalog gate then reads "template exists, none active" and
+# holds every order of an already-approved product. That happened on Aug 13,
+# Sep 22, Oct 4 and Oct 5 (the last one held 1,760 orders for a week).
+#
+# Stopgap until the tags are removed in Salla and the catalog-change guardrail
+# ships: every 15 minutes, re-run the proven fixer for the listed products. It
+# refuses any template that has components (a real build in progress), refuses
+# when more than one template matches, does nothing when none exists, and
+# repoints the key to a VOID- sentinel instead of deleting, ledgering the old
+# value in mirror/catalog_blocker_fixes.csv so every change is reversible.
+ExecStart=/bin/bash -lc 'set -a; . /home/integrations_claragroup_com/app/.env; set +a; exec /home/integrations_claragroup_com/app/venv/bin/python3 tools/fix_catalog_blockers.py --config config.live.json --apply'
+Restart=no
+TimeoutStartSec=600
+
+[Install]
+WantedBy=multi-user.target
