@@ -238,10 +238,20 @@ class Pipeline(unittest.TestCase):
     def setUp(self):
         _chdir_tmp(self)
 
-    def _with_queue(self, rows):
+    def _with_queue(self, rows, live_rows=None):
+        # [v2.14] the stuck check reads both queues: Queue Log (drain) and
+        # Live Queue (live sync)
         gio = mock.MagicMock()
         gio.qlog_read.return_value = rows
-        return mock.patch("queue_drain.DrainGoogleIO", return_value=gio)
+        gio.queue_read.return_value = live_rows or []
+        import contextlib
+
+        @contextlib.contextmanager
+        def both():
+            with mock.patch("queue_drain.DrainGoogleIO", return_value=gio), \
+                 mock.patch("backfill.GoogleIO", return_value=gio):
+                yield
+        return both()
 
     def test_clean_pipeline(self):
         with self._with_queue([]):
@@ -262,7 +272,7 @@ class Pipeline(unittest.TestCase):
                  "order_id": "42", "items": "Blocked Product"},
                 {"status": "processed", "queued_at": "2026-09-01 00:00:00",
                  "order_id": "43", "items": "x"},
-                {"status": "queued", "queued_at": "2026-09-19 00:00:00",
+                {"status": "queued", "queued_at": "2026-09-19 12:00:00",
                  "order_id": "44", "items": "young, not stuck"}]
         with self._with_queue(rows):
             f = phase_pipeline(_cfg(),
@@ -273,7 +283,8 @@ class Pipeline(unittest.TestCase):
 
     def test_unreachable_sheet_is_not_recorded_never_zero(self):
         with mock.patch("queue_drain.DrainGoogleIO",
-                        side_effect=RuntimeError("no creds")):
+                        side_effect=RuntimeError("no creds")), \
+             mock.patch("backfill.GoogleIO", side_effect=RuntimeError("no creds")):
             f = phase_pipeline(_cfg())
         self.assertFalse(f.measured)
         self.assertTrue(any("not recorded" in d for d in f.detail))
@@ -381,6 +392,80 @@ class DigestHook(unittest.TestCase):
         import report_digest
         with mock.patch.object(report_digest, "ROOT", Path(self.tmp)):
             self.assertIsNone(report_digest._reconcile_watch())
+
+
+class V214(unittest.TestCase):
+    """[v2.14] the Oct 2026 certificate: serial dates read as unreadable,
+    the Live Queue not read at all, 1,575 missing orders left unexplained."""
+
+    def setUp(self):
+        _chdir_tmp(self)
+
+    def test_serial_dates_parse(self):
+        from reconcile import sheet_time
+        self.assertEqual(sheet_time(46303.5).strftime("%Y-%m-%d %H:%M"), "2026-10-08 12:00")
+        self.assertEqual(sheet_time("2026-10-08 13:01:00").day, 8)
+        self.assertEqual(sheet_time("10/9/2026 2:33:44").month, 10)
+        self.assertIsNone(sheet_time("not a date"))
+        self.assertIsNone(sheet_time(""))
+
+    def test_live_queue_held_rows_with_serial_dates_are_stuck(self):
+        gio = mock.MagicMock()
+        gio.qlog_read.return_value = []
+        gio.queue_read.return_value = [
+            {"order_id": "1332665269", "status": "held", "received_at": 46300.68,
+             "note": "catalog gate: المجفف متعدد الاستخدام -- in review queue"},
+            {"order_id": "2", "status": "done", "received_at": 46300.68, "note": ""}]
+        with mock.patch("queue_drain.DrainGoogleIO", return_value=gio), \
+             mock.patch("backfill.GoogleIO", return_value=gio):
+            f = phase_pipeline(_cfg(), now=datetime(2026, 10, 11, 3, 33, tzinfo=RIYADH))
+        self.assertFalse(f.ok)
+        self.assertEqual(f.data["stuck"], 1)
+        self.assertTrue(any("المجفف متعدد الاستخدام" in d for d in f.detail))
+
+    def test_missing_orders_explained_by_catalog_hold(self):
+        from reconcile import explain_missing
+        counts = Finding("counts", True, False, "1 window(s) off, 3 named missing order(s)",
+                         data={"gaps": [{"day": "2026-10-06", "missing_ids": ["a", "b", "c"]}],
+                               "missing_total": 3})
+        explain_missing([counts], _cfg(), index={"a": (None, "Multi Styler"), "b": (None, "Multi Styler")})
+        self.assertEqual(counts.data["held_of_missing"], 2)
+        self.assertEqual(counts.data["unexplained_missing"], 1)
+        self.assertIn("on catalog hold", counts.summary)
+        self.assertIn("Multi Styler (2)", counts.detail[0])
+
+    def test_headline_states_why_repair_was_held_back(self):
+        fs = [Finding("counts", True, False, "9 window(s) off")]
+        head, _ = render(fs, _cfg(), held_back="month 2026-10 is 14% off")
+        self.assertIn("Automatic repair held back: month 2026-10 is 14% off", head)
+
+    def test_catalog_phase_finds_tag_trap_and_unclassified(self):
+        from reconcile import phase_catalog
+        src = FakeSource()
+        src.relay = mock.MagicMock()
+        src.relay.get_path.return_value = {"data": [
+            {"id": 1982906533, "name": "Multi Styler", "type": "product", "status": "sale",
+             "tags": [{"id": 784552908, "name": "bundle"}], "categories": [{"id": 294248735}]},
+            {"id": 555, "name": "Real bundle", "type": "product", "status": "sale",
+             "tags": [], "categories": [{"id": 1794840161}]}],
+            "pagination": {"totalPages": 1}}
+        src.hs = mock.MagicMock()
+        src.hs.search.return_value = {"results": [
+            {"properties": {"salla_product_id": "1982906533", "product_class": None, "name": "Multi Styler"}},
+            {"properties": {"salla_product_id": "555", "product_class": "bundle", "name": "Real bundle"}}]}
+        src.hs.gate_search_template.side_effect = lambda pid, elig: 1 if pid == "555" else 0
+        f = phase_catalog(src, _cfg())
+        self.assertFalse(f.ok)
+        self.assertEqual(f.data["traps"], ["Multi Styler (1982906533)"])
+        self.assertEqual(len(f.data["no_class"]), 1)
+
+    def test_catalog_phase_unmeasured_on_relay_failure(self):
+        from reconcile import phase_catalog
+        src = FakeSource()
+        src.relay = mock.MagicMock()
+        src.relay.get_path.side_effect = RelayError("down")
+        f = phase_catalog(src, _cfg())
+        self.assertFalse(f.measured)
 
 
 if __name__ == "__main__":

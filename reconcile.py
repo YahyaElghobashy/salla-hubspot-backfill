@@ -460,37 +460,31 @@ def phase_pipeline(cfg, now=None):
         if age_h > 3:
             detail.append(f"drain blocker matrix is {age_h:.0f}h old -- the "
                           f"hourly drain may be dead")
-    # queue rows stuck beyond a week -- read the LIVE sheet, never the local
-    # append-only mirror: the mirror records what was once written and never
-    # learns a row was drained, so it accumulates history forever (a first
-    # dry run read 88k ancient rows out of it)
-    stuck, queue_read = [], True
+    # queue rows stuck -- read the LIVE sheets, never the local append-only
+    # mirror (it never learns a row was drained). [v2.14] Both queues: the
+    # live sync parks catalog holds on the Live Queue, the drain reads the
+    # Queue Log; the Oct 2026 hold sat on both. Dates come back from Sheets as
+    # serial numbers (UNFORMATTED_VALUE); the v3.0 parser expected text,
+    # skipped every row and reported "pipeline clean" during a 1,500-order hold.
+    hours = float(getattr(cfg, "reconcile_stuck_hours", 24) or 24)
+    stuck, queue_read = {}, True
     try:
-        from queue_drain import DrainGoogleIO
-        gio = DrainGoogleIO(cfg, enabled=True)
-        for row in gio.qlog_read() or []:
-            status = str(row.get("status") or "").strip().lower()
-            if status not in ("queued", "held"):
+        for oid, (ts, blocker) in held_index(cfg).items():
+            if ts is None:
                 continue
-            qd = str(row.get("queued_at") or "")[:19]
-            try:
-                age = (now.replace(tzinfo=None)
-                       - datetime.strptime(qd, "%Y-%m-%d %H:%M:%S")).days
-            except ValueError:
-                continue
-            if age >= 7:
-                stuck.append((row.get("order_id"),
-                              str(row.get("items") or row.get("reason")
-                                  or "")[:50]))
+            age_h = (now.replace(tzinfo=None) - ts).total_seconds() / 3600
+            if age_h >= hours:
+                stuck[oid] = (age_h, blocker)
     except Exception as e:   # sheet unreachable: report, never fake a zero
         queue_read = False
         detail.append(f"queue check not recorded (sheet unreachable: "
                       f"{str(e)[:70]})")
     if stuck:
-        blockers = Counter(b for _, b in stuck if b)
-        detail.append(f"{len(stuck)} queue row(s) stuck >7d; top blockers: "
-                      + ", ".join(f"{b} ({n})"
-                                  for b, n in blockers.most_common(3)))
+        blockers = Counter(b for _, b in stuck.values() if b)
+        oldest = max(a for a, _ in stuck.values())
+        detail.append(f"{len(stuck)} order(s) on hold for over {hours:.0f}h (oldest {oldest / 24:.1f} days); "
+                      "blocking products: "
+                      + ", ".join(f"{b} ({n})" for b, n in blockers.most_common(3)))
     ok = not detail
     return Finding("pipeline", queue_read, ok,
                    "pipeline clean" if ok else f"{len(detail)} pipeline "
@@ -576,7 +570,134 @@ def phase_make_queue(cfg, get=None, now=None):
 # certificate + state
 # --------------------------------------------------------------------------
 
-def render(findings, cfg):
+def sheet_time(v):
+    """[v2.14] A queue timestamp as a naive datetime, whatever form Sheets
+    returned it in: a serial number (days since 1899-12-30, what
+    UNFORMATTED_VALUE gives for a date cell) or text. None when unreadable."""
+    if v is None or v == "":
+        return None
+    try:
+        return datetime(1899, 12, 30) + timedelta(days=float(v))
+    except (TypeError, ValueError):
+        pass
+    t = str(v).strip()[:19]
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%m/%d/%Y %H:%M:%S", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(t, fmt)
+        except ValueError:
+            continue
+    return None
+
+
+def held_index(cfg):
+    """[v2.14] {order_id: (since, blocking products)} for every order on hold
+    in either queue: Live Queue rows in state held, Queue Log rows queued or
+    held. Raises when a sheet cannot be read (callers report 'not recorded')."""
+    from backfill import GoogleIO
+    from queue_drain import DrainGoogleIO
+    out = {}
+    gio = GoogleIO(cfg, enabled=True)
+    for r in gio.queue_read(cfg.queue_spreadsheet_id, start_row=2,
+                            tab=getattr(cfg, "live_queue_tab", "Live Queue")) or []:
+        if str(r.get("status") or "") != "held":
+            continue
+        note = str(r.get("note") or "")
+        blocker = note[len("catalog gate:"):].split("--")[0].strip() if note.startswith("catalog gate:") else note[:50]
+        out[str(r.get("order_id"))] = (sheet_time(r.get("received_at")), blocker)
+    for r in DrainGoogleIO(cfg, enabled=True).qlog_read() or []:
+        if str(r.get("status") or "").strip().lower() not in ("queued", "held"):
+            continue
+        oid = str(r.get("order_id"))
+        if oid not in out:
+            out[oid] = (sheet_time(r.get("queued_at")), str(r.get("items") or r.get("reason") or "")[:50])
+    return out
+
+
+def explain_missing(findings, cfg, index=None):
+    """[v2.14] Split the count phase's named missing orders into "on hold at
+    the catalog gate, blocked by X" and "missing for no known reason". The
+    Oct 2026 certificate reported 1,575 missing orders it could not explain;
+    every one of them was on hold for one product."""
+    counts = next((f for f in findings if f.phase == "counts"), None)
+    if not counts or not counts.measured:
+        return
+    missing = [i for g in counts.data.get("gaps", []) for i in (g.get("missing_ids") or [])]
+    if not missing:
+        return
+    try:
+        index = held_index(cfg) if index is None else index
+    except Exception as e:
+        counts.detail.append(f"could not check which missing orders are on hold: {str(e)[:60]}")
+        return
+    held = [i for i in missing if str(i) in index]
+    if held:
+        top = Counter(index[str(i)][1] for i in held if index[str(i)][1]).most_common(3)
+        counts.detail.insert(0, f"{len(held)} of the {len(missing)} missing order(s) are on hold at the catalog "
+                                "gate, not lost; blocking products: "
+                                + ", ".join(f"{b} ({n})" for b, n in top))
+        counts.data["held_of_missing"] = len(held)
+        counts.data["unexplained_missing"] = len(missing) - len(held)
+        counts.summary += f" ({len(held)} on catalog hold)"
+
+
+def phase_catalog(src, cfg):
+    """[v2.14] Latent traps, found before they cost orders:
+      - a listing Salla routes as a bundle (tag "bundle" or category
+        1794840161) whose product is approved as a single item with no active
+        bundle record: its next edit mints an empty bundle record (the Oct
+        2026 dryer hold);
+      - an approved product with no product_class: its orders get no warranty
+        and no buyer flag (8,281 Multi Styler orders, 21 Sep to 12 Oct)."""
+    detail, data = [], {}
+    try:
+        markers, page = {}, 1
+        while True:
+            r = src.relay.get_path(f"products?per_page=65&page={page}")
+            for p in r.get("data") or []:
+                tags = {str((t or {}).get("name") if isinstance(t, dict) else t).strip().lower()
+                        for t in (p.get("tags") or [])}
+                cats = {str((c or {}).get("id")) for c in (p.get("categories") or []) if isinstance(c, dict)}
+                if str(p.get("type")) == "product" and str(p.get("status")) == "sale" and \
+                        ("bundle" in tags or "1794840161" in cats):
+                    markers[str(p["id"])] = p.get("name") or str(p["id"])
+            if page >= int((r.get("pagination") or {}).get("totalPages") or 1):
+                break
+            page += 1
+        approved, after = {}, None
+        while True:
+            body = {"filterGroups": [{"filters": [{"propertyName": "catalog_approval_status",
+                                                   "operator": "EQ", "value": "approved"}]}],
+                    "properties": ["salla_product_id", "product_class", "name"], "limit": 100}
+            if after:
+                body["after"] = after
+            d = src.hs.search("/crm/v3/objects/products/search", body, "catalog approved")
+            for x in d.get("results") or []:
+                pr = x.get("properties") or {}
+                if pr.get("salla_product_id"):
+                    approved[str(pr["salla_product_id"])] = pr
+            after = (d.get("paging") or {}).get("next", {}).get("after")
+            if not after:
+                break
+        traps = [f"{name} ({pid})" for pid, name in markers.items()
+                 if pid in approved and not src.hs.gate_search_template(pid, True)]
+        if traps:
+            detail.append(f"{len(traps)} single product(s) Salla still routes as bundles (tag or category): "
+                          + ", ".join(traps[:6]) + " -- their next edit creates an empty bundle record")
+        blank = [f"{pr.get('name') or pid} ({pid})" for pid, pr in approved.items()
+                 if not str(pr.get("product_class") or "").strip()]
+        if blank:
+            detail.append(f"{len(blank)} approved product(s) with no class (no warranty, no buyer flag): "
+                          + ", ".join(blank[:6]))
+        data = {"traps": traps, "no_class": blank}
+    except Exception as e:
+        return Finding("catalog", False, False, f"catalog check not recorded ({str(e)[:70]})")
+    ok = not detail
+    return Finding("catalog", True, ok, "no latent catalog traps" if ok else
+                   f"{len(data.get('traps', []))} bundle-tag trap(s), {len(data.get('no_class', []))} "
+                   "unclassified product(s)", detail, data)
+
+
+def render(findings, cfg, held_back=None):
     all_measured = all(f.measured for f in findings)
     all_ok = all(f.ok for f in findings if f.measured)
     if all_measured and all_ok:
@@ -586,6 +707,8 @@ def render(findings, cfg):
         bad = [f for f in findings if not f.ok or not f.measured]
         head = ("🟠 Weekly reconciliation found "
                 + "; ".join(f"{f.phase}: {f.summary}" for f in bad) + ".")
+        if held_back:
+            head += f" Automatic repair held back: {held_back}."
     lines = []
     for f in findings:
         lines.append(f"*{f.phase}* -- "
@@ -792,6 +915,7 @@ def main():
                      ("samples", lambda: phase_samples(src, cfg, cache)),
                      ("properties", lambda: phase_properties(src, cfg, cache)),
                      ("pipeline", lambda: phase_pipeline(cfg)),
+                     ("catalog", lambda: phase_catalog(src, cfg)),
                      ("make queue", lambda: phase_make_queue(cfg))]:
         _check_stop()
         prev = manifest["phases"].get(name)
@@ -808,7 +932,8 @@ def main():
             _save_manifest(manifest)
         log.info("phase %s: %s", name, f.summary)
 
-    head, body = render(findings, cfg)
+    explain_missing(findings, cfg)                      # [v2.14]
+    head, body = render(findings, cfg, held_back=insane(findings, cfg))
     log.info("VERDICT: %s", head)
     cert_ts = None
     if live:
