@@ -269,6 +269,37 @@ class StatusRelay(RealtimeConsumer):
             log.warning("status issue %s failed: %s", key, e)
             return False
 
+    def _escalate_held(self, count, top):
+        """[v2.14] The Oct 2026 hold was flagged within 7 hours and posted 26
+        times, and nobody acted: a yellow thread in a busy channel is easy to
+        miss. Past `held_escalate_count` held orders, post a red thread that
+        tags the named owners (and email it when email is configured). Keyed
+        per day, so it repeats daily while the hold lasts, once per day even
+        across restarts; the live settle step closes it when the hold clears."""
+        threshold = int(getattr(self.cfg, "held_escalate_count", 0) or 0)
+        if not threshold or count < threshold:
+            return
+        if not (self.live and getattr(self.cfg, "alerts_enabled", True)):
+            return
+        mentions = " ".join(f"<@{u}>" for u in (getattr(self.cfg, "escalation_mentions", None) or []))
+        subject = (f"🔴 {mentions + ' ' if mentions else ''}{count} orders are on hold and not in HubSpot. "
+                   "This needs a person today.")
+        body = st.message(
+            f"The catalog hold has passed {threshold} orders. Nothing is lost (the orders wait safely and "
+            "sync by themselves once the cause is fixed), but every hour adds more."
+            + (f" Products holding the most orders: {top}." if top else ""),
+            ["Open each blocking product's own thread in this channel and follow its fix.",
+             "If nobody on your side can act on it today, reply here and the integration team will."],
+            [])
+        try:
+            import notify
+            if notify.issue_open(f"held-escalation:{datetime.now().strftime('%Y-%m-%d')}", subject, body,
+                                 meta={"count": count}):
+                if notify.email_enabled():
+                    notify.send_email(subject, body)
+        except Exception as e:
+            log.warning("held escalation failed: %s", e)
+
     def _giveup_alert(self, kind, oid, reference_id, slug, attempts):
         """[v2.13] Every give-up becomes (or joins) a Slack thread that is
         answered when the order finally exists: held orders join their
@@ -296,14 +327,19 @@ class StatusRelay(RealtimeConsumer):
                         "not in HubSpot yet and their delivery updates cannot apply. Nothing is lost: when "
                         "an order is created it gets its latest status."
                         + (f" Products holding the most orders: {top}." if top else ""),
-                        [f"Open the {st.sheet(vs, 'Bundle & Product Validation sheet')}.",
-                         "Approve each product listed above: *ClaraHair › Products › Approve as Standalone*, "
-                         "or for a bundle *ClaraHair › Bundles › Push to HubSpot…*",
-                         "Orders are created within the hour after approval. This thread confirms when no "
-                         "order is left on hold."],
+                        # [v2.14] point at each product's own thread: it carries the
+                        # fix for THAT cause. "Approve the product" was wrong for the
+                        # Oct 2026 hold, where the product was already approved.
+                        ["Each product holding orders has its own thread in this channel with the exact "
+                         "fix for its case. Follow that thread.",
+                         "If a product is already approved and its orders are still on hold, do not approve "
+                         "it again: its thread explains the real cause (usually a \"bundle\" tag in Salla).",
+                         f"Approvals themselves happen on the {st.sheet(vs, 'Bundle & Product Validation sheet')}. "
+                         "This thread confirms when no order is left on hold."],
                         [exceptions])):
                 notify.issue_update("held-backlog", f"Now {st.plural(count, 'order')} on hold. Latest: order "
                                                     f"#{ref} got “{slug}”.", every_s=6 * 3600)
+            self._escalate_held(count, top)
             return
         if kind == "backfill":
             self._digest.append((oid, slug))

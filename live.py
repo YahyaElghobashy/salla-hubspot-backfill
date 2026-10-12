@@ -597,6 +597,8 @@ class LiveEngine(Engine):
         if still_held <= 0:
             notify.issue_resolve("held-backlog", "✅ Resolved: no order is on hold for catalog approval "
                                                  "any more. Every one of them is in HubSpot now.")
+            for key in notify.issues_open("held-escalation:"):       # [v2.14]
+                notify.issue_resolve(key, "✅ Resolved: the hold has cleared, every held order is in HubSpot now.")
         # [v2.14] close a stray-record thread once the empty record is gone,
         # or once someone starts building that bundle on purpose
         for key, rec in notify.issues_open("stray:").items():

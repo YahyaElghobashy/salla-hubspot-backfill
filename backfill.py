@@ -740,6 +740,11 @@ class Config:
     # (orders sync as the approved product) and one Slack thread names the
     # real cause. Anything a person touched still holds, as before.
     stray_template_exemption: bool = False
+    # [v2.14] escalation: past this many catalog-held orders, a red thread
+    # tags these Slack user ids (and emails when email is configured), once
+    # per day while the hold lasts. 0 disables.
+    held_escalate_count: int = 0
+    escalation_mentions: list = None
     # [v2.12] when a Zid-import order holds a new Salla order's number, move
     # that record to Z<number> (zid_rekey.py) and create the Salla order,
     # instead of parking the row. Dry runs never re-key.
@@ -2963,6 +2968,23 @@ class Engine:
                 pass
             row, found = self._sheet_index().row_link(vs, "Bundles", "bundle_template_key", pid,
                                                       f"{name} on the Bundles tab")
+            if not found:
+                # [v2.14] no Bundles-tab row: nobody is building this bundle. The
+                # record is a stray made by a Salla edit, and "push the bundle"
+                # (or "approve the product") would send people the wrong way.
+                subject = (f"🟠 Order #{ref} is on hold: an empty bundle record in HubSpot is blocking "
+                           f"{name}, which is sold as a single product")
+                what = (f"Order #{ref} includes {shown}. A listing edit in Salla made the Product Updated "
+                        "automation create an empty bundle record for it (the listing still carries the "
+                        "\"bundle\" tag or sits in the \"Bundles\" category), and the order check holds "
+                        "any product with an unfinished bundle record.")
+                todo = ["In Salla, remove the \"bundle\" tag from this product only (do not delete the tag "
+                        "from the store) or untick the \"Bundles\" category, then save once.",
+                        "Reply in this thread: the integration team sets the empty record aside, and the "
+                        "waiting orders are released automatically.",
+                        "Do NOT approve anything or use Reclassify on the sheet: the product is already approved."]
+                links += [st.hubspot("bundle_template", tid, "The empty record in HubSpot")]
+                return subject, st.message(what, todo, links)
             subject = f"🟡 Order #{ref} is on hold: the bundle {name} is not active yet"
             what = (f"Order #{ref} includes the bundle {shown}. The bundle exists in HubSpot but is not "
                     "active yet (its parts are not mapped, or it was never pushed), so the order is on hold.")
