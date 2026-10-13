@@ -29,6 +29,7 @@ listed waits, and the settle posts what Slack refused (notify.retry_failed).
 Everything is offline: Slack, email, HubSpot and the sheets are fakes; the
 issue registry is the real one in a temporary directory.
 """
+import json
 import time
 import types
 import unittest
@@ -230,6 +231,18 @@ class BacklogThreads(SettleCase):
         self.settle(self.engine(rows))
         self.assertEqual(self.state("held-backlog"), "open")
 
+
+    def test_unreadable_queue_log_writes_no_held_count(self):
+        # round 4: with the Queue Log unreadable every drain-closed row counted
+        # as held, and the stamp reopened a cleared escalation in the relay
+        rows = [row(5, "2", "held", "1002", "catalog gate: X -- in review queue")]
+        live.stamp_settle_held(0)
+        self.qlog_read.side_effect = RuntimeError("Sheets 503")
+        self.settle(self.engine(rows))
+        self.assertEqual(json.loads(live.SETTLE_HELD.read_text())["count"], 0)
+        self.qlog_read.side_effect = lambda gio: list(self.qlog)
+        self.settle(self.engine(rows))
+        self.assertEqual(json.loads(live.SETTLE_HELD.read_text())["count"], 1)
 
 class ProductThreads(SettleCase):
     """#11, #31: a product thread closes when its product passes and no order
@@ -519,7 +532,7 @@ class DrainClosedRows(SettleCase):
         self.assertEqual(rows[0]["status"], "held")               # the write waits for the next settle
         self.assertEqual(self.state("held-backlog"), "closed")
         self.assertIn("except 1 order that left the queue", self.replies()[-1])
-        retry.assert_called_once_with()
+        retry.assert_called_once_with(max_n=50)        # [v2.14.1] every due hold key, not the first five
 
     def relay(self, rows, **kw):
         import status_relay
@@ -703,7 +716,7 @@ class FailedHeldRecords(SettleCase):
         self.refused("held:P1", "Hair Dryer holds orders", {"orders": ["A"], "name": "Hair Dryer"})
         self.ledger["A"] = "H1"
         calls = []
-        with mock.patch.object(notify, "close_failed", side_effect=lambda k, why="": calls.append("close")), \
+        with mock.patch.object(notify, "close_failed", side_effect=lambda k, why="", **kw: calls.append("close")), \
                 mock.patch.object(notify, "retry_failed", side_effect=lambda *a, **k: calls.append("retry") or 0):
             e = self.engine([row(5, "A", "done", "1001", "HS H1")])
             self.settle(e)

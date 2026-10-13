@@ -51,6 +51,7 @@ from backfill import Config, GoogleIO, HubSpot, apply_portal_config, now_str
 LEDGER = Path("mirror/delivery_date_fixes.csv")
 STOP_FILE = Path("STOP.datefix")
 RIYADH = timezone(timedelta(hours=3))
+TERMINAL = ("done", "gone", "superseded", "error-final")
 EVENT = re.compile(r"status:([a-z_]+)@(\d{4}-\d\d-\d\d) \d\d:\d\d:\d\d")
 
 
@@ -95,10 +96,13 @@ def real_days(gio, cfg, wanted, ordered=None):
     ({salla order id: YYYY-MM-DD order date}) enables the trim guard: an
     order placed before the queue's oldest row gets no "completed" fallback."""
     vals = gio._gexec(gio.sheets.values().get(
-        spreadsheetId=cfg.queue_spreadsheet_id, range="'Status Queue'!A:D",
+        spreadsheetId=cfg.queue_spreadsheet_id, range="'Status Queue'!A:E",
         valueRenderOption="UNFORMATTED_VALUE"), "datefix status queue", gio.sheets_rl).get("values") or []
+    # the trim deletes terminal rows only and keeps open ones for good, so the
+    # oldest TERMINAL row marks how far back the trim has reached
     floor = min((str(r[0])[:10] for r in vals[1:]
-                 if r and re.match(r"\d{4}-\d\d-\d\d", str(r[0]))), default="")
+                 if len(r) > 4 and str(r[4]).strip().lower() in TERMINAL
+                 and re.match(r"\d{4}-\d\d-\d\d", str(r[0]))), default="")
     first = {}
     for r in vals[1:]:
         if len(r) < 4:

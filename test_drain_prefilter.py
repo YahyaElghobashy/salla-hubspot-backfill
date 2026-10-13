@@ -655,8 +655,30 @@ class FailuresAfterApproval(Pass, unittest.TestCase):
         eng, m = self.miss_pass([qrow(2, "601", "Dryer", 170, note("Dryer", T_OLD, PID))])
         u = m["601"]
         self.assertEqual((u[queue_drain.QC_STATUS], u[queue_drain.QC_ATTEMPTS], u[queue_drain.QC_NOTES]),
-                         ("Error", 1, ""))
+                         ("Error", 1, f"failed @ {NOW}"))       # timestamped: sorts by this try
         self.assertTrue(eng.claimable([qrow(2, "601", "Dryer", 1, "", status="error")]))
+
+    def test_an_interrupted_row_past_the_cap_starts_from_zero(self):
+        # round 4: a wave stopped mid-row leaves "processing since" and ~170
+        eng, m = self.miss_pass([qrow(2, "603", "Dryer", 170, f"processing since {T_OLD}", status="processing")])
+        self.assertEqual((m["603"][queue_drain.QC_STATUS], m["603"][queue_drain.QC_ATTEMPTS]), ("Error", 1))
+
+    def test_a_create_error_is_timestamped_and_sorts_by_that_try(self):
+        # round 4: a failure wrote an empty note, which sorts as never tried,
+        # so failing rows took every slot ahead of the approved backlog
+        eng, hs, relay, gio = self.drain({PID: (1, 0, 0)}, live=True)
+        rows = [qrow(2, "604", "Dryer", 170, note("Dryer", T_OLD, PID))]
+        gio.qlog_read = lambda: rows
+        gio.qlog_mark_batch = mock.Mock(return_value=1)
+        relay.fetch_orders.side_effect = lambda ids: {i: order(i, [(PID, "product")]) for i in ids}
+        eng.route_create = lambda o, r: None                     # no outcome: a create error
+        eng._audit_rows = {"604": 5}
+        eng.run_drain()
+        u = self.marks(gio)["604"]
+        self.assertEqual((u[queue_drain.QC_STATUS], u[queue_drain.QC_ATTEMPTS], u[queue_drain.QC_NOTES]),
+                         ("Error", 1, f"failed @ {NOW}"))
+        self.assertGreater(queue_drain.last_tried(u[queue_drain.QC_NOTES]),
+                           queue_drain.last_tried(note("Foam", T_OLD, "2")))
 
     def test_real_failures_still_reach_the_cap(self):
         eng, hs, relay, gio = self.drain({PID: (1, 0, 0)})

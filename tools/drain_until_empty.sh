@@ -52,7 +52,8 @@ for i in $(seq 1 "$MAX_PASSES"); do
   blocked=$(sed -E 's/.*blocked\(still queued\)=([0-9]+).*/\1/' <<<"$summary")
   # rows the pre-filter skipped unfetched are still blocked as expected, not news
   known=$(sed -nE 's/.*prefilter_skipped=([0-9]+).*/\1/p' <<<"$summary")
-  blocked=$((blocked - ${known:-0}))
+  rechecked=$(sed -nE 's/.*age_recheck_blocked=([0-9]+).*/\1/p' <<<"$summary")
+  blocked=$((blocked - ${known:-0} - ${rechecked:-0}))
   errors=$(sed -E 's/.*errors=([0-9]+).*/\1/' <<<"$summary")
 
   [ "$blocked" -gt 0 ] && { say "ABORT: $blocked order(s) still blocked"; exit 1; }

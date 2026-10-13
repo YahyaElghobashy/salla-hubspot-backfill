@@ -680,6 +680,18 @@ class RoundThree(RealPostCase):
         self.assertEqual(notify.issue_get("held-escalation:2026-10-13")["state"], "closed")  # reply posted
 
 
+class CloseFailedExpectOrders(RealPostCase):
+    """[v2.14.1] round 4: the quiet close of a refused record had the same
+    lane-join race issue_resolve's expect_orders closed."""
+
+    def test_refused_when_an_order_joined_since_the_check(self):
+        notify.issue_open("held:P7", "P7 holds orders", "detail", meta={"orders": ["10"]})   # refused
+        self.assertEqual(notify.issue_get("held:P7")["state"], "failed")
+        notify.issue_open("held:P7", "P7 holds orders", "detail", meta={"orders": ["11"]})   # a lane joins
+        self.assertFalse(notify.close_failed("held:P7", "cleared", expect_orders=["10"]))
+        self.assertEqual(notify.issue_get("held:P7")["state"], "failed")
+        self.assertTrue(notify.close_failed("held:P7", "cleared", expect_orders=["10", "11"]))
+
 class ResolveExpectOrders(RegistryCase):
     """[v2.14.1] review round 3: an order a lane joined while the settle was
     checking the thread was closed into it with "every order is in HubSpot"."""

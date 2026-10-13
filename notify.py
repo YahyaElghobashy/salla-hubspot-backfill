@@ -719,14 +719,18 @@ def issue_resolve(key, text, broadcast=False, dry_run=False, expect_orders=None)
     return True
 
 
-def close_failed(key, reason=""):
+def close_failed(key, reason="", expect_orders=None):
     """[v2.14.1] Close a "failed" record without posting anything, for an
     owner that sees its problem clear before any thread reached Slack (the
     live settle, for a held product whose orders are all created or gone).
-    True when a failed record was closed."""
+    True when a failed record was closed. expect_orders: as issue_resolve,
+    refused when a lane added an order since the caller's check."""
     with _issues() as d:
         rec = d.get(key)
         if not rec or rec.get("state") != "failed":
+            return False
+        if expect_orders is not None and (
+                {str(o) for o in (rec.get("meta") or {}).get("orders") or []} - {str(o) for o in expect_orders}):
             return False
         _close(rec, reason)
     log.info("ISSUE %s closed without a thread: %s", key, reason)

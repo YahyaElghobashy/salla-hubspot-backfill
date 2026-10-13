@@ -592,8 +592,10 @@ class LiveEngine(Engine):
         done = len(marks)
         state = None
         try:
+            self._closed_unknown = False
             state = self._held_now(rows)     # [v2.14.1] reads the Queue Log only when a row is held
-            stamp_settle_held(len(state[0]))
+            if not self._closed_unknown:     # a failed Queue Log read counts drain-closed rows as held
+                stamp_settle_held(len(state[0]))
         except Exception as e:
             log.warning("SETTLE held set unknown, no drain-closed row marked: %s", e)
         if state:
@@ -628,7 +630,9 @@ class LiveEngine(Engine):
                 # cleared. The relay and the credit watch retry the other keys
                 # more often but skip notify.HOLD_KEYS, which only this step,
                 # having just checked the hold, may post.
-                n = notify.retry_failed()
+                # [v2.14.1] the relay and credit watch leave hold keys to this
+                # hourly step, so it posts every due one, not the first five
+                n = notify.retry_failed(max_n=50)
                 if n:
                     log.info("SETTLE posted %d thread(s) Slack refused earlier", n)
             except Exception as e:
@@ -679,10 +683,12 @@ class LiveEngine(Engine):
         client (and its limiter). An unreadable Queue Log closes nothing:
         the threads wait an hour."""
         from queue_drain import DrainGoogleIO
+        self._closed_unknown = False
         try:
             rows = DrainGoogleIO.qlog_read(self.gio)
         except Exception as e:
             log.warning("SETTLE Queue Log read failed, no held order counts as closed: %s", e)
+            self._closed_unknown = True      # [v2.14.1] the held count is not trusted this hour
             return {}
         cap = self.cfg.live_max_attempts
         seen, live_ = {}, set()
@@ -888,7 +894,7 @@ class LiveEngine(Engine):
                     continue
                 else:
                     why = "no order is on hold any more"
-                notify.close_failed(key, why)
+                notify.close_failed(key, why, expect_orders=orders)   # [v2.14.1] refused if a lane joined one
         # [v2.14] close a stray-record thread once the empty record is gone,
         # or once someone starts building that bundle on purpose
         for key, rec in notify.issues_open("stray:").items():

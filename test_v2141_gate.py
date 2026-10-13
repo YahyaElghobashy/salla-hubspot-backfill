@@ -418,11 +418,23 @@ class HeldText(unittest.TestCase):
         self.assertNotIn("Push to HubSpot", body)
         self.assertNotIn("Do NOT approve", body)
 
-    def test_unknown_verdict_opens_no_new_thread(self):
+    def test_unknown_verdict_opens_the_neutral_thread(self):
+        # round 4: skipping the thread left a lasting unknown (a renamed Bundles
+        # column) holding orders with no thread at all; it opens, neutrally
         eng, hs, o, u = gated(self, flag=False, recs=RuntimeError("HubSpot 500"))
         with mock.patch("notify.issue_open") as io, mock.patch("notify.issue_get", return_value={}):
             eng.held_issue(o, [u])
-        io.assert_not_called()
+        self.assertIn("is checked", io.call_args[0][1])
+
+    def test_a_cached_build_verdict_survives_a_failed_read_in_held_text(self):
+        # round 4: a real build (cached False) whose held_text read failed got
+        # "nothing to do yet" instead of the Push steps it needs
+        eng, hs, o, u = gated(self, recs=DRAFT)
+        self.assertIs(eng._stray_cached(u["pid"]), False)
+        hs.template_records.side_effect = RuntimeError("HubSpot 500")
+        subject, body = eng.held_text(o, u)
+        self.assertIn("not active yet", subject)
+        self.assertIn("Push to HubSpot", body)
 
     def test_a_record_someone_touched_gets_the_bundle_steps(self):
         eng, hs, o, u = gated(self, recs=DRAFT)

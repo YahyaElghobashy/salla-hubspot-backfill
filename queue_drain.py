@@ -738,6 +738,9 @@ class QueueDrainEngine(Engine):
         if unverified:
             self.note_blocked(order, unverified)
             self._bump("held")
+            if row.get("_age_recheck"):       # [v2.14.1] fetched for the 72 h re-check, blocked as expected
+                with self._blocked_lock:
+                    self._age_recheck_blocked = getattr(self, "_age_recheck_blocked", 0) + 1
             names = ", ".join(u["name"] for u in unverified)
             log.info("BLOCKED order %s (%d item(s)): %s", oid,
                      len(unverified), names[:160])
@@ -784,8 +787,7 @@ class QueueDrainEngine(Engine):
             return ("Error", hs_ref, self.cfg.live_max_attempts)   # [v2.12]
         return ("Error", "create failed -- see drain.log / mirror/errors.csv", 1)
 
-    @staticmethod
-    def _fail_base(r):
+    def _fail_base(self, r):
         """[v2.14.1] The attempts a failure adds to. Every blocked pass adds
         one too (the pre-filter needs to know a row was tried), so a row held
         for a week carries ~170, and after its product was approved one relay
@@ -793,10 +795,16 @@ class QueueDrainEngine(Engine):
         Error that claimable never picks up again, and the order was never
         created. A row whose last outcome was a gate hold ("blocked: ..." in
         its notes) therefore starts its failure count at 0; the failure clears
-        that note, so the next one counts on from there."""
+        that note, so the next one counts on from there. A queued or
+        processing row past the cap (a wave interrupted mid-row keeps
+        "processing since" and the old count) can only have got there through
+        blocked passes, so it starts at 0 too."""
+        attempts = int(r.get("attempts") or 0)
         if str(r.get("notes") or "").startswith("blocked"):
             return 0
-        return int(r.get("attempts") or 0)
+        if r.get("status") in ("queued", "processing", "") and attempts >= self.cfg.live_max_attempts:
+            return 0
+        return attempts
 
     # -- claim + dedupe ----------------------------------------------------------
 
@@ -946,7 +954,7 @@ class QueueDrainEngine(Engine):
                                 QC_RESULT: ("relay returned nothing after "
                                             f"{att} attempts" if gone
                                             else "relay fetch miss -- retry"),
-                                QC_ATTEMPTS: att, QC_NOTES: ""}))
+                                QC_ATTEMPTS: att, QC_NOTES: f"failed @ {now_str()}"}))
                             outcome_by_oid[r["order_id"]] = "Gone" if gone else "Error"
                             continue
                         pending[pool.submit(self._drain_safe, r, order)] = r
@@ -967,7 +975,8 @@ class QueueDrainEngine(Engine):
                             # [v2.14.1] failures count from the last gate hold, not
                             # from the hourly blocked passes before it
                             upd[QC_ATTEMPTS] = self._fail_base(r) + att_d
-                            upd[QC_NOTES] = ""
+                            # timestamped, so the row sorts by this try, not as never tried
+                            upd[QC_NOTES] = f"failed @ {now_str()}"
                         if status == "Processed":
                             upd[QC_PROCESSED_AT] = now_str()
                             upd[QC_RESULT] = note
@@ -1014,9 +1023,9 @@ class QueueDrainEngine(Engine):
         # prefilter_skipped names them, so tools/drain_until_empty.sh can tell
         # "still blocked, as expected" from "blocked this pass"
         log.info("created=%d blocked(still queued)=%d skipped_existing=%d "
-                 "errors=%d gate_cache=%d product(s) prefilter_skipped=%d", s.created, s.held,
-                 s.skipped_existing, s.errors, len(self._gate_cache),
-                 getattr(self, "_prefilter_skipped", 0))
+                 "errors=%d gate_cache=%d product(s) prefilter_skipped=%d age_recheck_blocked=%d",
+                 s.created, s.held, s.skipped_existing, s.errors, len(self._gate_cache),
+                 getattr(self, "_prefilter_skipped", 0), getattr(self, "_age_recheck_blocked", 0))
         log.info("blocker matrix: %s -- share with the catalog owner, fix, "
                  "re-run this engine", MATRIX_FILE)
         log.info("=" * 68)
