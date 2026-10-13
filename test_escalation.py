@@ -6,6 +6,7 @@ alerts told people to approve an already-approved product and nobody acted.
 These tests pin the corrected wording and the escalation that tags named
 owners once a hold passes a threshold, at most once per day.
 """
+import json
 import time
 import types
 import unittest
@@ -213,7 +214,9 @@ class EscalationThroughGiveups(unittest.TestCase):
         with ch.patch():
             r._escalate_held(152, "Multi Styler (152)")
             self.assertEqual(ch.escalations(), [])          # [v2.14.1] a caller never posts a failed key
-            r.periodic()                                    # the main loop's retry_failed() does
+            r.periodic()                                    # the relay leaves hold keys to the settle
+            self.assertEqual(ch.escalations(), [])
+            notify.retry_failed()                           # the live settle's retry, after its hold check
         self.assertEqual(len(ch.escalations()), 1)
         self.assertEqual(len(ch.escalation_emails()), 1)
 
@@ -231,6 +234,50 @@ class EscalationThroughGiveups(unittest.TestCase):
             r.gio.live_rows = []            # the next real read sees the hold gone
             r._live_index_at = r._periodic_at = 0
             r.periodic()
+        self.assertEqual(len(ch.escalations()), 1)
+
+
+class NewHoldSameDay(unittest.TestCase):
+    """[v2.14.1] review round 3: once the day's escalation closed, a NEW hold
+    that passed the threshold later that day stayed silent until midnight.
+    It reopens when the live settle's own count (drain-closed rows left out)
+    confirms the hold; rows that only still read "held" never reopen it."""
+
+    def setUp(self):
+        _chdir_tmp(self)
+
+    def closed_today(self, ch, r):
+        import notify
+        with ch.patch():
+            r._escalate_held(150, "Multi Styler (150)")
+            for key in notify.issues_open("held-escalation:"):
+                notify.issue_resolve(key, "Resolved: the hold has cleared.")
+
+    def stamp(self, count, age_s=0):
+        import live
+        live.stamp_settle_held(count)
+        if age_s:
+            d = json.loads(live.SETTLE_HELD.read_text())
+            d["t"] -= age_s
+            live.SETTLE_HELD.write_text(json.dumps(d))
+
+    def test_reopens_when_the_settle_counts_a_new_hold(self):
+        r = held_relay(150, held_escalate_count=100)
+        ch = Channels(email=False)
+        self.closed_today(ch, r)
+        self.stamp(140)
+        with ch.patch():
+            r._escalate_held(150, "Multi Styler (150)")
+        self.assertEqual(len(ch.escalations()), 2)
+
+    def test_stays_closed_when_the_settle_count_is_low_or_stale(self):
+        r = held_relay(150, held_escalate_count=100)
+        ch = Channels(email=False)
+        self.closed_today(ch, r)
+        for count, age in ((20, 0), (140, 3 * 3600)):
+            self.stamp(count, age)
+            with ch.patch():
+                r._escalate_held(150, "Multi Styler (150)")
         self.assertEqual(len(ch.escalations()), 1)
 
 

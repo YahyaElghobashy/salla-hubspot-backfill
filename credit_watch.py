@@ -690,7 +690,7 @@ class CreditWatch:
         if self.dry_run or not getattr(self.cfg, "alerts_enabled", True):
             return 0
         try:
-            return notify.retry_failed()
+            return notify.retry_failed(skip=notify.HOLD_KEYS)
         except Exception as e:
             log.warning("retry of refused Slack threads failed: %s", e)
             return 0

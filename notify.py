@@ -57,6 +57,14 @@ SMTP_TIMEOUT_S = 20
 # post_slack call shape (which test fakes mirror) does not change.
 ISSUE_POST_TIMEOUT_S = 8
 ISSUE_RETRY_PAUSE_S = 2      # longest pause before the one retry
+# [v2.14.1] Outside fast_posts() an issue post is patient but bounded: three
+# tries, Slack's Retry-After honoured up to ISSUE_PATIENT_MAX_WAIT_S, no sleep
+# after the last try. Worst case 3 x 20 s + 2 x 30 s = 120 s, under
+# OPENING_TTL_S, so another service's retry_failed() can never take an open
+# or a reply that is still in flight and post it a second time (with_retries
+# honours any Retry-After and sleeps after the last try too).
+ISSUE_PATIENT_TRIES = 3
+ISSUE_PATIENT_MAX_WAIT_S = 30
 _SLACK_RETRY_STATUSES = (429, 500, 502, 503, 504, 0)
 _posting = threading.local()
 
@@ -103,6 +111,20 @@ def _post_fast(go):
             log.warning("slack chat.postMessage got %s, one quick retry", status)
             time.sleep(wait)
             status, headers, text = go()
+    return status, headers, text
+
+
+def _post_patient(go):
+    """Up to ISSUE_PATIENT_TRIES tries for an issue post outside fast_posts()."""
+    for attempt in range(1, ISSUE_PATIENT_TRIES + 1):
+        status, headers, text = go()
+        if status not in _SLACK_RETRY_STATUSES or attempt == ISSUE_PATIENT_TRIES:
+            return status, headers, text
+        ra = (headers or {}).get("Retry-After")
+        wait = float(ra) if ra and str(ra).isdigit() else float(2 ** attempt)
+        log.warning("slack chat.postMessage got %s (attempt %d/%d), backing off %.0fs",
+                    status, attempt, ISSUE_PATIENT_TRIES, min(wait, ISSUE_PATIENT_MAX_WAIT_S))
+        time.sleep(min(wait, ISSUE_PATIENT_MAX_WAIT_S))
     return status, headers, text
 
 
@@ -166,6 +188,8 @@ def post_slack(text, blocks=None, thread_ts=None, dry_run=False, channel=None,
 
     if fast:
         status, _, text_resp = _post_fast(go)
+    elif getattr(_posting, "issue", False):
+        status, _, text_resp = _post_patient(go)
     else:
         status, _, text_resp = with_retries(go, "slack chat.postMessage", retries=3)
     _posting.status = status     # [v2.14.1] read by the issue-post breaker
@@ -414,7 +438,11 @@ def _issue_post(text, **kw):
     if _breaker_open():
         return None
     _posting.status = None
-    ts = post_slack(text, **kw)
+    _posting.issue = True
+    try:
+        ts = post_slack(text, **kw)
+    finally:
+        _posting.issue = False
     status = getattr(_posting, "status", None)
     if not ts and isinstance(status, int) and (status == 0 or 500 <= status < 600):
         _breaker["until"] = time.time() + BREAKER_S
@@ -648,15 +676,23 @@ def _post_resolve(key, rid, threads, text, broadcast):
     return done
 
 
-def issue_resolve(key, text, broadcast=False, dry_run=False):
+def issue_resolve(key, text, broadcast=False, dry_run=False, expect_orders=None):
     """Answer the thread that raised `key` and close it. Returns True when an
     open issue was resolved; False (and nothing posted) otherwise.
     [v2.14.1] Until a channel takes the reply the record stays "resolving"
     (not open for callers) and retry_failed() posts the reply later, so a
     throttled or unreachable Slack no longer loses it. True either way, so a
-    caller does not post a second, plain notice."""
+    caller does not post a second, plain notice.
+    expect_orders: the order list the caller judged. When the record gained
+    an order since (a worker lane joined it meanwhile), nothing is closed and
+    False is returned: the next settle judges the new order too. [v2.14.1]"""
     with _issues() as d:
         rec = d.get(key)
+        if rec and expect_orders is not None:
+            gained = {str(o) for o in (rec.get("meta") or {}).get("orders") or []} - {str(o) for o in expect_orders}
+            if gained:
+                log.info("ISSUE %s not resolved: %d order(s) joined since the check", key, len(gained))
+                return False
         if rec and rec.get("state") == "failed" and not dry_run:
             # no thread was ever posted, so there is nothing to answer; closing
             # it lets the next occurrence open a fresh thread at once
@@ -709,7 +745,16 @@ def _retry_due(rec, now):
     return False
 
 
-def retry_failed(prefix="", max_n=5):
+# [v2.14.1] Keys whose staleness only the live settle can judge (a product
+# hold, the held backlog, the day's escalation). The relay and the credit
+# watch do not re-post a refused OPEN of these, so a hold that cleared during
+# a Slack outage is closed by the settle instead of being posted as "on hold"
+# to the client channel. A pending reply (an all-clear) is never stale, so
+# every caller still retries those.
+HOLD_KEYS = ("held:", "held-backlog", "held-escalation")
+
+
+def retry_failed(prefix="", max_n=5, skip=()):
     """[v2.14.1] Post what Slack refused earlier: a due "failed" open gets its
     stored subject and body, a due "resolving" record its reply. Called from
     the main loops (the live settle, the status relay's periodic step, the
@@ -717,7 +762,9 @@ def retry_failed(prefix="", max_n=5):
     the way issue_open claims one ("opening", posts outside the lock), so two
     services never post the same key twice. At most max_n keys per call,
     oldest first, stopping once the breaker opens. Posts fail fast: a failure
-    only moves that key's retry back. Returns how many threads it opened."""
+    only moves that key's retry back. A refused open whose key starts with
+    any of `skip` is left alone (HOLD_KEYS: the settle's); its pending reply
+    is not. Returns how many threads it opened."""
     if not slack_enabled():
         return 0
     opened, tried = 0, set()
@@ -726,7 +773,8 @@ def retry_failed(prefix="", max_n=5):
             now = time.time()
             with _issues() as d:
                 due = sorted((float(v.get("retry_at") or v.get("t") or 0), k) for k, v in d.items()
-                             if k.startswith(prefix) and k not in tried and _retry_due(v, now))
+                             if k.startswith(prefix) and k not in tried and _retry_due(v, now)
+                             and (v.get("state") == "resolving" or not k.startswith(tuple(skip))))
                 if not due:
                     break
                 key = due[0][1]

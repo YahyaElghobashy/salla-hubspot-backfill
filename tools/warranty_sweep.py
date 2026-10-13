@@ -165,9 +165,9 @@ def candidates(hs, cfg, days, ids, redate=False):
     """Delivered/Completed Salla orders with no warranty: explicit ids, or
     those touched in the last `days` days (a stage change or a late create
     both move hs_lastmodifieddate). redate=True (explicit ids only) returns
-    the ones that DO have warranties instead, so the action re-runs on them
-    and its upsert moves their start and end dates to the order's corrected
-    delivery_date [v2.14.1]."""
+    the ones that DO have warranties instead, so redate_dates() can move
+    their start and end dates to the order's corrected delivery_date
+    [v2.14.1]."""
     stage_map = cfg.status_stage_map or {}
     stages = [stage_map.get("delivered"), stage_map.get("completed")]
     props = ["salla_order_id", "hs_pipeline_stage", "delivery_date", "hs_source_store"]
@@ -222,6 +222,55 @@ def delivered_on(hs, cfg, hs_id):
     return t.strftime("%Y-%m-%d")
 
 
+def redate_dates(hs, mod, live, run):
+    """[v2.14.1] --redate: move each existing warranty's start and end dates to
+    its order's delivery_date, and change nothing else. Re-running the engine
+    action instead (as the first --redate run did, 13 Oct, harmlessly: every
+    record was a day old and Active) rewrites the whole record, origin, name
+    and stage included, which would bring a unit staff voided by hand back as
+    Active. Voided warranties are left alone. The ledger keeps each old start."""
+    by_order = assoc_map(hs, "orders", WARRANTY, [str(r["id"]) for r in run])
+    day_of = {str(r["id"]): str(dig(r, "properties.delivery_date"))[:10] for r in run}
+    wids = [w for o in day_of for w in by_order.get(o, [])]
+    props = {}
+    for i in range(0, len(wids), 100):
+        st, d = hs._req("POST", f"/crm/v3/objects/{WARRANTY}/batch/read",
+                        {"properties": ["warranty_start_date", "warranty_months_snapshot", "hs_pipeline_stage"],
+                         "inputs": [{"id": w} for w in wids[i:i + 100]]}, what="warranty sweep redate read")
+        if st not in (200, 207):
+            raise RuntimeError(f"warranty read HTTP {st}")
+        for x in (d or {}).get("results") or []:
+            props[str(x["id"])] = x.get("properties") or {}
+    upd, rows, outcome = [], [], Counter()
+    for o, day in day_of.items():
+        for w in by_order.get(o, []):
+            p = props.get(w) or {}
+            old = str(p.get("warranty_start_date") or "")[:10]
+            if p.get("hs_pipeline_stage") == W_VOIDED:
+                outcome["voided_left_alone"] += 1
+                continue
+            if old == day:
+                outcome["already_right"] += 1
+                continue
+            try:
+                months = int(float(p.get("warranty_months_snapshot")))
+            except (TypeError, ValueError):
+                outcome["no_term"] += 1
+                continue
+            upd.append({"id": w, "properties": {"warranty_start_date": day,
+                                                "warranty_end_date": mod.add_months(day, months)}})
+            rows.append(["redate", o, "", "redated", 1, f"warranty {w}: start {old} -> {day}"])
+            outcome["redated"] += 1
+    if live:
+        for i in range(0, len(upd), 100):
+            st, d = hs._write("POST", f"/crm/v3/objects/{WARRANTY}/batch/update",
+                              {"inputs": upd[i:i + 100]}, "warranty sweep redate")
+            if st not in (200, 201):
+                raise RuntimeError(f"redate batch HTTP {st}: {json.dumps(d)[:200]}")
+        ledger(rows)
+    return dict(outcome)
+
+
 def sweep_missing(hs, cfg, mod, live, days, ids, workers, redate=False):
     todo = candidates(hs, cfg, days, ids, redate)
     run = [r for r in todo if dig(r, "properties.delivery_date")]
@@ -248,6 +297,11 @@ def sweep_missing(hs, cfg, mod, live, days, ids, workers, redate=False):
                 continue
         dated.append((str(r["id"]), day))
         run.append(r)
+    if redate:
+        res = redate_dates(hs, mod, live, run)
+        log.info("WARRANTY redate: %d order(s) with warranties, %d without a delivery_date (left alone): %s",
+                 len(todo), len(no_date), json.dumps(res))
+        return {"orders": len(todo), "no_delivery_date": len(no_date), **res}
     log.info("WARRANTY missing: %d delivered/completed order(s) without a warranty; %d dated from "
              "their stage history; %d skipped (no date found); running the action on %d",
              len(todo), len(dated), len(no_date), len(run))

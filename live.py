@@ -57,6 +57,22 @@ TOPUPS_PER_CYCLE = 3
 # the catalog drain closed its order without creating it
 DRAIN_CLOSED = "drain closed"
 
+SETTLE_HELD = Path("mirror/settle_held.json")
+
+
+def stamp_settle_held(count):
+    """[v2.14.1] The hourly settle's own catalog-hold count (drain-closed and
+    Zid-parked rows left out), for the status relay: a day's escalation that
+    closed reopens only when this count also passes the threshold."""
+    try:
+        SETTLE_HELD.parent.mkdir(parents=True, exist_ok=True)
+        tmp = SETTLE_HELD.with_suffix(".tmp")
+        tmp.write_text(json.dumps({"t": time.time(), "count": int(count)}))
+        tmp.replace(SETTLE_HELD)
+    except Exception as e:
+        log.debug("settle held stamp not written: %s", e)
+
+
 STOP_FILE = Path("STOP.live")
 LOCK_FILE = Path("live.lock")
 STATE_FILE = Path("live_state.json")
@@ -577,6 +593,7 @@ class LiveEngine(Engine):
         state = None
         try:
             state = self._held_now(rows)     # [v2.14.1] reads the Queue Log only when a row is held
+            stamp_settle_held(len(state[0]))
         except Exception as e:
             log.warning("SETTLE held set unknown, no drain-closed row marked: %s", e)
         if state:
@@ -608,9 +625,9 @@ class LiveEngine(Engine):
             try:
                 import notify
                 # [v2.14.1] after the closes above, so this call posts no hold that
-                # cleared. The relay and the credit watch retry too, more often: a
-                # held thread one of them posts after its orders cleared is
-                # answered by the next settle like any open one.
+                # cleared. The relay and the credit watch retry the other keys
+                # more often but skip notify.HOLD_KEYS, which only this step,
+                # having just checked the hold, may post.
                 n = notify.retry_failed()
                 if n:
                     log.info("SETTLE posted %d thread(s) Slack refused earlier", n)
@@ -833,7 +850,8 @@ class LiveEngine(Engine):
                 if gate_of(key) == "held":
                     text += (f" A new order with {name} would wait again, in a new thread: the product still "
                              "does not pass the catalog check.")
-                notify.issue_resolve(key, text)
+                # [v2.14.1] refused when a lane joined an order meanwhile
+                notify.issue_resolve(key, text, expect_orders=listed[key])
 
             def but_of(key):
                 # [v2.14.1] the orders the drain closed while this thread was open,

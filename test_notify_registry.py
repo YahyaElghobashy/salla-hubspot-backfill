@@ -634,3 +634,59 @@ class SlackBreaker(RealPostCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class RoundThree(RealPostCase):
+    """[v2.14.1] review round 3 (alerts lens)."""
+
+    def test_patient_issue_post_stays_under_the_opening_ttl(self):
+        # Retry-After 90 three times: with_retries honoured all of it and slept
+        # after the last try (270 s), so another service's retry_failed() took
+        # the open still in flight and posted a second thread
+        self.reply = (429, {"Retry-After": "90"}, "")
+        os.environ["SLACK_CHANNEL_IDS"] = "C1"
+        self.assertFalse(notify.issue_open("status-missing:1", "Order #1 is not in HubSpot", ""))
+        self.assertEqual(len(self.calls), notify.ISSUE_PATIENT_TRIES)
+        self.assertEqual(self.sleeps, [notify.ISSUE_PATIENT_MAX_WAIT_S] * (notify.ISSUE_PATIENT_TRIES - 1))
+        worst = notify.ISSUE_PATIENT_TRIES * 20 + sum(self.sleeps)
+        self.assertLess(worst, notify.OPENING_TTL_S)
+
+    def test_plain_alerts_keep_with_retries(self):
+        self.reply = (429, {"Retry-After": "90"}, "")
+        os.environ["SLACK_CHANNEL_IDS"] = "C1"
+        notify.send_alert("Something broke", "")
+        self.assertIn(90.0, self.sleeps)
+
+    def test_relay_and_credit_skip_refused_hold_opens_but_retry_pending_replies(self):
+        self.reply = self.DOWN
+        notify.issue_open("held:P1", "P1 holds orders", "detail")          # refused: stored failed
+        notify.issue_open("credits-out", "Make credits ran out", "detail")
+        notify._breaker["until"] = 0.0
+        self.reply = self.OK
+        notify.issue_open("held-escalation:2026-10-13", "120 orders on hold", "detail")
+        self.assertEqual(notify.issue_get("held-escalation:2026-10-13")["state"], "open")
+        self.reply = self.DOWN
+        notify.issue_resolve("held-escalation:2026-10-13", "Resolved")      # reply refused: resolving
+        self.assertEqual(notify.issue_get("held-escalation:2026-10-13")["state"], "resolving")
+        notify._breaker["until"] = 0.0
+        with notify._issues() as d:
+            for rec in d.values():
+                rec["retry_at"] = 0
+                rec.pop("t", None)
+        self.reply = self.OK
+        notify.retry_failed(skip=notify.HOLD_KEYS)
+        self.assertEqual(notify.issue_get("held:P1")["state"], "failed")                   # the settle's
+        self.assertEqual(notify.issue_get("credits-out")["state"], "open")
+        self.assertEqual(notify.issue_get("held-escalation:2026-10-13")["state"], "closed")  # reply posted
+
+
+class ResolveExpectOrders(RegistryCase):
+    """[v2.14.1] review round 3: an order a lane joined while the settle was
+    checking the thread was closed into it with "every order is in HubSpot"."""
+
+    def test_refused_when_an_order_joined_since_the_check(self):
+        notify.issue_open("held:P5", "P5 holds orders", "detail", meta={"orders": ["A"]})
+        notify.issue_update("held:P5", "", every_s=float("inf"), meta={"orders": ["Z"]})   # the lane
+        self.assertFalse(notify.issue_resolve("held:P5", "Released", expect_orders=["A"]))
+        self.assertEqual(notify.issue_get("held:P5")["state"], "open")
+        self.assertTrue(notify.issue_resolve("held:P5", "Released", expect_orders=["A", "Z"]))

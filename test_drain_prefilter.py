@@ -627,3 +627,66 @@ class DeletedListing(Pass, unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class FailuresAfterApproval(Pass, unittest.TestCase):
+    """[v2.14.1] drain review: every blocked pass adds an attempt, so a row
+    held for a week carried ~170 and, once its product was approved, one
+    relay miss or create error parked it for good (Gone, or an Error row
+    claimable never picks up), and the order was never created."""
+
+    @staticmethod
+    def marks(gio):
+        out = {}
+        for c in gio.qlog_mark_batch.call_args_list:
+            for _row, oid, upd in c.args[0]:
+                out[oid] = upd
+        return out
+
+    def miss_pass(self, rows):
+        eng, hs, relay, gio = self.drain({PID: (1, 0, 0)}, live=True)    # approved now
+        gio.qlog_read = lambda: rows
+        gio.qlog_mark_batch = mock.Mock(return_value=1)
+        relay.fetch_orders.side_effect = lambda ids: {}                # the relay misses
+        eng.run_drain()
+        return eng, self.marks(gio)
+
+    def test_a_miss_after_a_long_hold_starts_counting_from_zero(self):
+        eng, m = self.miss_pass([qrow(2, "601", "Dryer", 170, note("Dryer", T_OLD, PID))])
+        u = m["601"]
+        self.assertEqual((u[queue_drain.QC_STATUS], u[queue_drain.QC_ATTEMPTS], u[queue_drain.QC_NOTES]),
+                         ("Error", 1, ""))
+        self.assertTrue(eng.claimable([qrow(2, "601", "Dryer", 1, "", status="error")]))
+
+    def test_real_failures_still_reach_the_cap(self):
+        eng, hs, relay, gio = self.drain({PID: (1, 0, 0)})
+        cap = eng.cfg.live_max_attempts
+        eng, m = self.miss_pass([qrow(2, "602", "Dryer", cap - 1, "", status="error")])
+        self.assertEqual(m["602"][queue_drain.QC_STATUS], "Gone")
+
+
+class AgeRecheckWaves(Pass, unittest.TestCase):
+    """[v2.14.1] drain review: rows a big hold recorded came due for the 72 h
+    re-check together and filled every hourly slot for hours, ahead of the
+    orders of a product approved meanwhile (tried more recently)."""
+
+    def test_approved_rows_first_and_age_rechecks_capped(self):
+        eng, hs, relay, gio = self.drain({PID: (1, 0, 1), "2": (1, 0, 0)})   # PID blocked, "2" approved
+        old = [qrow(10 + i, f"70{i}", "Dryer", 5, note("Dryer", T_72H, PID)) for i in range(10)]
+        new = [qrow(30 + i, f"80{i}", "Foam", 2, note("Foam", T_NEW, "2")) for i in range(2)]
+        db = {r["order_id"]: order(r["order_id"], [(PID, "product")]) for r in old}
+        db.update({r["order_id"]: order(r["order_id"], [("2", "product")]) for r in new})
+        fetched = self.run_pass(eng, relay, gio, old + new, db, max_orders=4)
+        self.assertEqual(fetched[:2], ["800", "801"])          # the approved product first
+        self.assertEqual(len(fetched), 3)                       # one age re-check (4 // 5 -> 1)
+        self.assertIn(fetched[2], {r["order_id"] for r in old})
+
+    def test_without_a_cap_every_due_row_is_fetched_last(self):
+        eng, hs, relay, gio = self.drain({PID: (1, 0, 1), "2": (1, 0, 0)})
+        old = [qrow(10 + i, f"70{i}", "Dryer", 5, note("Dryer", T_72H, PID)) for i in range(3)]
+        new = [qrow(30, "800", "Foam", 2, note("Foam", T_NEW, "2"))]
+        db = {r["order_id"]: order(r["order_id"], [(PID, "product")]) for r in old}
+        db["800"] = order("800", [("2", "product")])
+        fetched = self.run_pass(eng, relay, gio, old + new, db)
+        self.assertEqual(fetched[0], "800")
+        self.assertEqual(sorted(fetched[1:]), ["700", "701", "702"])

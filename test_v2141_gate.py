@@ -397,21 +397,32 @@ class HeldText(unittest.TestCase):
         self.assertIn("Do NOT approve", body)
         self.assertClean(subject, body)
 
-    def test_failed_bundles_lookup_gets_the_generic_text(self):
+    # [v2.14.1] review round 3: an approved product whose stray check could not
+    # finish got "the bundle is not active yet ... Push to HubSpot", the steps
+    # v2.14 set out to remove for a stray; it now gets no steps at all
+    def test_failed_bundles_lookup_gets_the_neutral_text(self):
         eng, hs, o, u = gated(self, flag=False)
         eng.sheet_gio.fail = RuntimeError("HttpError 503")
         eng._sheets = slack_text.SheetIndex(eng.sheet_gio)          # nothing cached
         eng.__dict__.pop("_stray_cache", None)
         subject, body = eng.held_text(o, u)
-        self.assertIn("not active yet", subject)
-        self.assertNotIn("Do NOT approve", body)
-        self.assertNotIn("already approved", body)
+        self.assertIn("is checked", subject)
+        for wrong in ("Do NOT approve", "already approved", "Push to HubSpot", "Approve as Standalone"):
+            self.assertNotIn(wrong, body)
+        self.assertClean(subject, body)
 
-    def test_unknown_verdict_gets_the_generic_text(self):
+    def test_unknown_verdict_gets_the_neutral_text(self):
         eng, hs, o, u = gated(self, flag=False, recs=RuntimeError("HubSpot 500"))
         subject, body = eng.held_text(o, u)
-        self.assertIn("not active yet", subject)
+        self.assertIn("is checked", subject)
+        self.assertNotIn("Push to HubSpot", body)
         self.assertNotIn("Do NOT approve", body)
+
+    def test_unknown_verdict_opens_no_new_thread(self):
+        eng, hs, o, u = gated(self, flag=False, recs=RuntimeError("HubSpot 500"))
+        with mock.patch("notify.issue_open") as io, mock.patch("notify.issue_get", return_value={}):
+            eng.held_issue(o, [u])
+        io.assert_not_called()
 
     def test_a_record_someone_touched_gets_the_bundle_steps(self):
         eng, hs, o, u = gated(self, recs=DRAFT)

@@ -145,17 +145,32 @@ class TestPasses(unittest.TestCase):
         hs = FakeHS(orders, {"2": {"w2": "5913821399"}, "3": {"w3": "5913821399"}})
         self.assertEqual([r["id"] for r in ws.candidates(hs, cfg(), 3, ["1", "2", "3"], redate=True)], ["2"])
 
-    def test_redate_never_dates_from_stage_history(self):
+    def test_redate_moves_only_the_dates_and_leaves_voided_units_alone(self):
+        # review round 3: re-running the action rewrote stage and origin too, so
+        # a unit staff voided by hand came back Active
         orders = {"1": {"hs_pipeline_stage": "D", "hs_source_store": "Salla", "delivery_date": "2026-10-07",
                         "salla_order_id": "S1"},
                   "2": {"hs_pipeline_stage": "D", "hs_source_store": "Salla", "salla_order_id": "S2"}}
-        hs = FakeHS(orders, {"1": {"w1": "5913821399"}, "2": {"w2": "5913821399"}})
-        hs._req_history = mock.Mock()
-        mod = types.SimpleNamespace(main=mock.Mock(return_value={"outputFields": {"status": "ok", "warranties_created": 1}}))
+        hs = FakeHS(orders, {"1": {"w1": "5913821399", "w2": "5913821402", "w3": "5913821399"},
+                             "2": {"w9": "5913821399"}})
+        real = hs._req
+        recs = {"w1": "2026-10-12", "w2": "2026-10-12", "w3": "2026-10-07"}
+
+        def req(method, path, body=None, is_search=False, what=""):
+            if path.endswith("/objects/2-252148104/batch/read"):
+                return 200, {"results": [{"id": x["id"], "properties": {
+                    "warranty_start_date": recs.get(x["id"]), "warranty_months_snapshot": "24",
+                    "hs_pipeline_stage": hs.warranties["1"].get(x["id"])}} for x in body["inputs"]]}
+            return real(method, path, body, is_search, what)
+        hs._req = req
+        mod = types.SimpleNamespace(main=mock.Mock(), add_months=ws.load_action.__globals__.get("add_months")
+                                    or (lambda d, m: f"{int(d[:4]) + m // 12}{d[4:]}"))
         out = ws.sweep_missing(hs, cfg(), mod, live=True, days=3, ids=["1", "2"], workers=1, redate=True)
-        self.assertEqual((out["orders"], out["dated_from_history"], out["no_delivery_date"]), (2, 0, 1))
-        self.assertEqual(hs.writes, [])                   # no delivery_date written in redate mode
-        self.assertEqual([c.args[0]["object"]["objectId"] for c in mod.main.call_args_list], ["1"])
+        mod.main.assert_not_called()                      # no full upsert
+        self.assertEqual((out["redated"], out["voided_left_alone"], out["already_right"], out["no_delivery_date"]),
+                         (1, 1, 1, 1))
+        self.assertEqual(hs.writes, [("/crm/v3/objects/2-252148104/batch/update", {"inputs": [
+            {"id": "w1", "properties": {"warranty_start_date": "2026-10-07", "warranty_end_date": "2028-10-07"}}]})])
 
     def test_stale_pass_voids_active_warranties_with_the_reason(self):
         orders = {"7": {"hs_pipeline_stage": "X", "salla_order_id": "S7"},

@@ -3158,6 +3158,21 @@ class Engine:
                         "Do NOT approve anything or use Reclassify on the sheet: the product is already approved."]
                 links += [st.hubspot("bundle_template", tid, "The empty record in HubSpot")]
                 return subject, st.message(what, todo, links)
+            verdict = self._stray_cached(pid, recs) if recs is not None else None
+            if approved and found is not True and verdict is None:
+                # [v2.14.1] an approved product whose stray check could not finish
+                # (a read failed): neither the stray steps nor "push the bundle"
+                # can be told apart yet, so no steps at all; the check runs again
+                subject = f"🟠 Order #{ref} is on hold while {name} is checked"
+                what = (f"Order #{ref} includes {shown}. The product is approved, but HubSpot also has an "
+                        "unfinished bundle record for it, and the check that tells a leftover record from a "
+                        "bundle someone is building could not finish just now (a temporary read error). "
+                        "The order waits until it does.")
+                todo = ["Nothing to do yet: the check runs again within the hour, and the order is released "
+                        "automatically if the record is a leftover.",
+                        "If you are building this product as a bundle on purpose, reply in this thread.", done]
+                links += [st.hubspot("bundle_template", tid, "The bundle record in HubSpot")]
+                return subject, st.message(what, todo, links)
             if found is False and not approved:
                 # [v2.14.1] the product itself is not approved (or not in HubSpot):
                 # that is the fix, so the product text below applies, plus the record
@@ -3225,6 +3240,15 @@ class Engine:
             meta = {"orders": [oid], "refs": [ref], "name": u.get("name", ""), "pid": u.get("pid", ""),
                     "sku": u.get("sku", ""), "why": u.get("why", "")}
             rec = notify.issue_get(key) or {}
+            if (rec.get("state") != "open" and u.get("why") == "bundle_inactive" and u.get("approved")
+                    and self._stray_cached(str(u.get("pid") or "")) is None):
+                # [v2.14.1] held only because the stray check of an approved
+                # product could not read just now: a new client thread would
+                # open and close within the hour for a read blip, so none is
+                # opened (the drain re-checks it; the held count alerts if it
+                # lasts). An open thread still gets the order below.
+                log.info("HELD %s for %s with an unknown stray verdict: no new thread", oid, u.get("pid"))
+                continue
             # [v2.14.1] a thread Slack refused a moment ago ("failed") is retried
             # by notify once retry_at passes; until then the order only joins
             # its record, with no catalog reads for a post that cannot happen

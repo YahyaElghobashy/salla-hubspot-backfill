@@ -16,7 +16,10 @@ Salla status change there as "status:<slug>@<Salla time>", even while the
 order is held. The first "delivered" event wins; an order that went straight
 to "completed" uses its first "completed" event. An order with neither is
 left alone and counted. Salla times are Riyadh time, so the date part is the
-Riyadh day.
+Riyadh day. The Status Queue is trimmed (status_trim_days), so an order
+placed before its oldest row may have lost its "delivered" row while a later
+"completed" row survived: such an order is never dated from "completed", it
+is listed for a Salla order-history check instead.
 
 Only orders whose current delivery_date differs from the real day are
 written. Old values are ledgered in mirror/delivery_date_fixes.csv BEFORE the
@@ -70,7 +73,8 @@ def collect(hs, cfg, created_since, ordered_since):
                 {"propertyName": "hs_pipeline_stage", "operator": "EQ", "value": stage},
                 {"propertyName": "hs_external_created_date", "operator": "GTE", "value": ms(ordered_since)},
                 {"propertyName": "hs_createdate", "operator": "GTE", "value": ms(created_since)}]}],
-                "properties": ["salla_order_id", "delivery_date", "hs_pipeline_stage"],
+                "properties": ["salla_order_id", "delivery_date", "hs_pipeline_stage",
+                               "hs_external_created_date"],
                 "sorts": [{"propertyName": "hs_object_id", "direction": "ASCENDING"}],
                 "limit": 200}
             if after:
@@ -86,11 +90,15 @@ def collect(hs, cfg, created_since, ordered_since):
     return out
 
 
-def real_days(gio, cfg, wanted):
-    """{salla order id: YYYY-MM-DD} from the Status Queue events."""
+def real_days(gio, cfg, wanted, ordered=None):
+    """{salla order id: YYYY-MM-DD} from the Status Queue events. ordered
+    ({salla order id: YYYY-MM-DD order date}) enables the trim guard: an
+    order placed before the queue's oldest row gets no "completed" fallback."""
     vals = gio._gexec(gio.sheets.values().get(
         spreadsheetId=cfg.queue_spreadsheet_id, range="'Status Queue'!A:D",
         valueRenderOption="UNFORMATTED_VALUE"), "datefix status queue", gio.sheets_rl).get("values") or []
+    floor = min((str(r[0])[:10] for r in vals[1:]
+                 if r and re.match(r"\d{4}-\d\d-\d\d", str(r[0]))), default="")
     first = {}
     for r in vals[1:]:
         if len(r) < 4:
@@ -102,8 +110,16 @@ def real_days(gio, cfg, wanted):
         key = (oid, m.group(1))
         if key not in first or m.group(2) < first[key]:
             first[key] = m.group(2)
-    return {o: first.get((o, "delivered")) or first.get((o, "completed"))
-            for o in wanted if first.get((o, "delivered")) or first.get((o, "completed"))}
+    out = {}
+    for o in wanted:
+        day = first.get((o, "delivered"))
+        if not day and first.get((o, "completed")):
+            placed = (ordered or {}).get(o, "")
+            if ordered is None or (placed and floor and placed > floor):
+                day = first[(o, "completed")]
+        if day:
+            out[o] = day
+    return out
 
 
 def main():
@@ -125,7 +141,9 @@ def main():
     orders = collect(hs, cfg, args.created_since, args.ordered_since)
     by_sid = {str((o.get("properties") or {}).get("salla_order_id") or ""): o for o in orders}
     by_sid.pop("", None)
-    real = real_days(gio, cfg, set(by_sid))
+    ordered = {sid: ((o.get("properties") or {}).get("hs_external_created_date") or "")[:10]
+               for sid, o in by_sid.items()}
+    real = real_days(gio, cfg, set(by_sid), ordered)
     change, kinds, no_event = [], Counter(), []
     for sid, o in by_sid.items():
         cur = ((o.get("properties") or {}).get("delivery_date") or "")[:10]
@@ -139,7 +157,8 @@ def main():
         kinds["blank -> real day" if not cur else f"{cur} -> real day"] += 1
         change.append((str(o["id"]), sid, cur, day))
     print(f"{len(by_sid)} released delivered/completed order(s); {len(change)} to change; "
-          f"{len(no_event)} with no delivered/completed event (left alone)")
+          f"{len(no_event)} with no usable delivered/completed event (left alone: check their "
+          "Salla order history)")
     for k, n in sorted(kinds.items()):
         print(f"  {k}: {n}")
     print("  new days:", dict(sorted(Counter(d for *_, d in change).items())))

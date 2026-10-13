@@ -273,6 +273,21 @@ class StatusRelay(RealtimeConsumer):
             log.warning("status issue %s failed: %s", key, e)
             return False
 
+    SETTLE_FRESH_S = 2 * 3600        # [v2.14.1] the settle stamps hourly; older is not trusted
+
+    @classmethod
+    def _settle_confirms(cls, threshold):
+        """[v2.14.1] True when the live settle counted at least `threshold`
+        catalog holds within SETTLE_FRESH_S (live.stamp_settle_held). Its
+        count leaves out the rows the catalog drain finished with, so it
+        tells a new hold from rows that only still read "held"."""
+        try:
+            d = json.loads(Path("mirror/settle_held.json").read_text())
+            return (time.time() - float(d.get("t") or 0) < cls.SETTLE_FRESH_S
+                    and int(d.get("count") or 0) >= threshold)
+        except (OSError, ValueError, TypeError):
+            return False
+
     def _escalate_held(self, count, top):
         """[v2.14] The Oct 2026 hold was flagged within 7 hours and posted 26
         times, and nobody acted: a yellow thread in a busy channel is easy to
@@ -307,15 +322,17 @@ class StatusRelay(RealtimeConsumer):
         try:
             import notify
             rec = notify.issue_get(key) or {}
-            if rec.get("state") in ("closed", "resolving"):
+            if rec.get("state") in ("closed", "resolving") and not self._settle_confirms(threshold):
                 # [v2.14.1] closed today (the live settle's all-clear, or its
                 # reply still waiting to post): never reopened the same day.
                 # This count included "held" rows of orders the catalog drain
                 # has finished with, which the settle leaves out, so a reopen
                 # came back every hour with a red thread and an email for a
                 # hold that had cleared. The settle now marks those rows gone;
-                # this holds when a mark does not reach the sheet. A hold
-                # still there tomorrow escalates on tomorrow's key.
+                # this holds when a mark does not reach the sheet. [v2.14.1
+                # round 3] A NEW hold later the same day still escalates: the
+                # key reopens once the live settle's own count (which leaves
+                # drain-closed rows out) also passes the threshold.
                 return
             opened = notify.issue_open(key, subject, body, meta={"count": count}, email=False)
             rec = notify.issue_get(key) or {}
@@ -513,7 +530,7 @@ class StatusRelay(RealtimeConsumer):
             # [v2.14.1] a thread or reply Slack refused (from any service) is
             # posted only from a main loop, never by the caller that raised it:
             # this pass, the live settle and the credit watch are those loops
-            notify.retry_failed()
+            notify.retry_failed(skip=notify.HOLD_KEYS)
         except Exception as e:
             log.warning("status periodic retry of refused threads failed: %s", e)
 

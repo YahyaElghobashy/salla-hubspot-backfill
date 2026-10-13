@@ -7,8 +7,9 @@
 # time between passes disappears. Stop rules, checked after every pass:
 #   - a pass left orders blocked, or reported errors
 #   - any NEW HubSpot 429 in drain.log, live.log or status_relay.log
+#     (rows the pre-filter skipped do not count as blocked)
 #   - any NEW "needs_review item" line (a line item built wrongly)
-#   - the live sync's oldest waiting order went over 60 s during the pass
+#   - 3+ orders waited in the live sync for over 90 s during the pass
 #   - no summary line (the pass died) or STOP.drain present
 # A pass that creates nothing means the backlog is empty: done.
 #
@@ -25,9 +26,11 @@ MAX_PASSES=${1:-20}
 cd "$APP" || exit 1
 LOG=drain_backtoback.log
 say() { echo "$(date '+%F %T') $*" | tee -a "$LOG"; }
-# Real throttles log as "... got 429 (attempt 1/5) ...". A bare " 429" also
-# matches order numbers like 429992396, which falsely aborted a run on 12 Oct.
-n429() { local n; n=$(grep -c "got 429 (attempt" "$1" 2>/dev/null); echo "${n:-0}"; }
+# HubSpot throttles log as "... got 429 (attempt 1/5) ..." (the HubSpot client
+# retries 5 times). A bare " 429" also matched order numbers like 429992396,
+# which falsely aborted a run on 12 Oct; "/5" leaves out Google Sheets ("/6")
+# and Slack ("/3") throttles, which do not touch the HubSpot budget.
+n429() { local n; n=$(grep -cE "got 429 \(attempt [0-9]+/5\)" "$1" 2>/dev/null); echo "${n:-0}"; }
 state() { systemctl show -p ActiveState --value salla-queue-drain.service; }
 
 say "start: up to $MAX_PASSES passes"
@@ -47,6 +50,9 @@ for i in $(seq 1 "$MAX_PASSES"); do
   [ -z "$summary" ] && { say "ABORT: pass wrote no summary"; exit 1; }
   created=$(sed -E 's/.*created=([0-9]+).*/\1/' <<<"$summary")
   blocked=$(sed -E 's/.*blocked\(still queued\)=([0-9]+).*/\1/' <<<"$summary")
+  # rows the pre-filter skipped unfetched are still blocked as expected, not news
+  known=$(sed -nE 's/.*prefilter_skipped=([0-9]+).*/\1/p' <<<"$summary")
+  blocked=$((blocked - ${known:-0}))
   errors=$(sed -E 's/.*errors=([0-9]+).*/\1/' <<<"$summary")
 
   [ "$blocked" -gt 0 ] && { say "ABORT: $blocked order(s) still blocked"; exit 1; }
@@ -54,8 +60,10 @@ for i in $(seq 1 "$MAX_PASSES"); do
   [ "$(n429 drain.log)" -gt "$d0" ] || [ "$(n429 live.log)" -gt "$l0" ] || \
     [ "$(n429 status_relay.log)" -gt "$s0" ] && { say "ABORT: new HubSpot 429s"; exit 1; }
   [ "$(grep -c 'needs_review item' drain.log)" -gt "$r0" ] && { say "ABORT: needs_review line items"; exit 1; }
-  if tail -n +"$lline" live.log | grep -qE "oldest_age=([0-9]+m|[6-9][0-9]s|[0-9]{3,}s)"; then
-    say "ABORT: live sync queue waited over 60s during the pass"; exit 1
+  # a real slowdown is a queue of several orders waiting; one old error row
+  # retried every few minutes keeps its first received_at and is not one
+  if tail -n +"$lline" live.log | grep -qE "QUEUE depth=([3-9]|[1-9][0-9]+) oldest_age=([0-9]+m|(9[1-9]|[1-9][0-9]{2,})s)"; then
+    say "ABORT: live sync queue of 3+ orders waited over 90s during the pass"; exit 1
   fi
   [ "$created" -eq 0 ] && { say "DONE: backlog empty"; exit 0; }
   sleep 30

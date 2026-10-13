@@ -44,6 +44,16 @@ class RealDays(unittest.TestCase):
                 ["t", "55"]]
         self.assertEqual(self.days(rows, {"33", "55"}), {})
 
+    def test_trim_guard_never_dates_an_older_order_from_completed(self):
+        # the queue is trimmed: an order placed before its oldest row may have
+        # lost "delivered" (5 Oct) while "completed" (9 Oct) survived
+        rows = [["2026-10-06 00:10:00", "66", "r", "status:completed@2026-10-09 10:00:00"],
+                ["2026-10-06 00:20:00", "77", "r", "status:completed@2026-10-09 10:00:00"]]
+        cfg = types.SimpleNamespace(queue_spreadsheet_id="Q")
+        got = fd.real_days(FakeGIO(rows), cfg, {"66", "77"},
+                           ordered={"66": "2026-10-05", "77": "2026-10-07"})
+        self.assertEqual(got, {"77": "2026-10-09"})
+
 
 if __name__ == "__main__":
     unittest.main()

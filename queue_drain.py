@@ -529,7 +529,7 @@ class QueueDrainEngine(Engine):
                 if len(b["samples"]) < 5:
                     b["samples"].append(str(order.get("id")))
 
-    def _skip_known_blocked(self, rows):
+    def _skip_known_blocked(self, rows, age_cap=None):
         """[v2.14] Drop rows that can only be blocked, without fetching them.
 
         [v2.14.1] Keyed on the ids drain_one recorded in each blocked row's
@@ -549,15 +549,22 @@ class QueueDrainEngine(Engine):
         passes. Both cover a listing deleted in Salla after the row was
         recorded: its orders resolve by SKU from then on, and the old id
         would have kept the row skipped (and in the matrix under a product
-        nobody can approve) for good."""
+        nobody can approve) for good.
+
+        [v2.14.1] A row fetched ONLY because of its age (every id it recorded
+        still fails) is flagged _age_recheck so the pass takes it after every
+        other row, and at most age_cap of them are fetched per pass (the rest
+        count as skipped). Otherwise the rows a big hold recorded come due
+        together 72 h later and fill every hourly slot for hours, ahead of
+        the orders of a product approved meanwhile."""
         now = now_str()
         marked = []
         for r in rows:
             keys = recorded_keys(r.get("notes"))
-            ok = (keys and r.get("status") == "queued" and r.get("attempts", 0) > 0
-                  and tried_within(r.get("notes"), SKIP_MAX_AGE_S, now))
-            marked.append((r, keys if ok else None))
-        wanted = sorted(frozenset().union(*(k for _, k in marked if k)))
+            ok = keys and r.get("status") == "queued" and r.get("attempts", 0) > 0
+            marked.append((r, keys if ok else None,
+                           bool(ok) and tried_within(r.get("notes"), SKIP_MAX_AGE_S, now)))
+        wanted = sorted(frozenset().union(*(k for _, k, _ in marked if k)))
         if not wanted:
             return rows
         still = {}
@@ -573,8 +580,16 @@ class QueueDrainEngine(Engine):
             return rows
         prev = self._prev_matrix()
         keep, skipped = [], 0
-        for r, keys in marked:
+        due = sorted((r for r, keys, fresh in marked
+                      if keys and not fresh and all(k in still for k in keys)),
+                     key=lambda r: last_tried(r.get("notes")))
+        take = {id(r) for r in (due if age_cap is None else due[:max(0, age_cap)])}
+        for r, keys, fresh in marked:
             if not keys or not all(k in still for k in keys):
+                keep.append(r)
+                continue
+            if not fresh and id(r) in take:
+                r["_age_recheck"] = True
                 keep.append(r)
                 continue
             skipped += 1
@@ -597,6 +612,7 @@ class QueueDrainEngine(Engine):
                         rec["samples"].append(str(r["order_id"]))
         if skipped:
             self._bump("held", skipped)
+            self._prefilter_skipped = getattr(self, "_prefilter_skipped", 0) + skipped   # [v2.14.1]
             log.info("PRE-FILTER skipped %d row(s) still blocked by %s (no relay fetch)",
                      skipped, ", ".join(sorted(still)))
         return keep
@@ -768,6 +784,20 @@ class QueueDrainEngine(Engine):
             return ("Error", hs_ref, self.cfg.live_max_attempts)   # [v2.12]
         return ("Error", "create failed -- see drain.log / mirror/errors.csv", 1)
 
+    @staticmethod
+    def _fail_base(r):
+        """[v2.14.1] The attempts a failure adds to. Every blocked pass adds
+        one too (the pre-filter needs to know a row was tried), so a row held
+        for a week carries ~170, and after its product was approved one relay
+        miss or create error crossed live_max_attempts: the row went Gone, or
+        Error that claimable never picks up again, and the order was never
+        created. A row whose last outcome was a gate hold ("blocked: ..." in
+        its notes) therefore starts its failure count at 0; the failure clears
+        that note, so the next one counts on from there."""
+        if str(r.get("notes") or "").startswith("blocked"):
+            return 0
+        return int(r.get("attempts") or 0)
+
     # -- claim + dedupe ----------------------------------------------------------
 
     def claimable(self, rows):
@@ -855,9 +885,11 @@ class QueueDrainEngine(Engine):
             # attempts parked the rows old passes retried ~170 times behind
             # every row that can never be skipped, for days.
             self._yield_to_live()
-            to_process = self._skip_known_blocked(to_process)
-            # '' (never tried) sorts first; stable, so ties keep sheet order
-            to_process.sort(key=lambda r: last_tried(r.get("notes")))
+            to_process = self._skip_known_blocked(
+                to_process, age_cap=None if max_orders is None else max(1, max_orders // 5))
+            # '' (never tried) sorts first; stable, so ties keep sheet order;
+            # rows fetched only for the 72 h re-check go last
+            to_process.sort(key=lambda r: (bool(r.get("_age_recheck")), last_tried(r.get("notes"))))
 
         # fetch + process in relay-sized waves so a STOP loses little work
         done_counter = 0
@@ -906,7 +938,7 @@ class QueueDrainEngine(Engine):
                             break
                         order = orders.get(r["order_id"])
                         if not order:
-                            att = r["attempts"] + 1
+                            att = self._fail_base(r) + 1
                             gone = att >= self.cfg.live_max_attempts
                             wave_marks.append((r["row"], r["order_id"], {
                                 QC_STATUS: "Gone" if gone else "Error",
@@ -914,7 +946,7 @@ class QueueDrainEngine(Engine):
                                 QC_RESULT: ("relay returned nothing after "
                                             f"{att} attempts" if gone
                                             else "relay fetch miss -- retry"),
-                                QC_ATTEMPTS: att}))
+                                QC_ATTEMPTS: att, QC_NOTES: ""}))
                             outcome_by_oid[r["order_id"]] = "Gone" if gone else "Error"
                             continue
                         pending[pool.submit(self._drain_safe, r, order)] = r
@@ -931,6 +963,11 @@ class QueueDrainEngine(Engine):
                             continue  # verify mode: no writes
                         upd = {QC_STATUS: status if status != "Queued" else "Queued",
                                QC_ATTEMPTS: r["attempts"] + att_d}
+                        if status == "Error":
+                            # [v2.14.1] failures count from the last gate hold, not
+                            # from the hourly blocked passes before it
+                            upd[QC_ATTEMPTS] = self._fail_base(r) + att_d
+                            upd[QC_NOTES] = ""
                         if status == "Processed":
                             upd[QC_PROCESSED_AT] = now_str()
                             upd[QC_RESULT] = note
@@ -973,9 +1010,13 @@ class QueueDrainEngine(Engine):
         log.info("=" * 68)
         log.info("DRAIN SUMMARY mode=%s  %.1f min", mode,
                  (time.monotonic() - t0) / 60)
+        # [v2.14.1] blocked includes the rows the pre-filter skipped unfetched;
+        # prefilter_skipped names them, so tools/drain_until_empty.sh can tell
+        # "still blocked, as expected" from "blocked this pass"
         log.info("created=%d blocked(still queued)=%d skipped_existing=%d "
-                 "errors=%d gate_cache=%d product(s)", s.created, s.held,
-                 s.skipped_existing, s.errors, len(self._gate_cache))
+                 "errors=%d gate_cache=%d product(s) prefilter_skipped=%d", s.created, s.held,
+                 s.skipped_existing, s.errors, len(self._gate_cache),
+                 getattr(self, "_prefilter_skipped", 0))
         log.info("blocker matrix: %s -- share with the catalog owner, fix, "
                  "re-run this engine", MATRIX_FILE)
         log.info("=" * 68)
