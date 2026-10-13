@@ -677,6 +677,24 @@ class CreditWatch:
             log.warning("credit resolve %s failed: %s", key, e)
             return False
 
+    def _retry_refused(self):
+        """[v2.14.1] Post the issue threads (and resolve replies) Slack
+        refused earlier: notify keeps their text and backs off per key, but
+        only notify.retry_failed() posts them, never a caller raising the
+        key again. credits-out is raised once, on the transition, so without
+        this a thread refused then stayed unposted for the whole outage.
+        Once per tick, after the checks, so a problem that cleared in this
+        tick is closed quietly instead of posted and answered at once. The
+        registry is shared, so this also posts what another service's
+        refused open left behind (two services never post the same key)."""
+        if self.dry_run or not getattr(self.cfg, "alerts_enabled", True):
+            return 0
+        try:
+            return notify.retry_failed()
+        except Exception as e:
+            log.warning("retry of refused Slack threads failed: %s", e)
+            return 0
+
     def _make_link(self, label="Make credits"):
         org = str(getattr(self.cfg, "make_org_id", "") or "")
         return st.link(f"https://eu1.make.com/organization/{org}/dashboard", label) if org else ""
@@ -903,7 +921,11 @@ class CreditWatch:
     # ------------- the tick -------------
 
     def tick(self):
-        org = self.read_org()
+        try:
+            org = self.read_org()
+        except Exception:
+            self._retry_refused()       # [v2.14.1] a Make API outage must not hold back refused threads
+            raise
         try:
             cons = self.read_consumptions()
             self._attribute(cons)
@@ -1028,6 +1050,9 @@ class CreditWatch:
                         todo, [link], "This thread confirms when credits are topped up or renew."),
                     key=LOW_KEY, broadcast=i >= 1)
                 break  # one alert per tick, highest applicable
+
+        # -- 5. threads Slack refused earlier [v2.14.1] ------------------
+        self._retry_refused()
 
         self.state["org"] = org
         self.state["ts"] = int(time.time())

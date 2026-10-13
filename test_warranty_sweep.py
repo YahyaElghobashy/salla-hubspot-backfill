@@ -138,6 +138,25 @@ class TestPasses(unittest.TestCase):
         self.assertEqual(sorted(c.args[0]["object"]["objectId"] for c in mod.main.call_args_list), ["1", "2"])
         self.assertTrue(Path("mirror/warranty_sweep.csv").exists())
 
+    def test_redate_returns_only_orders_that_have_warranties(self):
+        orders = {"1": {"hs_pipeline_stage": "D", "hs_source_store": "Salla", "delivery_date": "2026-10-07"},
+                  "2": {"hs_pipeline_stage": "C", "hs_source_store": "Salla", "delivery_date": "2026-10-08"},
+                  "3": {"hs_pipeline_stage": "X", "hs_source_store": "Salla"}}
+        hs = FakeHS(orders, {"2": {"w2": "5913821399"}, "3": {"w3": "5913821399"}})
+        self.assertEqual([r["id"] for r in ws.candidates(hs, cfg(), 3, ["1", "2", "3"], redate=True)], ["2"])
+
+    def test_redate_never_dates_from_stage_history(self):
+        orders = {"1": {"hs_pipeline_stage": "D", "hs_source_store": "Salla", "delivery_date": "2026-10-07",
+                        "salla_order_id": "S1"},
+                  "2": {"hs_pipeline_stage": "D", "hs_source_store": "Salla", "salla_order_id": "S2"}}
+        hs = FakeHS(orders, {"1": {"w1": "5913821399"}, "2": {"w2": "5913821399"}})
+        hs._req_history = mock.Mock()
+        mod = types.SimpleNamespace(main=mock.Mock(return_value={"outputFields": {"status": "ok", "warranties_created": 1}}))
+        out = ws.sweep_missing(hs, cfg(), mod, live=True, days=3, ids=["1", "2"], workers=1, redate=True)
+        self.assertEqual((out["orders"], out["dated_from_history"], out["no_delivery_date"]), (2, 0, 1))
+        self.assertEqual(hs.writes, [])                   # no delivery_date written in redate mode
+        self.assertEqual([c.args[0]["object"]["objectId"] for c in mod.main.call_args_list], ["1"])
+
     def test_stale_pass_voids_active_warranties_with_the_reason(self):
         orders = {"7": {"hs_pipeline_stage": "X", "salla_order_id": "S7"},
                   "8": {"hs_pipeline_stage": "R", "salla_order_id": "S8"}}

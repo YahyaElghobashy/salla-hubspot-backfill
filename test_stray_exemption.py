@@ -10,10 +10,12 @@ lines to needs_review. Under the exemption both treat it as the approved
 product. Everything a person touched (a status, components, a Bundles row)
 still holds exactly as before, and an unapproved product is never exempt.
 """
+import time
 import unittest
 from unittest import mock
 
 import backfill
+import notify
 import slack_text
 from test_queue_drain import chdir_tmp, make_cfg, make_engine, order
 
@@ -208,6 +210,60 @@ class Alert(unittest.TestCase):
         with mock.patch("notify.issue_open") as io:
             eng.effective_ta(PID, 1, 0, 1, "x", alert=False)
         io.assert_not_called()
+
+
+class StrayReopen(unittest.TestCase):
+    """[v2.14.1] round 2, N3: the sentinel sets the dryer's stray aside every
+    15 minutes, the live settle closes its thread, and Make mints a new one on
+    the next listing edit. Each hourly drain is a fresh process (its 6 h
+    "once per product" memory starts empty), so it reopened the thread with a
+    new email every time. A thread closed within a day is not reopened."""
+
+    def setUp(self):
+        self.tmp = chdir_tmp(self)
+
+    def gate_with(self, rec):
+        eng, _ = engine(self.tmp, live=True)
+        with mock.patch("notify.issue_get", return_value=rec), \
+                mock.patch("notify.issue_open", return_value=True) as io:
+            self.assertEqual(eng.gate_unverified_items(dryer_order()), [])   # orders still sync
+        return io
+
+    def test_closed_within_a_day_is_not_reopened(self):
+        self.gate_with({"state": "closed", "closed_at": time.time() - 3600}).assert_not_called()
+
+    def test_closed_over_a_day_ago_reopens(self):
+        io = self.gate_with({"state": "closed", "closed_at": time.time() - 25 * 3600})
+        self.assertEqual(io.call_count, 1)
+        self.assertEqual(io.call_args[0][0], f"stray:{PID}")
+
+    def test_a_reply_still_being_posted_is_not_reopened(self):
+        self.gate_with({"state": "resolving", "closed_at": time.time() - 60}).assert_not_called()
+        self.gate_with({"state": "resolving"}).assert_not_called()
+
+    def test_no_record_or_a_failed_open_still_goes_to_notify(self):
+        for rec in (None, {"state": "failed", "retry_at": time.time() - 1}):
+            self.assertEqual(self.gate_with(rec).call_count, 1, rec)
+
+    def test_hourly_drain_processes_do_not_churn_threads(self):
+        # scratchpad repro_stray_churn: 3 hourly cycles gave 3 threads, 6 emails
+        posts, mails = [], []
+        with mock.patch.object(notify, "slack_enabled", return_value=True), \
+                mock.patch.object(notify, "slack_channels", return_value=["C1"]), \
+                mock.patch.object(notify, "post_slack",
+                                  side_effect=lambda t, **k: posts.append(t) or "1.%d" % len(posts)), \
+                mock.patch.object(notify, "email_enabled", return_value=True), \
+                mock.patch.object(notify, "send_email", side_effect=lambda s, b: mails.append(s) or True), \
+                mock.patch.object(notify, "add_reaction", return_value=True), \
+                mock.patch.object(notify, "issue_open", wraps=notify.issue_open) as io:
+            for hour in range(3):
+                eng, _ = engine(self.tmp, live=True)          # a fresh drain process each hour
+                self.assertEqual(eng.gate_cached(order(str(hour), [(PID, "product")])), [])
+                notify.issue_resolve(f"stray:{PID}", "Resolved: set aside")   # live settle
+        self.assertEqual(io.call_count, 1)
+        opens = [p for p in posts if p.startswith("\U0001F7E0 An empty bundle record")]
+        self.assertLessEqual(len(opens), 1)
+        self.assertLessEqual(len(mails), 2)
 
 
 class Defaults(unittest.TestCase):

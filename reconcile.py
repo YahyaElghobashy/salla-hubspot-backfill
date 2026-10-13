@@ -605,7 +605,9 @@ def held_index(cfg):
     and stay out, as report_digest and status_relay keep them out. One
     unreadable row is skipped, never the whole read. Raises when a sheet
     cannot be read (callers report 'not recorded'). The daily digest counts
-    held orders with this too, so both reports give the same total."""
+    held orders with this too, so both reports give the same total.
+    [v2.14.1] A row with no order id is no held order: the drain never claims
+    one (queue_drain claimable skips it), so it was counted held forever."""
     from backfill import GoogleIO
     from queue_drain import DrainGoogleIO
     out, skipped = {}, 0
@@ -615,6 +617,9 @@ def held_index(cfg):
         try:
             if str(r.get("status") or "") != "held":
                 continue
+            oid = str(r.get("order_id") or "")
+            if not oid:
+                continue
             note = str(r.get("note") or "")
             if note.startswith("zid collision"):
                 continue
@@ -623,15 +628,15 @@ def held_index(cfg):
             else:
                 # "catalog gate -- in review queue" names no product
                 blocker = "" if note.startswith("catalog gate") else note[:50]
-            out[str(r.get("order_id"))] = (sheet_time(r.get("received_at")), blocker)
+            out[oid] = (sheet_time(r.get("received_at")), blocker)
         except Exception:
             skipped += 1
     for r in DrainGoogleIO(cfg, enabled=True).qlog_read() or []:
         try:
             if str(r.get("status") or "").strip().lower() not in ("queued", "held"):
                 continue
-            oid = str(r.get("order_id"))
-            if oid not in out:
+            oid = str(r.get("order_id") or "")
+            if oid and oid not in out:
                 # whole product names, like the Live Queue's: the digest
                 # splits them on commas
                 out[oid] = (sheet_time(r.get("queued_at")), str(r.get("items") or r.get("reason") or ""))

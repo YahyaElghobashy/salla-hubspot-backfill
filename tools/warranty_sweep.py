@@ -161,10 +161,13 @@ def assoc_map(hs, frm, to, ids):
     return out
 
 
-def candidates(hs, cfg, days, ids):
+def candidates(hs, cfg, days, ids, redate=False):
     """Delivered/Completed Salla orders with no warranty: explicit ids, or
     those touched in the last `days` days (a stage change or a late create
-    both move hs_lastmodifieddate)."""
+    both move hs_lastmodifieddate). redate=True (explicit ids only) returns
+    the ones that DO have warranties instead, so the action re-runs on them
+    and its upsert moves their start and end dates to the order's corrected
+    delivery_date [v2.14.1]."""
     stage_map = cfg.status_stage_map or {}
     stages = [stage_map.get("delivered"), stage_map.get("completed")]
     props = ["salla_order_id", "hs_pipeline_stage", "delivery_date", "hs_source_store"]
@@ -187,6 +190,8 @@ def candidates(hs, cfg, days, ids):
     rows = [r for r in rows if dig(r, "properties.hs_source_store") != "Zid"
             and dig(r, "properties.hs_pipeline_stage") in stages]
     has = assoc_map(hs, "orders", WARRANTY, [r["id"] for r in rows])
+    if redate:
+        return [r for r in rows if has.get(str(r["id"]))]
     return [r for r in rows if not has.get(str(r["id"]))]
 
 
@@ -217,12 +222,17 @@ def delivered_on(hs, cfg, hs_id):
     return t.strftime("%Y-%m-%d")
 
 
-def sweep_missing(hs, cfg, mod, live, days, ids, workers):
-    todo = candidates(hs, cfg, days, ids)
+def sweep_missing(hs, cfg, mod, live, days, ids, workers, redate=False):
+    todo = candidates(hs, cfg, days, ids, redate)
     run = [r for r in todo if dig(r, "properties.delivery_date")]
     no_date, dated = [], []
     for r in todo:
         if dig(r, "properties.delivery_date"):
+            continue
+        if redate:
+            # re-dating exists to correct delivery_date-based starts; an order
+            # still without one is skipped, never dated from its stage history
+            no_date.append(r)
             continue
         # the action would fall back to the last-modified date, which for an
         # old order is wrong: date it from the stage history instead
@@ -316,8 +326,13 @@ def main():
     ap.add_argument("--workers", type=int, default=4)
     ap.add_argument("--apply", action="store_true")
     ap.add_argument("--no-stale", action="store_true")
+    ap.add_argument("--redate", action="store_true",
+                    help="with --ids-file: re-run the action on orders that HAVE warranties, so their "
+                         "dates follow a corrected delivery_date (tools/fix_delivery_dates.py first)")
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args()
+    if args.redate and not args.ids_file:
+        sys.exit("--redate needs --ids-file")
     setup_logging(args.verbose, logfile="warranty_sweep.log")
     if Path("STOP.warranty").exists():
         log.info("STOP.warranty present -- not running")
@@ -333,11 +348,12 @@ def main():
     wrap_http(mod, args.apply, Pacer(), planned)
     ids = [x.strip() for x in open(args.ids_file).read().split()] if args.ids_file else []
     t0 = time.time()
-    res = {"missing": sweep_missing(hs, cfg, mod, args.apply, args.days, ids, args.workers)}
+    res = {"redate" if args.redate else "missing":
+           sweep_missing(hs, cfg, mod, args.apply, args.days, ids, args.workers, args.redate)}
     if not args.no_stale:
         res["stale"] = sweep_stale(hs, cfg, args.apply, max(args.days, 30))
     if not args.apply:
-        res["missing"]["planned_records"] = len(planned)
+        res["redate" if args.redate else "missing"]["planned_records"] = len(planned)
     log.info("WARRANTY SWEEP %s in %.0fs: %s", "APPLIED" if args.apply else "DRY RUN", time.time() - t0,
              json.dumps(res))
 

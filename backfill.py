@@ -2138,11 +2138,21 @@ class GoogleIO:
                 "reference_id": self._norm_id(raw[2]),
                 "event": str(raw[3]),
                 "status": str(raw[4]).strip().lower(),
-                "attempts": int(raw[5] or 0),
+                "attempts": self._attempts(raw[5]),
                 "source": str(raw[6]),
                 "note": str(raw[7]),
             })
         return out
+
+    @staticmethod
+    def _attempts(v):
+        """[v2.14.1] A hand-edited attempts cell ("n/a") reads as 0. It used
+        to raise out of queue_read and fail the whole read, and with it the
+        Sunday check's held index and the digest's held count."""
+        try:
+            return int(float(str(v).strip() or 0))
+        except (TypeError, ValueError, OverflowError):
+            return 0
 
     def queue_read_all(self, qsid, tab=None, chunk=20000):
         """queue_read for a whole tab in bounded pages: one values.get of a
@@ -2709,13 +2719,17 @@ class Engine:
             self._gate_book().pop(str((order or {}).get("id")), None)
 
     def _line_ta(self, order, pid, p, te, ta, name=""):
-        """The template count the line builder routes on: exactly the gate's
-        decision for this order when a gate ran (no fresh stray lookup that
-        could disagree with it), else the shared rule without alerts."""
+        """The template count the line builder routes on. A product the gate
+        exempted for this order counts 0 (no fresh stray lookup that could
+        disagree with it); anything else goes through the shared rule without
+        alerts. [v2.14.1] That rule can only lower ta, so a stray record
+        minted after the gate read its counts (the drain caches them for the
+        whole pass) still routes as the product the gate passed, while an
+        unknown or False verdict leaves ta and the line goes to needs_review."""
         exempt = self.gate_exempt(order)
-        if exempt is None:
-            return self.effective_ta(str(pid), p, te, ta, name, alert=False)
-        return 0 if str(pid) in exempt else ta
+        if exempt is not None and str(pid) in exempt:
+            return 0
+        return self.effective_ta(str(pid), p, te, ta, name, alert=False)
 
     # -- [v2.14] stray-template exemption ------------------------------------
 
@@ -2757,9 +2771,11 @@ class Engine:
     def _stray_cached(self, pid, recs=None):
         """stray_verdict, cached a few minutes (the answer changes only when
         someone acts). A failed read is remembered for STRAY_FAIL_S so the
-        lines of a busy product do not hammer the search pool, and it returns
-        the last verdict when there is one (stale is fine), else None. An
-        unknown is never cached, so it can never count as a stray."""
+        lines of a busy product do not hammer the search pool. After a failed
+        refresh a stale False still holds, but a stale True is NOT reused:
+        someone may have started building the bundle since (a Reclassify adds
+        the Bundles row), so it is unknown and holds [v2.14.1]. The line
+        builder does not need the stale True: it follows the gate's book."""
         pid = str(pid)
         cache = self.__dict__.setdefault("_stray_cache", {})
         failed = self.__dict__.setdefault("_stray_failed", {})
@@ -2773,7 +2789,7 @@ class Engine:
                 failed.pop(pid, None)
                 return verdict
             failed[pid] = time.time()
-        return hit[1] if hit else None
+        return False if hit and hit[1] is False else None
 
     def stray_verdict(self, pid, recs=None):
         """[v2.14.1] Is every template keyed to pid an empty stray?
@@ -2808,12 +2824,15 @@ class Engine:
         except Exception as e:
             log.warning("stray check for %s failed (%s): holding", pid, e)
             return None
-        row = self._bundles_row(pid)
+        # read the Bundles tab fresh: a Reclassify adds the row the moment a
+        # person starts building, and the sheet index caches columns for 10
+        # minutes, which would re-confirm "stray" on a bundle being built
+        row = self._bundles_row(pid, max_age=0)
         if row is None:
             return None
         return not row
 
-    def _bundles_row(self, pid):
+    def _bundles_row(self, pid, max_age=None):
         """Row number of pid on the validation sheet's Bundles tab; False when
         the tab was read and has no row for it; None when it could not be
         read (Sheets error, renamed tab or column, no sheet configured). A
@@ -2823,10 +2842,13 @@ class Engine:
             vs = getattr(self.cfg, "validation_spreadsheet_id", "")
             if not vs:
                 return None
-            return self._sheet_index().column(vs, "Bundles", "bundle_template_key").get(str(pid)) or False
+            return self._sheet_index().column(vs, "Bundles", "bundle_template_key",
+                                              max_age=max_age).get(str(pid)) or False
         except Exception as e:
             log.info("Bundles tab unreadable for stray check (%s)", e)
             return None
+
+    STRAY_REOPEN_S = 24 * 3600     # [v2.14.1] a closed stray thread stays closed this long
 
     def _note_stray(self, pid, name=""):
         """One Slack thread per product, opened once; the live settle step
@@ -2837,6 +2859,17 @@ class Engine:
         try:
             import notify
             import slack_text as st
+            # [v2.14.1] Make mints a new empty record on every listing edit and
+            # the sentinel sets each one aside, so a thread closed within a day
+            # is not reopened: each fresh process (the hourly drain) would
+            # otherwise post a new thread and email for the same product
+            rec = notify.issue_get(f"stray:{pid}") or {}
+            if rec.get("state") in ("closed", "resolving"):
+                closed = float(rec.get("closed_at") or time.time())
+                if time.time() - closed < self.STRAY_REOPEN_S:
+                    log.info("stray thread for %s closed %.1f h ago, not reopened",
+                             pid, (time.time() - closed) / 3600)
+                    return
             shown = name or f"Salla product {pid}"
             subject = (f"🟠 An empty bundle record appeared in HubSpot for {shown}, which is approved "
                        "as a single product. Its orders keep syncing normally.")
@@ -2855,8 +2888,9 @@ class Engine:
                     "Do NOT approve anything for this: the product is already approved."]
             links = [st.link(f"https://s.salla.sa/products/{pid}", "Product in Salla"),
                      st.hubspot_search(pid, "Find the empty record in HubSpot")]
-            notify.issue_open(f"stray:{pid}", subject, st.message(what, todo, links),
-                              meta={"pid": str(pid), "name": name})
+            with notify.fast_posts():      # [v2.14.1] the gate runs in a lane: never wait on Slack
+                notify.issue_open(f"stray:{pid}", subject, st.message(what, todo, links),
+                                  meta={"pid": str(pid), "name": name})
         except Exception as e:
             log.warning("stray alert for %s failed: %s", pid, e)
 
@@ -3197,11 +3231,13 @@ class Engine:
             backing_off = rec.get("state") == "failed" and time.time() < float(rec.get("retry_at") or 0)
             if rec.get("state") == "open" or backing_off:
                 n = len(set((rec.get("meta") or {}).get("orders") or []) | {oid})
-                notify.issue_update(key, f"Order #{ref} is also waiting for {u.get('name') or 'this product'}. "
-                                         f"{st.plural(n, 'order')} waiting in total.", every_s=6 * 3600, meta=meta)
+                with notify.fast_posts():   # [v2.14.1] a lane never waits on Slack
+                    notify.issue_update(key, f"Order #{ref} is also waiting for {u.get('name') or 'this product'}. "
+                                             f"{st.plural(n, 'order')} waiting in total.", every_s=6 * 3600, meta=meta)
                 continue
             subject, body = self.held_text(order, u)
-            notify.issue_open(key, subject, body, meta=meta)
+            with notify.fast_posts():
+                notify.issue_open(key, subject, body, meta=meta)
 
     def resolve_order_issues(self, oid, hs_id, reference=None):
         """[v2.13] An order now exists in HubSpot: answer any thread that was
@@ -3218,16 +3254,19 @@ class Engine:
             rec = notify.issue_get(key) or {}
             return str((rec.get("meta") or {}).get("ref") or reference or "").strip()
 
-        notify.issue_resolve(f"status-missing:{oid}",
-                             f"✅ Resolved: order #{ref_of(f'status-missing:{oid}') or oid} is in HubSpot now "
-                             f"({rec_link}), with its latest delivery status.")
-        # the Zid thread is opened by the engine ("Salla order <id>") or by the
-        # status relay ("Order #<reference>"): name both when they differ
-        ref = ref_of(f"zid:{oid}")
-        shown = f"order #{ref} (Salla order {oid})" if ref and ref != oid else f"Salla order {oid}"
-        notify.issue_resolve(f"zid:{oid}",
-                             f"✅ Resolved: the old Zid order was moved to its own number and {shown} "
-                             f"is in HubSpot now ({rec_link}).")
+        # [v2.14.1] called from a lane: posts fail fast, and a reply Slack
+        # refused stays "resolving" for notify.retry_failed to post later
+        with notify.fast_posts():
+            notify.issue_resolve(f"status-missing:{oid}",
+                                 f"✅ Resolved: order #{ref_of(f'status-missing:{oid}') or oid} is in HubSpot now "
+                                 f"({rec_link}), with its latest delivery status.")
+            # the Zid thread is opened by the engine ("Salla order <id>") or by the
+            # status relay ("Order #<reference>"): name both when they differ
+            ref = ref_of(f"zid:{oid}")
+            shown = f"order #{ref} (Salla order {oid})" if ref and ref != oid else f"Salla order {oid}"
+            notify.issue_resolve(f"zid:{oid}",
+                                 f"✅ Resolved: the old Zid order was moved to its own number and {shown} "
+                                 f"is in HubSpot now ({rec_link}).")
 
     def zid_collision(self, oid, zid_hs_id):
         """[v2.12] Record a Salla order whose id is held by a Zid-import
@@ -3275,18 +3314,19 @@ class Engine:
             try:
                 import notify
                 import slack_text as st
-                notify.issue_open(
-                    f"zid:{oid}",
-                    f"🟠 Salla order {oid} could not be created: an old Zid order uses the same number",
-                    st.message(
-                        f"Salla order {oid} came in, but an imported Zid order ({st.hubspot('order', zid_hs_id, 'this one')}) "
-                        "already uses the same order number, and HubSpot allows each number only once. The "
-                        "sync normally moves the old Zid order to its own number and carries on; this time "
-                        "that step failed, so the Salla order is waiting.",
-                        "Nothing yet: the integration team is alerted and will re-run it. This thread "
-                        "will confirm when the order is in HubSpot.",
-                        [st.hubspot("order", zid_hs_id, "Zid order in HubSpot")]),
-                    meta={"zid_hs_id": str(zid_hs_id)})
+                with notify.fast_posts():   # [v2.14.1] a lane never waits on Slack
+                    notify.issue_open(
+                        f"zid:{oid}",
+                        f"🟠 Salla order {oid} could not be created: an old Zid order uses the same number",
+                        st.message(
+                            f"Salla order {oid} came in, but an imported Zid order ({st.hubspot('order', zid_hs_id, 'this one')}) "
+                            "already uses the same order number, and HubSpot allows each number only once. The "
+                            "sync normally moves the old Zid order to its own number and carries on; this time "
+                            "that step failed, so the Salla order is waiting.",
+                            "Nothing yet: the integration team is alerted and will re-run it. This thread "
+                            "will confirm when the order is in HubSpot.",
+                            [st.hubspot("order", zid_hs_id, "Zid order in HubSpot")]),
+                        meta={"zid_hs_id": str(zid_hs_id)})
             except Exception as e:
                 log.warning("zid collision alert failed: %s", e)
         return note

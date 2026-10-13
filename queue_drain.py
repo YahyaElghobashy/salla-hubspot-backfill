@@ -50,6 +50,7 @@ import threading
 import time
 from collections import defaultdict
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from datetime import datetime
 from pathlib import Path
 
 import backfill
@@ -75,9 +76,18 @@ TERMINAL = {"processed", "duplicate", "gone"}
 # pass can skip it by id (names are not unique: a relisted Salla product keeps
 # its name under a new id). The record goes LAST so the "blocked: <names> @"
 # head tools/held_inventory.py reads is unchanged:
-#   blocked: <names> @ <YYYY-MM-DD HH:MM:SS> [pids=<id>,sku:<sku>,...]
+#   blocked: <names> @ <YYYY-MM-DD HH:MM:SS> [pids=<id>,<id>/<sku>,sku:<sku>,...]
+# [v2.14.1] "<id>/<sku>" is an id with its item's SKU, recorded when that SKU
+# did not pass the gate; the row is fetched again once it does.
 PIDS_RE = re.compile(r"\[pids=([^\[\]]*)\]\s*$")
 TRIED_RE = re.compile(r"(?:@|since) (\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2}:\d{2})")
+_UNWRITABLE = re.compile(r"[,\[\]\r\n]")
+
+# [v2.14.1] The pre-filter skips a row only for this long after its last try.
+# A row's blocker can change without its recorded id ever passing (the listing
+# is deleted in Salla and the order now resolves by SKU), so every row is
+# fetched again at least this often: ~24 relay fetches an hour for 1,700 rows.
+SKIP_MAX_AGE_S = 72 * 3600
 
 
 def block_key(u):
@@ -86,13 +96,30 @@ def block_key(u):
     return u["pid"] or f"sku:{u.get('sku') or '-'}"
 
 
-def pids_note(unverified):
+def pids_note(unverified, skus=()):
     """The ' [pids=...]' suffix for a blocked row's note; '' when a key cannot
-    be written back unambiguously (that row is then simply fetched)."""
-    keys = sorted({str(block_key(u)).strip() for u in unverified})
-    if not keys or any(not k or re.search(r"[,\[\]\r\n]", k) for k in keys):
-        return ""
-    return f" [pids={','.join(keys)}]"
+    be written back unambiguously (that row is then simply fetched).
+    [v2.14.1] A product id whose item SKU is in `skus` is written as
+    "<id>/<sku>"; a SKU that cannot be written back is left off its id."""
+    keys = set()
+    for u in unverified:
+        key = str(block_key(u)).strip()
+        if not key or _UNWRITABLE.search(key) or (u["pid"] and "/" in key):
+            return ""
+        sku = str(u.get("sku") or "").strip()
+        if u["pid"] and sku and sku in skus and not _UNWRITABLE.search(sku):
+            key = f"{key}/{sku}"
+        keys.add(key)
+    return f" [pids={','.join(sorted(keys))}]" if keys else ""
+
+
+def split_key(key):
+    """[v2.14.1] A recorded key -> (blocker key, SKU): "<id>/<sku>" gives the
+    id and its SKU, "sku:<sku>" itself and its SKU, a bare id (id, '')."""
+    if key.startswith("sku:"):
+        return key, ("" if key == "sku:-" else key[4:])
+    pid, _, sku = key.partition("/")
+    return pid, sku
 
 
 def recorded_keys(notes):
@@ -115,6 +142,18 @@ def last_tried(notes):
     "@ <ts>" of a blocked note or "processing since <ts>"); '' when never."""
     found = TRIED_RE.findall(str(notes or ""))
     return " ".join(found[-1]) if found else ""
+
+
+def tried_within(notes, seconds, now):
+    """[v2.14.1] The drain tried this row less than `seconds` before `now`
+    (a now_str() timestamp, the clock the notes are written with). False when
+    the note has no readable try."""
+    try:
+        age = (datetime.strptime(now, "%Y-%m-%d %H:%M:%S")
+               - datetime.strptime(last_tried(notes), "%Y-%m-%d %H:%M:%S"))
+    except ValueError:
+        return False
+    return age.total_seconds() < seconds
 
 
 def load_dotenv(path=".env"):
@@ -366,8 +405,15 @@ class QueueDrainEngine(Engine):
             p, te, raw_ta = self._pid_counts(pid)
             # [v2.14] same stray-record rule as the live gate, applied per order
             # on the cached counts (the verdict keeps its own short cache), so
-            # a bundle someone starts building mid-pass holds like it does live
+            # a bundle someone starts building mid-pass holds like it does live.
+            # [v2.14.1] Counts the verdict can act on are no older than it.
             ta = self.effective_ta(pid, p, te, raw_ta, item.get("name", ""))
+            if ta and self._exemptable(p, te, raw_ta):
+                # the verdict did not exempt it, but the counts may predate that
+                # verdict (the sentinel can set the record aside in between):
+                # read them again, at most once per verdict, before holding
+                p, te, raw_ta = self._pid_counts(pid, older_than=self._verdict_at(pid))
+                ta = self.effective_ta(pid, p, te, raw_ta, item.get("name", ""))
             if raw_ta and not ta:
                 self.note_gate_exempt(order, pid)     # [v2.14.1] for the line builder
             if self._fails(p, te, ta):
@@ -389,18 +435,54 @@ class QueueDrainEngine(Engine):
                 self._gate_cache[key] = ok
         return ok
 
-    def _pid_counts(self, pid):
+    def _verdict_at(self, pid):
+        """[v2.14.1] When the cached stray verdict for pid was read (0 if none)."""
+        hit = (self.__dict__.get("_stray_cache") or {}).get(str(pid))
+        return hit[0] if hit else 0
+
+    def _pid_counts(self, pid, older_than=0):
         """(p, te, raw ta) for one product, cached for the pass. Raw, so the
-        stray exemption can be decided (and recorded) per order."""
+        stray exemption can be decided (and recorded) per order.
+
+        [v2.14.1] Counts of an exemptable shape live only as long as the stray
+        verdict they are combined with (STRAY_TTL_S), then they are read again:
+        pass-old counts next to a fresh verdict held an approved product's
+        orders for the rest of the pass once the catalog sentinel set its stray
+        record aside (no record left, but the cached count still had one). One
+        lane reads a product at a time, so a product is re-read at most once
+        per TTL. A failed re-read keeps the old counts for another TTL; a
+        failed first read raises, as before. older_than also re-reads counts
+        read before that moment (the verdict they are about to be combined
+        with), so counts and verdict never come from different clocks."""
         with self._gate_lock:
-            res = self._gate_cache.get(pid)
-        if res is None:
-            res = (self.hs.gate_search_product_approved(pid),    # [M211]
-                   self.hs.gate_search_template(pid, True),      # [M213]
-                   self.hs.gate_search_template(pid, False))     # [M214]
+            hit = self._gate_cache.get(pid)
+        if hit is not None and self._counts_fresh(hit) and hit[3] >= older_than:
+            return hit[:3]
+        with self._gate_lock:
+            lock = self.__dict__.setdefault("_pid_locks", {}).setdefault(pid, threading.Lock())
+        with lock:
             with self._gate_lock:
-                self._gate_cache[pid] = res
+                hit = self._gate_cache.get(pid)
+            if hit is not None and self._counts_fresh(hit) and hit[3] >= older_than:
+                return hit[:3]                 # another lane read it meanwhile
+            try:
+                res = (self.hs.gate_search_product_approved(pid),    # [M211]
+                       self.hs.gate_search_template(pid, True),      # [M213]
+                       self.hs.gate_search_template(pid, False))     # [M214]
+            except Exception as e:
+                if hit is None:
+                    raise
+                log.warning("gate re-read of %s failed (%s): keeping its counts", pid, e)
+                res = hit[:3]
+            with self._gate_lock:
+                self._gate_cache[pid] = res + (time.time(),)
         return res
+
+    def _counts_fresh(self, hit):
+        """[v2.14.1] Cached (p, te, ta, read_at) still usable: any shape the
+        stray exemption cannot touch lasts the pass, an exemptable one lasts
+        STRAY_TTL_S."""
+        return not self._exemptable(*hit[:3]) or time.time() - hit[3] < self.STRAY_TTL_S
 
     @staticmethod
     def _fails(p, te, ta):
@@ -460,11 +542,20 @@ class QueueDrainEngine(Engine):
         when it is Queued, was tried before and EVERY id it recorded still
         fails; a row with no record, or with an id that passes or could not be
         checked, is fetched normally. Skipped rows are carried into this
-        pass's matrix under their own ids, so the matrix still counts them."""
+        pass's matrix under their own ids, so the matrix still counts them.
+
+        [v2.14.1] Also fetched: a row last tried SKIP_MAX_AGE_S ago or more,
+        and a row whose recorded id still fails but whose recorded SKU now
+        passes. Both cover a listing deleted in Salla after the row was
+        recorded: its orders resolve by SKU from then on, and the old id
+        would have kept the row skipped (and in the matrix under a product
+        nobody can approve) for good."""
+        now = now_str()
         marked = []
         for r in rows:
             keys = recorded_keys(r.get("notes"))
-            ok = keys and r.get("status") == "queued" and r.get("attempts", 0) > 0
+            ok = (keys and r.get("status") == "queued" and r.get("attempts", 0) > 0
+                  and tried_within(r.get("notes"), SKIP_MAX_AGE_S, now))
             marked.append((r, keys if ok else None))
         wanted = sorted(frozenset().union(*(k for _, k in marked if k)))
         if not wanted:
@@ -487,15 +578,20 @@ class QueueDrainEngine(Engine):
                 keep.append(r)
                 continue
             skipped += 1
-            names = note_names(r.get("notes")) if len(keys) == 1 else ""
+            blocks = {}                  # [v2.14.1] one tally per blocker, SKU or not
+            for k in sorted(keys):
+                bk, sku = split_key(k)
+                if not (blocks.get(bk) or ("", ""))[1]:
+                    blocks[bk] = (still[k], sku)
+            names = note_names(r.get("notes")) if len(blocks) == 1 else ""
             with self._blocked_lock:
-                for k in keys:
+                for k, (why, sku) in blocks.items():
                     m = prev.get(k) or {}
-                    sku = k[4:] if k.startswith("sku:") else None
+                    by_sku = k.startswith("sku:")
                     rec = self._blocked.setdefault(k, {
-                        "name": m.get("item_name") or names, "why": still[k], "count": 0,
-                        "sku": m.get("sku", "") if sku is None else ("" if sku == "-" else sku),
-                        "pid": k if sku is None else "", "samples": []})
+                        "name": m.get("item_name") or names, "why": why, "count": 0,
+                        "sku": sku if by_sku else (m.get("sku") or sku),
+                        "pid": "" if by_sku else k, "samples": []})
                     rec["count"] += 1
                     if len(rec["samples"]) < 5:
                         rec["samples"].append(str(r["order_id"]))
@@ -509,17 +605,49 @@ class QueueDrainEngine(Engine):
         """The gate's suggested fix when this blocker key still fails the
         gate now, '' when it passes. Same rule and same cache as gate_cached,
         never alerting. Raises when a read fails or the stray verdict is
-        unknown (it might pass any minute): the caller fetches those rows."""
+        unknown (it might pass any minute): the caller fetches those rows.
+        [v2.14.1] An id recorded with its SKU passes too when that SKU now
+        passes the SKU gate (the listing was deleted in Salla)."""
         if key.startswith("sku:"):
             sku = "" if key == "sku:-" else key[4:]
             return "" if self._sku_ok(sku) else self._deleted_why(sku)
-        p, te, ta = self._pid_counts(key)
+        pid, sku = split_key(key)
+        p, te, ta = self._pid_counts(pid)
         if self._exemptable(p, te, ta):
-            verdict = self._stray_cached(key)
+            verdict = self._stray_cached(pid)
             if verdict is None:
                 raise LookupError("stray verdict unknown")
-            ta = 0 if verdict else ta
-        return self._why(p, ta) if self._fails(p, te, ta) else ""
+            if verdict:
+                ta = 0
+            else:                    # [v2.14.1] counts no older than the verdict, as in gate_cached
+                p, te, ta = self._pid_counts(pid, older_than=self._verdict_at(pid))
+                if self._exemptable(p, te, ta) and self._stray_cached(pid):
+                    ta = 0
+        why = self._why(p, ta) if self._fails(p, te, ta) else ""
+        return "" if why and sku and self._sku_ok(sku) else why
+
+    def _open_skus(self, unverified):
+        """[v2.14.1] The SKUs of blocked Salla products worth recording next to
+        their ids: the ones the SKU gate does not pass now (pass-cached, and
+        only when the pre-filter is on). When one passes later, the listing was
+        most likely deleted in Salla and a legacy record approved, so the row
+        is fetched. A SKU that passes already (an approved relisting can carry
+        it) could never signal that, and would only get the row fetched every
+        pass. A failed check records the SKU: the worst case is one fetch."""
+        if not getattr(self.cfg, "drain_skip_known_blocked", False):
+            return set()
+        out = set()
+        for u in unverified:
+            sku = str(u.get("sku") or "").strip()
+            if not u["pid"] or not sku or sku in out or _UNWRITABLE.search(sku):
+                continue
+            try:
+                if self._sku_ok(sku):
+                    continue
+            except Exception as e:
+                log.warning("SKU check of %s failed (%s): recording it", sku, e)
+            out.add(sku)
+        return out
 
     def _prev_matrix(self):
         """Last pass's blocker matrix by blocker key, for the names of rows
@@ -598,7 +726,8 @@ class QueueDrainEngine(Engine):
             log.info("BLOCKED order %s (%d item(s)): %s", oid,
                      len(unverified), names[:160])
             # [v2.14.1] the ids go in too: the next pass skips this row by id
-            return ("Queued", f"blocked: {names[:180]} @ {now_str()}{pids_note(unverified)}", 1)
+            return ("Queued", f"blocked: {names[:180]} @ {now_str()}"
+                              f"{pids_note(unverified, self._open_skus(unverified))}", 1)
         if not self.live:
             log.info("READY order %s (verify mode -- not creating)", oid)
             return ("Ready", "", 0)

@@ -20,6 +20,8 @@ Durability model (nothing is ever lost, nothing is created twice):
 Row lifecycle: queued -> done | held | gone (Salla 404 terminal) | error
 (attempts+1, retried each poll up to live_max_attempts, then loud ledger).
 A crash mid-order leaves the row queued; reprocessing is idempotent.
+[v2.14.1] The hourly settle moves held -> done once the order exists, and
+held -> gone ("drain closed ...") once the catalog drain gave up on it.
 
 Own namespace so it coexists with a running backfill: live.log, STOP.live,
 live.lock, live_state.json, config.live.json.
@@ -51,6 +53,9 @@ log = logging.getLogger("backfill")  # share the engine's logger/format
 
 # [v2.11] partial orders topped up per poll cycle (the rest wait a cycle)
 TOPUPS_PER_CYCLE = 3
+# [v2.14.1] note head of a held row the hourly settle marked "gone" because
+# the catalog drain closed its order without creating it
+DRAIN_CLOSED = "drain closed"
 
 STOP_FILE = Path("STOP.live")
 LOCK_FILE = Path("live.lock")
@@ -534,7 +539,17 @@ class LiveEngine(Engine):
         made the digest's held count and the status relay's classification
         wrong. Once an hour every such row whose order is in the created
         ledger is marked done, naming the HubSpot order. Never during a
-        trim (row numbers move); never in a dry run."""
+        trim (row numbers move); never in a dry run.
+
+        [v2.14.1] It also marks "gone" the held rows of orders the catalog
+        drain finished with and never created (deleted in Salla, out of
+        attempts, a Zid number park in the drain). Those rows read "held"
+        for good, so the status relay, reconcile.held_index and the digest
+        kept counting them after the held threads had closed, and the
+        relay's escalation reopened every hour with no hold in progress.
+        Every reader now sees the same held set. Such a row whose order is
+        created after all is marked done like the others. Last, it posts
+        what Slack refused earlier (notify.retry_failed)."""
         if not self.live or time.monotonic() < getattr(self, "_next_settle", 0):
             return 0
         self._next_settle = time.monotonic() + every_s
@@ -550,23 +565,57 @@ class LiveEngine(Engine):
         marks = []
         for r in rows:
             st = r["status"]
-            if not (st == "held" or (st == "error" and r["attempts"] >= cap)):
+            drained = st == "gone" and str(r.get("note") or "").startswith(DRAIN_CLOSED)
+            if not (st == "held" or (st == "error" and r["attempts"] >= cap) or drained):
                 continue
             hs_id = self.created_ledger.get(r["order_id"])
             if hs_id:
                 was = str(r.get("note") or st)[:70]
                 marks.append((r["row"], r["order_id"], "done", r["attempts"],
                               f"HS {hs_id} (created later; was {st}: {was})"))
+        done = len(marks)
+        state = None
+        try:
+            state = self._held_now(rows)     # [v2.14.1] reads the Queue Log only when a row is held
+        except Exception as e:
+            log.warning("SETTLE held set unknown, no drain-closed row marked: %s", e)
+        if state:
+            closed = state[2]
+            for r in rows:
+                note = str(r.get("note") or "")
+                if (r["status"] == "held" and r["order_id"] in closed
+                        and not note.startswith("zid collision")):
+                    marks.append((r["row"], r["order_id"], "gone", r["attempts"],
+                                  f"{DRAIN_CLOSED} (Queue Log: {closed[r['order_id']]}; "
+                                  f"was held: {(note or 'held')[:60]})"))
         written = 0
-        for i in range(0, len(marks), 500):
-            written += self.gio.queue_mark_batch(self.qsid, marks[i:i + 500])
+        try:
+            for i in range(0, len(marks), 500):
+                written += self.gio.queue_mark_batch(self.qsid, marks[i:i + 500])
+        except Exception as e:
+            # [v2.14.1] the threads and the Slack retry below do not need the
+            # marks: a failed write waits for the next settle, not the threads
+            log.warning("SETTLE marks failed after %d row(s), the rest wait an hour: %s", written, e)
         if marks:
-            log.info("SETTLE %d held/exhausted row(s) whose order now exists marked done", written)
+            log.info("SETTLE %d of %d row(s) written: %d held/exhausted whose order now exists marked "
+                     "done, %d held that the catalog drain closed without creating marked gone",
+                     written, len(marks), done, len(marks) - done)
         if getattr(self.cfg, "alerts_enabled", True):
             try:
-                self._answer_held_threads(rows)
+                self._answer_held_threads(rows, state)
             except Exception as e:
                 log.warning("SETTLE Slack threads failed: %s", e)
+            try:
+                import notify
+                # [v2.14.1] after the closes above, so this call posts no hold that
+                # cleared. The relay and the credit watch retry too, more often: a
+                # held thread one of them posts after its orders cleared is
+                # answered by the next settle like any open one.
+                n = notify.retry_failed()
+                if n:
+                    log.info("SETTLE posted %d thread(s) Slack refused earlier", n)
+            except Exception as e:
+                log.warning("SETTLE Slack retry failed: %s", e)
         return written
 
     def _held_now(self, rows):
@@ -579,8 +628,9 @@ class LiveEngine(Engine):
           busy    orders the live engine still works on (queued, processing,
                   an error with attempts left)
           closed  held orders the catalog drain finished with and never
-                  created (deleted in Salla, out of attempts): their Live
-                  Queue row reads "held" for good, so they leave `held`
+                  created (deleted in Salla, out of attempts), as
+                  {order id: the drain's last word}: they leave `held`,
+                  and the settle marks their Live Queue rows "gone"
           refs    order id -> the Salla reference number the client knows"""
         cap = self.cfg.live_max_attempts
         held, busy, refs = set(), set(), {}
@@ -597,31 +647,36 @@ class LiveEngine(Engine):
                     held.add(oid)
             elif st in ("queued", "processing") or (st == "error" and r["attempts"] < cap):
                 busy.add(oid)               # what _claimable picks up again
-        closed = (held & self._drain_closed()) if held else set()
-        return held - closed, busy, closed, refs
+        closed = {}
+        if held:
+            drained = self._drain_closed()
+            closed = {o: drained[o] for o in held if o in drained}
+        return held - closed.keys(), busy, closed, refs
 
     def _drain_closed(self):
-        """[v2.14.1] Order ids the catalog drain is finished with: every Queue
-        Log row of the order is gone, duplicate, processed, cancelled or out
-        of attempts, so nothing will create it any more. Read with the
-        drain's own reader on this engine's Sheets client (and its limiter).
-        An unreadable Queue Log closes nothing: the threads wait an hour."""
+        """[v2.14.1] {order id: why} for the orders the catalog drain is
+        finished with: every Queue Log row of the order is gone, duplicate,
+        processed, cancelled or out of attempts, so nothing will create it
+        any more. `why` is its last row's status ("gone", "error after 8
+        attempts"). Read with the drain's own reader on this engine's Sheets
+        client (and its limiter). An unreadable Queue Log closes nothing:
+        the threads wait an hour."""
         from queue_drain import DrainGoogleIO
         try:
             rows = DrainGoogleIO.qlog_read(self.gio)
         except Exception as e:
             log.warning("SETTLE Queue Log read failed, no held order counts as closed: %s", e)
-            return set()
+            return {}
         cap = self.cfg.live_max_attempts
-        seen, live_ = set(), set()
+        seen, live_ = {}, set()
         for r in rows or []:
             oid, st = r.get("order_id"), r.get("status") or ""
             if not oid:
                 continue
-            seen.add(oid)
+            seen[oid] = f"error after {r.get('attempts', 0)} attempts" if st == "error" else st
             if st in ("queued", "processing", "held", "") or (st == "error" and r.get("attempts", 0) < cap):
                 live_.add(oid)
-        return seen - live_
+        return {o: why for o, why in seen.items() if o not in live_}
 
     def _thread_gate(self, key):
         """[v2.14.1] "pass" | "held" | None (a read failed) for the product
@@ -663,7 +718,21 @@ class LiveEngine(Engine):
         except Exception as e:
             log.warning("held thread %s: closed orders not dropped: %s", key, e)
 
-    def _answer_held_threads(self, rows):
+    @staticmethod
+    def _failed_held():
+        """[v2.14.1] {key: listed order ids} of the held records (held:<product>,
+        held-backlog, held-escalation:<day>) whose open no Slack channel took.
+        notify.retry_failed() posts them later unless the settle closes them."""
+        import notify
+        try:
+            with notify._issues() as d:     # notify lists open records only
+                return {k: [str(o) for o in ((v.get("meta") or {}).get("orders") or [])]
+                        for k, v in d.items() if k.startswith("held") and v.get("state") == "failed"}
+        except Exception as e:
+            log.warning("SETTLE failed held records unreadable: %s", e)
+            return {}
+
+    def _answer_held_threads(self, rows, state=None):
         """[v2.13] Reply "released" in every held-product thread whose product
         passes the gate now, and close the aggregated backlog thread when no
         order is left on hold.
@@ -673,12 +742,18 @@ class LiveEngine(Engine):
         attempts, no longer held) are dropped from it, and an order that also
         waits for another product that still fails is that product's thread's
         business. The thread closes when its product passes the gate and no
-        order waits for it alone (those are created by the hourly drain)."""
+        order waits for it alone (those are created by the hourly drain), and
+        whatever the gate says once every order it listed is created or gone.
+        A held record Slack refused ("failed") is closed without a post once
+        none of its orders waits (or, for the backlog and escalation, once
+        nothing is held), so notify.retry_failed() never posts a stale hold.
+        `state` is _held_now(rows) when the caller has it already."""
         import notify
         import slack_text as st
         opened = notify.issues_open("held")     # held:<product>, held-backlog, held-escalation:<day>
-        if opened:
-            held, busy, closed, live_refs = self._held_now(rows)
+        failed = self._failed_held()
+        if opened or failed:
+            held, busy, closed, live_refs = state or self._held_now(rows)
             threads = {k: v for k, v in opened.items() if k.startswith("held:")}
             listed = {k: [str(o) for o in ((v.get("meta") or {}).get("orders") or [])]
                       for k, v in threads.items()}
@@ -704,55 +779,98 @@ class LiveEngine(Engine):
                 gone = [o for o in orders if not made[o] and o not in held and o not in busy]
                 if gone:
                     self._drop_thread_orders(key, set(gone), ref)
-                # an order no other thread lists waits for this product alone (or
-                # for the drain, once it passes): nothing to say yet
-                if any(not any(o in member[k] for k in threads if k != key) for o in waiting):
-                    continue
-                if gate_of(key) != "pass":
-                    continue
-                elsewhere = [o for o in waiting
-                             if any(o in member[k] and gate_of(k) == "held" for k in threads if k != key)]
-                if len(elsewhere) < len(waiting):
-                    continue                      # shared, but its other product passes too: the drain is due
+                elsewhere = []
+                if waiting:
+                    # an order no other thread lists waits for this product alone (or
+                    # for the drain, once it passes): nothing to say yet
+                    if any(not any(o in member[k] for k in threads if k != key) for o in waiting):
+                        continue
+                    if gate_of(key) != "pass":
+                        continue
+                    elsewhere = [o for o in waiting
+                                 if any(o in member[k] and gate_of(k) == "held" for k in threads if k != key)]
+                    if len(elsewhere) < len(waiting):
+                        continue                  # shared, but its other product passes too: the drain is due
+                # [v2.14.1] every order it listed is created or gone: nothing waits on
+                # this thread, so it closes whatever the gate says (a deleted product
+                # with no SKU never passes it), and only the gate's pass is called one
+                passes = gate_of(key) == "pass"
                 name = m.get("name") or "the product"
                 done = [o for o in orders if made[o]]
-                text = f"✅ Released: {name} passes the catalog check now"
-                if done:
-                    shown = ", ".join(st.hubspot("order", made[o], f"#{ref(o)}") for o in done[:5])
-                    more = f" and {len(done) - 5} more" if len(done) > 5 else ""
-                    n = len(done)
-                    text += (f", and {st.plural(n, 'order')} that waited for it {'is' if n == 1 else 'are'} "
-                             f"in HubSpot: {shown}{more}.")
+                shown = ", ".join(st.hubspot("order", made[o], f"#{ref(o)}") for o in done[:5])
+                more = f" and {len(done) - 5} more" if len(done) > 5 else ""
+                n = len(done)
+                listed_refs = {ref(o) for o in orders}
+                left = [c for c in (m.get("closed") or []) if c not in listed_refs]
+                left += [ref(o) for o in gone if ref(o) not in left]
+                if passes:
+                    text = f"✅ Released: {name} passes the catalog check now"
+                    if done:
+                        text += (f", and {st.plural(n, 'order')} that waited for it {'is' if n == 1 else 'are'} "
+                                 f"in HubSpot: {shown}{more}.")
+                    else:
+                        text += "."
+                elif done and not left:
+                    text = f"✅ Every order that waited for {name} is in HubSpot now: {shown}{more}."
                 else:
-                    text += "."
+                    text = f"✅ No order is waiting for {name} any more."
+                    if done:
+                        text += (f" {st.plural(n, 'order')} that waited for it {'is' if n == 1 else 'are'} "
+                                 f"in HubSpot: {shown}{more}.")
                 if elsewhere:
                     k = len(elsewhere)
                     text += (f" Still waiting for another product: {', '.join(f'#{ref(o)}' for o in elsewhere[:5])}"
                              f"{f' and {k - 5} more' if k > 5 else ''}. That product's own thread confirms "
                              f"{'it' if k == 1 else 'them'}.")
-                listed_refs = {ref(o) for o in orders}
-                left = [c for c in (m.get("closed") or []) if c not in listed_refs]
-                left += [ref(o) for o in gone if ref(o) not in left]
                 if left:
                     k = len(left)
                     text += (f" {'Order' if k == 1 else 'Orders'} {', '.join(f'#{c}' for c in left[:5])}"
                              f"{f' and {k - 5} more' if k > 5 else ''} {'was' if k == 1 else 'were'} not "
                              f"created: {'it' if k == 1 else 'they'} left the queue without reaching HubSpot "
                              f"(for example, deleted in Salla).")
-                if not (done or elsewhere or left):
+                if passes and not (done or elsewhere or left):
                     text += " No order is waiting for it any more."
+                if gate_of(key) == "held":
+                    text += (f" A new order with {name} would wait again, in a new thread: the product still "
+                             "does not pass the catalog check.")
                 notify.issue_resolve(key, text)
+
+            def but_of(key):
+                # [v2.14.1] the orders the drain closed while this thread was open,
+                # at earlier settles too: their rows read "gone" since, so a later
+                # settle no longer finds them among the closed ones
+                left = set(closed) | set((opened[key].get("meta") or {}).get("left") or [])
+                k = len([o for o in left if not self.created_ledger.get(o)])
+                return (f", except {st.plural(k, 'order')} that left the queue without being created "
+                        "(for example, deleted in Salla)") if k else ""
+
             if not held:
-                k = len(closed)
-                but = (f", except {st.plural(k, 'order')} that left the queue without being created "
-                       "(for example, deleted in Salla)") if k else ""
                 if "held-backlog" in opened:
                     notify.issue_resolve("held-backlog", "✅ Resolved: no order is on hold for catalog approval "
-                                                         f"any more. Every one of them is in HubSpot now{but}.")
+                                                         f"any more. Every one of them is in HubSpot "
+                                                         f"now{but_of('held-backlog')}.")
                 for key in opened:                                        # [v2.14]
                     if key.startswith("held-escalation:"):
                         notify.issue_resolve(key, "✅ Resolved: the hold has cleared, every held order is in "
-                                                  f"HubSpot now{but}.")
+                                                  f"HubSpot now{but_of(key)}.")
+            elif closed:
+                # [v2.14.1] kept for the all-clear (merged, never posted)
+                for key in opened:
+                    if key == "held-backlog" or key.startswith("held-escalation:"):
+                        notify.issue_update(key, "", every_s=float("inf"), meta={"left": sorted(closed)})
+            # [v2.14.1] a held record Slack refused, whose problem cleared before any
+            # thread got out: close it quietly (False: retry_failed holds it right
+            # now, the next settle looks again)
+            for key, orders in failed.items():
+                if key.startswith("held:") and orders:
+                    if any(not self.created_ledger.get(o) and (o in held or o in busy) for o in orders):
+                        continue
+                    why = "every order it listed is in HubSpot or left the queue"
+                elif held:              # the backlog, an escalation, a product record listing no order
+                    continue
+                else:
+                    why = "no order is on hold any more"
+                notify.close_failed(key, why)
         # [v2.14] close a stray-record thread once the empty record is gone,
         # or once someone starts building that bundle on purpose
         for key, rec in notify.issues_open("stray:").items():

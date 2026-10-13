@@ -133,7 +133,6 @@ class StatusRelay(RealtimeConsumer):
         # stories (held / live-order-missing / awaiting-backfill).
         self._live_index = {}          # order_id -> (state, note)
         self._live_index_at = 0.0
-        self._live_index_snap = 0.0    # start of the last read that succeeded
         self._digest = []              # backfill-era give-ups awaiting flush
         self._digest_sent_day = ""
 
@@ -186,7 +185,6 @@ class StatusRelay(RealtimeConsumer):
                                 (str(r.get("status") or r.get("state") or ""),
                                  str(r.get("note") or ""))
                                 for r in rows if r.get("order_id")}
-            self._live_index_snap = self._live_index_at
         except Exception as e:
             log.warning("live-queue index refresh failed: %s", e)
 
@@ -287,7 +285,9 @@ class StatusRelay(RealtimeConsumer):
         such an order used to return before ever getting here. The email goes
         once per day's thread, with no Slack mention markup in its subject,
         and also when Slack refused the thread (email is then the only way the
-        owners hear of it)."""
+        owners hear of it). A day's thread that closed is not reopened that
+        day, and a failed email waits notify's failed backoff before the next
+        try."""
         threshold = int(getattr(self.cfg, "held_escalate_count", 0) or 0)
         if not threshold or count < threshold:
             return
@@ -307,21 +307,54 @@ class StatusRelay(RealtimeConsumer):
         try:
             import notify
             rec = notify.issue_get(key) or {}
-            if (rec.get("state") == "closed"
-                    and float(rec.get("closed_at") or 0) >= getattr(self, "_live_index_snap", 0.0)):
-                # the live settle closed it after our Live Queue read: the count
-                # predates the all-clear, so wait for a fresh read
+            if rec.get("state") in ("closed", "resolving"):
+                # [v2.14.1] closed today (the live settle's all-clear, or its
+                # reply still waiting to post): never reopened the same day.
+                # This count included "held" rows of orders the catalog drain
+                # has finished with, which the settle leaves out, so a reopen
+                # came back every hour with a red thread and an email for a
+                # hold that had cleared. The settle now marks those rows gone;
+                # this holds when a mark does not reach the sheet. A hold
+                # still there tomorrow escalates on tomorrow's key.
                 return
             opened = notify.issue_open(key, subject, body, meta={"count": count}, email=False)
             rec = notify.issue_get(key) or {}
-            if ((opened or rec.get("state") == "failed")
-                    and not (rec.get("meta") or {}).get("emailed") and notify.email_enabled()):
+            m = rec.get("meta") or {}
+            if ((opened or rec.get("state") == "failed") and not m.get("emailed")
+                    and notify.email_enabled() and self._email_due(m)):
+                # [v2.14.1] the attempt is recorded before the send: with Slack
+                # down and SMTP unreachable (one try can block for
+                # SMTP_TIMEOUT_S), every held give-up tried again and stalled
+                # the relay
+                self._escalation_meta(key, {"email_tried_at": time.time(),
+                                            "email_tries": int(m.get("email_tries") or 0) + 1})
                 if notify.send_email(f"🔴 {headline}", body):
-                    # an open or failed key only merges this; a retried
-                    # open keeps it, so the email never goes twice
-                    notify.issue_open(key, subject, body, meta={"emailed": True}, email=False)
+                    # an open or failed key keeps this, and so does the thread
+                    # retry_failed() posts later, so the email never goes twice
+                    self._escalation_meta(key, {"emailed": True})
         except Exception as e:
             log.warning("held escalation failed: %s", e)
+
+    @staticmethod
+    def _email_due(meta):
+        """[v2.14.1] The escalation email's next try, on notify's failed
+        backoff: 5, 10, 20, 40 minutes after each failed one, capped."""
+        import notify
+        n = int(meta.get("email_tries") or 0)
+        if not n:
+            return True
+        wait = notify._retry_delay(n)     # the one backoff a refused thread uses too
+        return time.time() - float(meta.get("email_tried_at") or 0) >= wait
+
+    @staticmethod
+    def _escalation_meta(key, meta):
+        """[v2.14.1] Merge into the day's escalation record and never post.
+        issue_update merges into an open or failed record and, with a throttle
+        that never runs out, posts nothing; it leaves a closed record alone,
+        where issue_open would post a fresh red thread if the live settle had
+        closed the key a moment earlier."""
+        import notify
+        notify.issue_update(key, "", every_s=float("inf"), meta=meta)
 
     def _giveup_alert(self, kind, oid, reference_id, slug, attempts):
         """[v2.13] Every give-up becomes (or joins) a Slack thread that is
@@ -442,8 +475,9 @@ class StatusRelay(RealtimeConsumer):
         """[v2.13] Every 10 minutes: answer "unmapped status" threads whose
         status now has a stage (the mapping was added and the relay restarted).
         [v2.14.1] Also check the held escalation, so a hold escalates even when
-        no delivery update gives up, and close the shared "not in HubSpot"
-        thread once a day passes with nothing new."""
+        no delivery update gives up, close the shared "not in HubSpot"
+        thread once a day passes with nothing new, and post what Slack
+        refused earlier (notify.retry_failed)."""
         if time.time() - getattr(self, "_periodic_at", 0) < 600:
             return
         self._periodic_at = time.time()
@@ -474,6 +508,14 @@ class StatusRelay(RealtimeConsumer):
                                                        "is created later gets its latest status then.")
         except Exception as e:
             log.warning("status periodic close of %s failed: %s", UNCLASSIFIED_KEY, e)
+        try:
+            import notify
+            # [v2.14.1] a thread or reply Slack refused (from any service) is
+            # posted only from a main loop, never by the caller that raised it:
+            # this pass, the live settle and the credit watch are those loops
+            notify.retry_failed()
+        except Exception as e:
+            log.warning("status periodic retry of refused threads failed: %s", e)
 
     def _alert(self, key, subject, body):
         """Cooldown-respecting Slack alert (per key, alert_cooldown_minutes)."""

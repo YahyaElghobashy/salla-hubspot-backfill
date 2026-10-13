@@ -18,6 +18,7 @@
   * reconcile_stuck_hours is a real Config field.
 All I/O is mocked: HubSpot is a MagicMock, Sheets a fake, Slack is patched.
 """
+import contextlib
 import copy
 import json
 import tempfile
@@ -120,21 +121,51 @@ class StrayCache(unittest.TestCase):
     def setUp(self):
         self.tmp = chdir_tmp(self)
 
-    def test_failed_read_returns_the_last_verdict(self):
+    def test_failed_refresh_never_reuses_a_stale_true(self):
+        # review round 2, M1 / finding 3 path A: a stale True after a failed
+        # refresh let a bundle someone had started building pass as the product
         eng, hs = engine(self.tmp)
         self.assertTrue(eng._stray_only(PID))
         age_cache(eng)
         hs.template_records.side_effect = RuntimeError("HubSpot 429")
-        self.assertTrue(eng._stray_only(PID))           # stale is fine, never re-decided
+        self.assertIsNone(eng._stray_cached(PID))
+        self.assertFalse(eng._stray_only(PID))            # unknown holds
 
-    def test_stale_verdict_after_a_failure_never_alerts(self):
+    def test_failed_refresh_keeps_a_stale_false(self):
+        eng, hs = engine(self.tmp, recs=DRAFT)
+        self.assertFalse(eng._stray_only(PID))
+        age_cache(eng)
+        hs.template_records.side_effect = RuntimeError("HubSpot 429")
+        self.assertIs(eng._stray_cached(PID), False)
+
+    def test_failed_refresh_holds_without_alerting(self):
         eng, hs = engine(self.tmp, live=True)
         self.assertTrue(eng._stray_only(PID))           # primed without alerting
         age_cache(eng)
         hs.template_records.side_effect = RuntimeError("HubSpot 429")
         with mock.patch("notify.issue_open") as io:
-            self.assertEqual(eng.gate_unverified_items(dryer_order()), [])
+            self.assertEqual(len(eng.gate_unverified_items(dryer_order())), 1)
         io.assert_not_called()
+
+    def test_build_started_then_sheet_fails_holds(self):
+        # M1 as the reviewer ran it: Reclassify adds the Bundles row, the
+        # verdict expires and the Sheets read of the refresh fails
+        eng, hs = engine(self.tmp)
+        self.assertEqual(eng.gate_unverified_items(dryer_order()), [])
+        eng.sheet_gio.tabs["Bundles"][1].append(PID)
+        age_cache(eng)
+        eng.sheet_gio.fail = RuntimeError("HttpError 503")
+        self.assertEqual(len(eng.gate_unverified_items(dryer_order())), 1)
+
+    def test_build_started_is_seen_through_the_sheet_cache(self):
+        # finding 3 path B: the sheet index caches columns for 10 minutes, so
+        # the refresh re-confirmed "stray" on a bundle being built
+        eng, hs = engine(self.tmp)
+        self.assertEqual(eng.gate_unverified_items(dryer_order()), [])
+        eng.sheet_gio.tabs["Bundles"][1].append(PID)
+        age_cache(eng)                                  # verdict expired, sheet cache still warm
+        self.assertEqual(len(eng.gate_unverified_items(dryer_order())), 1)
+        self.assertIs(eng._stray_cache[PID][1], False)
 
     def test_failure_without_a_verdict_holds_and_is_remembered_a_minute(self):
         # finding 23: every line of a busy product retried the failing search
@@ -178,17 +209,63 @@ class GateDecision(unittest.TestCase):
         self.assertEqual(hs.template_records.call_count, calls)     # no fresh lookup
         hs.patch_order.assert_not_called()                          # no flag_partial
 
-    def test_a_product_the_gate_did_not_exempt_routes_on_raw_counts(self):
-        # the gate passed it as a plain product (no record then); a record
-        # appearing before the line is built is not re-judged by the builder
+    def test_a_stray_minted_after_the_gate_routes_as_the_product(self):
+        # [v2.14.1] round 2, N1/N10: the gate passed it as a plain product (no
+        # record then); Make mints an empty record before the line is built.
+        # The builder may only lower ta, so the line is the product, not a
+        # permanent needs_review line with flag_partial
         eng, hs = engine(self.tmp, ta=0)
         o = dryer_order()
         self.assertEqual(eng.gate_unverified_items(o), [])
         self.assertEqual(eng.gate_exempt(o), set())
         line_builder_mocks(hs, ta_line=1)
         eng.process_item(o, "HS-ORDER", o["items"][0])
+        self.assertEqual(sale_context(hs), "standalone_product")
+        hs.patch_order.assert_not_called()                          # no flag_partial
+
+    def test_a_record_someone_touched_after_the_gate_still_needs_review(self):
+        # a False verdict (a status, components, a Bundles row) never lowers ta
+        eng, hs = engine(self.tmp, ta=0, recs=DRAFT)
+        o = dryer_order()
+        self.assertEqual(eng.gate_unverified_items(o), [])
+        line_builder_mocks(hs, ta_line=1)
+        eng.process_item(o, "HS-ORDER", o["items"][0])
         self.assertEqual(sale_context(hs), "needs_review")
-        hs.template_records.assert_not_called()
+
+    def test_an_unknown_verdict_after_the_gate_still_needs_review(self):
+        # a failed lookup is unknown, which never counts as a stray
+        for fail in ({"recs": RuntimeError("HubSpot 429")}, {"sheet_fail": RuntimeError("HttpError 503")}):
+            eng, hs = engine(self.tmp, ta=0, **fail)
+            o = dryer_order()
+            self.assertEqual(eng.gate_unverified_items(o), [])
+            line_builder_mocks(hs, ta_line=1)
+            eng.process_item(o, "HS-ORDER", o["items"][0])
+            self.assertEqual(sale_context(hs), "needs_review", fail)
+
+    def test_drain_pass_cache_then_a_new_stray_routes_as_the_product(self):
+        # the drain caches raw counts for the whole pass (ta=0 at its start),
+        # so every later order of the product passes on the cache while
+        # process_item reads the fresh count with the new empty record
+        eng, hs = engine(self.tmp, ta=0)
+        o1 = order("1", [(PID, "product")])
+        self.assertEqual(eng.gate_cached(o1), [])
+        hs.gate_search_template.side_effect = lambda pid, elig: 0 if elig else 1
+        o2 = order("2", [(PID, "product")])
+        self.assertEqual(eng.gate_cached(o2), [])
+        line_builder_mocks(hs, ta_line=1)
+        eng.process_item(o2, "HS-ORDER", o2["items"][0])
+        self.assertEqual(sale_context(hs), "standalone_product")
+        hs.patch_order.assert_not_called()
+
+    def test_line_builder_never_alerts_for_a_late_stray(self):
+        eng, hs = engine(self.tmp, ta=0, live=True)
+        o = dryer_order()
+        self.assertEqual(eng.gate_unverified_items(o), [])
+        line_builder_mocks(hs, ta_line=1)
+        with mock.patch("notify.issue_open") as io:
+            eng.process_item(o, "HS-ORDER", o["items"][0])
+        io.assert_not_called()
+        self.assertEqual(sale_context(hs), "standalone_product")
 
     def test_without_a_gate_the_builder_uses_the_shared_rule(self):
         eng, hs = engine(self.tmp)
@@ -379,6 +456,77 @@ class HeldIssue(unittest.TestCase):
             eng.held_issue(o, [u])
         self.assertEqual(io.call_count, 1)
         self.assertIn("Do NOT approve", io.call_args[0][2])
+
+
+# ------------------------------------------- lanes fail fast on Slack (N6)
+
+class LaneFastPosts(unittest.TestCase):
+    """[v2.14.1] round 2, N6: only the lane entry points make their issue
+    posts fail fast (notify.fast_posts); the main-loop callers keep the normal
+    post_slack retries. Every issue_* call a lane makes must run inside it."""
+
+    def setUp(self):
+        self.tmp = chdir_tmp(self)
+        self.depth = 0
+        self.seen = []
+        test = self
+
+        @contextlib.contextmanager
+        def fast_posts():
+            test.depth += 1
+            try:
+                yield
+            finally:
+                test.depth -= 1
+
+        def rec(name, ret):
+            def call(*a, **kw):
+                test.seen.append((name, test.depth > 0))
+                return ret
+            return call
+
+        for target in (mock.patch("notify.fast_posts", fast_posts, create=True),
+                       mock.patch("notify.issue_open", side_effect=rec("open", True)),
+                       mock.patch("notify.issue_update", side_effect=rec("update", True)),
+                       mock.patch("notify.issue_resolve", side_effect=rec("resolve", True))):
+            target.start()
+            self.addCleanup(target.stop)
+
+    def assertAllFast(self, names):
+        self.assertEqual(sorted({n for n, _ in self.seen}), sorted(names), self.seen)
+        self.assertTrue(all(fast for _, fast in self.seen), self.seen)
+        self.assertEqual(self.depth, 0)                      # the mode never leaks out
+
+    def test_held_thread_open(self):
+        eng, hs, o, u = gated(self, flag=False)
+        with mock.patch("notify.issue_get", return_value=None):
+            eng.held_issue(o, [u])
+        self.assertAllFast(["open"])
+
+    def test_held_thread_join(self):
+        eng, hs, o, u = gated(self, flag=False)
+        with mock.patch("notify.issue_get", return_value={"state": "open", "meta": {"orders": ["9"]}}):
+            eng.held_issue(o, [u])
+        self.assertAllFast(["update"])
+
+    def test_stray_thread_from_the_gate(self):
+        eng, _ = engine(self.tmp, live=True)
+        with mock.patch("notify.issue_get", return_value=None):
+            self.assertEqual(eng.gate_unverified_items(dryer_order()), [])
+        self.assertAllFast(["open"])
+
+    def test_zid_collision_alert(self):
+        eng, hs = engine(self.tmp, live=True)
+        hs.live = True
+        eng.zid_collision("4938528", "Z1")
+        self.assertAllFast(["open"])
+
+    def test_order_created_answers(self):
+        eng, _ = engine(self.tmp, live=True)
+        with mock.patch("notify.issue_get", return_value={"state": "open", "meta": {"ref": "239847561"}}):
+            eng.resolve_order_issues("1593948275", "HS9", "239847561")
+        self.assertAllFast(["resolve"])
+        self.assertEqual(len(self.seen), 2)
 
 
 # ----------------------------------------------------------------- slack_text

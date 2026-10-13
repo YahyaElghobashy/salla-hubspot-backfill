@@ -18,10 +18,18 @@ v2.14.1 (review of the v2.14 diff):
     the gate cache so gate_cached does not search the same product again.
   * gate_cached records the gate's per-order decision, so the line builder
     never re-decides a stray exemption the gate already made.
+  * [v2.14.1] (round 2) N2: an exemptable product's pass-cached counts are
+    read again once they are as old as the stray verdict (at most once per
+    TTL), so a stray the sentinel sets aside mid-pass no longer holds the rest
+    of the pass. N9: a row is skipped only within 72 h of its last try, and an
+    id recorded with its SKU is fetched once that SKU passes, so a listing
+    deleted in Salla no longer keeps its rows skipped for good.
 All I/O is mocked.
 """
 import csv
+import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from unittest import mock
 
 import queue_drain
@@ -31,9 +39,22 @@ from test_v2141_gate import DRAFT, age_cache, line_builder_mocks, sale_context
 
 PID = "1982906533"
 OLD = "1111"                 # an older listing with the same name
+DEL = "777000111"            # a listing later deleted in Salla
 STILL_BLOCKED_REC = [{"id": "1", "properties": {"template_status": "draft",
                                                 "component_count": None, "active_component_count": None}}]
-T_OLD, T_NEW = "2026-10-01 10:17:03", "2026-10-12 09:17:03"
+# [v2.14.1] every test runs at NOW; a row is skipped only within 72 h of its last try
+NOW = "2026-10-12 12:00:00"
+T_OLD, T_NEW = "2026-10-11 10:17:03", "2026-10-12 09:17:03"
+T_72H, T_UNDER_72H = "2026-10-09 12:00:00", "2026-10-09 12:00:01"
+
+
+def hermetic(test):
+    """chdir_tmp, plus the drain's clock frozen at NOW."""
+    tmp = chdir_tmp(test)
+    p = mock.patch.object(queue_drain, "now_str", return_value=NOW)
+    p.start()
+    test.addCleanup(p.stop)
+    return tmp
 
 
 def write_matrix(rows):
@@ -74,7 +95,7 @@ class Pass:
     sku_ok resolve to an approved legacy record."""
 
     def setUp(self):
-        self.tmp = chdir_tmp(self)
+        self.tmp = hermetic(self)
 
     def drain(self, table, flag=True, sku_ok=(), live=False):
         cfg = make_cfg(self.tmp)
@@ -251,7 +272,7 @@ class Records(Pass, unittest.TestCase):
 
 class StrayRecheck(unittest.TestCase):
     def setUp(self):
-        self.tmp = chdir_tmp(self)
+        self.tmp = hermetic(self)
 
     def rows(self):
         return [qrow(2, "401", "Dryer", 7, note("Dryer", T_OLD, PID))]
@@ -324,7 +345,7 @@ class GateDecision(unittest.TestCase):
     line builder reads, for cache hits too, and drops it when the order ends."""
 
     def setUp(self):
-        self.tmp = chdir_tmp(self)
+        self.tmp = hermetic(self)
 
     def test_every_order_gets_the_decision_even_from_the_cache(self):
         eng, hs = engine(self.tmp)
@@ -379,6 +400,229 @@ class GateDecision(unittest.TestCase):
         st, _, _ = eng.drain_one({"row": 2, "order_id": "1", "attempts": 0}, o)
         self.assertEqual(st, "Queued")
         self.assertIsNone(eng.gate_exempt(o))
+
+
+class Clock:
+    """A fake time.time() shared by the drain's count cache and the stray
+    verdict cache, so a test can let minutes of a long pass go by."""
+
+    def __init__(self, test):
+        self.t = 1_800_000_000.0
+        p = mock.patch("time.time", lambda: self.t)
+        p.start()
+        test.addCleanup(p.stop)
+
+    def advance(self, s):
+        self.t += s
+
+
+def dryer(oid):
+    return order(oid, [(PID, "product")])
+
+
+class CountsAsFreshAsTheVerdict(unittest.TestCase):
+    """N2: the pass cached (approved, 0 active, 1 record) while the stray
+    existed. The catalog sentinel set the record aside mid-pass; once the
+    stray verdict expired it read "no record" (False), and the pass-old ta=1
+    held every later order of the approved product while live passed them."""
+
+    def setUp(self):
+        self.tmp = hermetic(self)
+        self.clock = Clock(self)
+
+    def test_a_stray_set_aside_mid_pass_does_not_hold_the_rest_of_the_pass(self):
+        eng, hs = engine(self.tmp)                 # approved, no active template, one empty record
+        self.assertEqual(eng.gate_cached(dryer("1")), [])           # exempt
+        hs.template_records.return_value = []                       # the sentinel voids the key
+        hs.gate_search_template.side_effect = lambda pid, elig: 0
+        self.clock.advance(eng.STRAY_TTL_S + 1)
+        o2 = dryer("2")
+        self.assertEqual(eng.gate_cached(o2), [])
+        self.assertEqual(eng.gate_exempt(o2), set())     # passed on its own counts, no exemption
+        self.assertEqual(eng.gate_unverified_items(dryer("3")), [])  # what live says
+
+    def test_counts_read_before_the_verdict_are_read_again(self):
+        # review round 2, M2: counts and verdict expired on separate clocks, so
+        # a void between the counts re-read and the next verdict refresh held
+        # the approved product's orders while live passed them
+        eng, hs = engine(self.tmp, sheet_fail=RuntimeError("HttpError 503"))
+        self.assertEqual(len(eng.gate_cached(dryer("1"))), 1)      # t0: counts read, verdict unknown
+        eng.sheet_gio.fail = None
+        self.clock.advance(61)
+        self.assertEqual(eng.gate_cached(dryer("2")), [])           # t0+61: verdict True
+        self.clock.advance(240)
+        self.assertEqual(eng.gate_cached(dryer("3")), [])           # t0+301: counts re-read (1, 0, 1)
+        hs.template_records.return_value = []                       # t0+330: the sentinel voids it
+        hs.gate_search_template.side_effect = lambda pid, elig: 0
+        self.clock.advance(61)
+        o4 = dryer("4")
+        self.assertEqual(eng.gate_cached(o4), [])                   # t0+362: verdict False, counts re-read
+        self.assertEqual(eng.gate_exempt(o4), set())
+        self.assertEqual(eng.gate_unverified_items(dryer("5")), [])  # what live says
+
+    def test_a_build_started_mid_pass_still_holds(self):
+        eng, hs = engine(self.tmp)
+        self.assertEqual(eng.gate_cached(dryer("1")), [])
+        hs.template_records.return_value = DRAFT
+        self.clock.advance(eng.STRAY_TTL_S + 1)
+        self.assertEqual(len(eng.gate_cached(dryer("2"))), 1)
+
+    def test_read_again_at_most_once_per_ttl(self):
+        eng, hs = engine(self.tmp)
+        reads = hs.gate_search_product_approved
+        for n in range(3):
+            eng.gate_cached(dryer(str(n)))
+        self.assertEqual(reads.call_count, 1)
+        self.clock.advance(eng.STRAY_TTL_S - 1)
+        eng.gate_cached(dryer("3"))
+        self.assertEqual(reads.call_count, 1)
+        self.clock.advance(2)
+        for n in range(4, 9):
+            eng.gate_cached(dryer(str(n)))
+        self.assertEqual((reads.call_count, hs.gate_search_template.call_count), (2, 4))
+        self.clock.advance(eng.STRAY_TTL_S)
+        eng.gate_cached(dryer("9"))
+        self.assertEqual(reads.call_count, 3)
+
+    def test_one_lane_reads_again_while_the_others_wait(self):
+        eng, hs = engine(self.tmp)
+        eng.gate_cached(dryer("0"))
+        self.clock.advance(eng.STRAY_TTL_S + 1)
+        hs.gate_search_product_approved.side_effect = lambda pid: time.sleep(0.02) or 1
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            list(pool.map(eng.gate_cached, [dryer(str(n)) for n in range(1, 33)]))
+        self.assertEqual(hs.gate_search_product_approved.call_count, 2)
+
+    def test_shapes_the_exemption_cannot_touch_are_read_once_a_pass(self):
+        for flag, p, te, ta in ((True, 0, 0, 0), (True, 0, 0, 1), (True, 1, 1, 1),
+                                (True, 1, 0, 0), (False, 1, 0, 1)):
+            eng, hs = engine(self.tmp, flag=flag, p=p, te=te, ta=ta)
+            eng.gate_cached(dryer("1"))
+            self.clock.advance(10 * 3600)
+            eng.gate_cached(dryer("2"))
+            self.assertEqual(hs.gate_search_product_approved.call_count, 1, (flag, p, te, ta))
+
+    def test_a_failed_reread_keeps_the_counts_for_another_ttl(self):
+        eng, hs = engine(self.tmp)
+        eng.gate_cached(dryer("1"))
+        self.clock.advance(eng.STRAY_TTL_S + 1)
+        hs.gate_search_product_approved.side_effect = RuntimeError("HubSpot 502")
+        self.assertEqual(eng.gate_cached(dryer("2")), [])   # no error row: old counts, live verdict
+        self.assertEqual(eng.gate_cached(dryer("3")), [])
+        self.assertEqual(hs.gate_search_product_approved.call_count, 2)
+        hs.gate_search_product_approved.side_effect = None
+        hs.gate_search_product_approved.return_value = 1
+        self.clock.advance(eng.STRAY_TTL_S + 1)
+        eng.gate_cached(dryer("4"))
+        self.assertEqual(hs.gate_search_product_approved.call_count, 3)
+
+    def test_a_failed_first_read_still_raises_and_caches_nothing(self):
+        eng, hs = engine(self.tmp)
+        hs.gate_search_product_approved.side_effect = RuntimeError("HubSpot 502")
+        with self.assertRaises(RuntimeError):
+            eng.gate_cached(dryer("1"))
+        self.assertNotIn(PID, eng._gate_cache)
+
+
+def sku_order(oid, pid, sku):
+    o = order(oid, [(pid, "product")])
+    o["items"][0]["sku"] = sku
+    return o
+
+
+class DeletedListing(Pass, unittest.TestCase):
+    """N9: order 301 was held by Salla listing DEL and recorded under it. The
+    client then deleted DEL in Salla: the order's item now has no product id
+    and the gate resolves it by SKU (C18). Once LGCY-C18 was approved the order
+    would pass, but the pre-filter re-checked only DEL, which still fails, so
+    the row was skipped on every pass and the matrix kept asking for DEL."""
+
+    TABLE = {DEL: (0, 0, 0)}
+
+    def test_a_row_is_fetched_again_72_hours_after_its_last_try(self):
+        db = {"301": deleted_item_order("301", "C18")}
+        for ts, want in ((T_UNDER_72H, []), (T_72H, ["301"])):
+            rows = [qrow(2, "301", "Old dryer", 1, note("Old dryer", ts, DEL))]
+            eng, hs, relay, gio = self.drain(self.TABLE, sku_ok={"C18"})
+            self.assertEqual(self.run_pass(eng, relay, gio, rows, db), want, ts)
+        self.assertEqual(eng.stats.held, 0)             # fetched, and it passes by SKU
+        self.assertNotIn(DEL, read_matrix())
+
+    def test_the_sku_is_recorded_and_the_row_fetched_once_it_passes(self):
+        eng, hs, relay, gio = self.drain(self.TABLE, live=True)
+        st, text, _ = eng.drain_one({"row": 2, "order_id": "301", "attempts": 0},
+                                    sku_order("301", DEL, "C18"))
+        self.assertEqual(st, "Queued")
+        self.assertEqual(queue_drain.recorded_keys(text), {f"{DEL}/C18"})
+        self.assertEqual(text.split("@")[0].replace("blocked:", "").strip(), f"item-{DEL}")
+        rows = [qrow(2, "301", f"item-{DEL}", 1, text)]
+        db = {"301": deleted_item_order("301", "C18")}
+        eng, hs, relay, gio = self.drain(self.TABLE)                 # nothing changed yet
+        self.assertEqual(self.run_pass(eng, relay, gio, rows, db), [])
+        m = read_matrix()[DEL]
+        self.assertEqual((m["sku"], m["blocked_orders"], m["sample_order_ids"]), ("C18", "1", "301"))
+        eng, hs, relay, gio = self.drain(self.TABLE, sku_ok={"C18"})  # LGCY-C18 approved
+        self.assertEqual(self.run_pass(eng, relay, gio, rows, db), ["301"])
+        self.assertEqual(eng.stats.held, 0)
+
+    def test_a_sku_that_already_passes_is_not_recorded(self):
+        # an approved relisting can carry the same SKU: recording it would get
+        # the old listing's rows fetched every pass
+        eng, hs, relay, gio = self.drain(self.TABLE, live=True, sku_ok={"C18"})
+        _, text, _ = eng.drain_one({"row": 2, "order_id": "301", "attempts": 0},
+                                   sku_order("301", DEL, "C18"))
+        self.assertEqual(queue_drain.recorded_keys(text), {DEL})
+
+    def test_no_sku_search_when_the_pre_filter_is_off(self):
+        eng, hs, relay, gio = self.drain(self.TABLE, flag=False, live=True)
+        _, text, _ = eng.drain_one({"row": 2, "order_id": "301", "attempts": 0},
+                                   sku_order("301", DEL, "C18"))
+        self.assertEqual(queue_drain.recorded_keys(text), {DEL})
+        hs.gate_search_product_by_sku.assert_not_called()
+
+    def test_a_failed_sku_check_records_the_sku(self):
+        eng, hs, relay, gio = self.drain(self.TABLE, live=True)
+        hs.gate_search_product_by_sku.side_effect = RuntimeError("HubSpot 502")
+        st, text, _ = eng.drain_one({"row": 2, "order_id": "301", "attempts": 0},
+                                    sku_order("301", DEL, "C18"))
+        self.assertEqual((st, queue_drain.recorded_keys(text)), ("Queued", {f"{DEL}/C18"}))
+
+    def test_a_failed_sku_recheck_fetches_the_row(self):
+        eng, hs, relay, gio = self.drain(self.TABLE)
+        hs.gate_search_product_by_sku.side_effect = RuntimeError("HubSpot 502")
+        rows = [qrow(2, "301", "Old dryer", 1, note("Old dryer", T_OLD, f"{DEL}/C18"))]
+        self.assertEqual(eng._skip_known_blocked(rows), rows)
+
+    def test_a_skipped_row_counts_once_per_product(self):
+        rows = [qrow(2, "301", "Old dryer", 1, note("Old dryer", T_OLD, DEL, f"{DEL}/C18", f"{DEL}/C19"))]
+        eng, hs, relay, gio = self.drain(self.TABLE)
+        self.assertEqual(self.run_pass(eng, relay, gio, rows, {}), [])
+        m = read_matrix()
+        self.assertEqual(list(m), [DEL])
+        self.assertEqual((m[DEL]["blocked_orders"], m[DEL]["sku"], m[DEL]["item_name"]),
+                         ("1", "C18", "Old dryer"))
+        # either SKU passing now is enough to fetch it
+        eng, hs, relay, gio = self.drain(self.TABLE, sku_ok={"C19"})
+        self.assertEqual(self.run_pass(eng, relay, gio, rows, {"301": deleted_item_order("301", "C19")}),
+                         ["301"])
+
+    def test_parsing(self):
+        self.assertEqual(queue_drain.split_key(f"{DEL}/C18"), (DEL, "C18"))
+        self.assertEqual(queue_drain.split_key(f"{DEL}/A/B"), (DEL, "A/B"))
+        self.assertEqual(queue_drain.split_key(DEL), (DEL, ""))
+        self.assertEqual(queue_drain.split_key("sku:A/B"), ("sku:A/B", "A/B"))
+        self.assertEqual(queue_drain.split_key("sku:-"), ("sku:-", ""))
+        u = {"pid": DEL, "sku": "C18", "name": "x"}
+        self.assertEqual(queue_drain.pids_note([u], {"C18"}), f" [pids={DEL}/C18]")
+        self.assertEqual(queue_drain.pids_note([u]), f" [pids={DEL}]")
+        # a SKU that cannot be written back is left off its id
+        self.assertEqual(queue_drain.pids_note([dict(u, sku="A,B")], {"A,B"}), f" [pids={DEL}]")
+        # an id that could be read as id/sku records nothing
+        self.assertEqual(queue_drain.pids_note([dict(u, pid="1/2")]), "")
+        tw = queue_drain.tried_within
+        self.assertTrue(tw(note("x", T_UNDER_72H, DEL), queue_drain.SKIP_MAX_AGE_S, NOW))
+        self.assertFalse(tw(note("x", T_72H, DEL), queue_drain.SKIP_MAX_AGE_S, NOW))
+        self.assertFalse(tw("blocked: x", queue_drain.SKIP_MAX_AGE_S, NOW))
 
 
 if __name__ == "__main__":

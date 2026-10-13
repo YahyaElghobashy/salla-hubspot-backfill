@@ -113,13 +113,14 @@ class SheetIndex:
         self._tabs[sheet_id] = (time.time(), tabs)
         return tabs
 
-    def column(self, sheet_id, tab, header):
+    def column(self, sheet_id, tab, header, max_age=None):
         """{value: row} for the column whose header row names `header`.
         Raises LookupError when no header names it: a renamed column is a
-        lookup that failed, not a column with no rows. [v2.14.1]"""
+        lookup that failed, not a column with no rows. max_age (seconds)
+        overrides the cache TTL for this read; 0 always reads. [v2.14.1]"""
         key = (sheet_id, tab, header)
         hit = self._cols.get(key)
-        if hit and time.time() - hit[0] < self.ttl:
+        if hit and time.time() - hit[0] < (self.ttl if max_age is None else max_age):
             if hit[1] is None:
                 raise LookupError(f"no '{header}' column on the {tab} tab")
             return hit[1]

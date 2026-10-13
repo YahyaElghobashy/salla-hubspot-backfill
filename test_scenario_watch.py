@@ -206,5 +206,163 @@ class ScenarioOffAcrossTicks(unittest.TestCase):
         self.assertEqual(self.posts[4]["thread_ts"], "4.0001")
 
 
+class RefusedThreadsAcrossTicks(unittest.TestCase):
+    """[v2.14.1] Review #28: a thread Slack refused was posted only when a
+    caller raised its key again, and credits-out is raised once, on the
+    transition. Credits ran out during a Slack outage, two healthy hours
+    followed with the balance still at 0, and the channel shared with the
+    client never saw the thread. Now notify keeps a refused thread for
+    retry_failed() and never posts it from a caller, so make-off (raised on
+    every tick) needs the same retry. The real notify registry and
+    post_slack, a fake Slack behind notify.http_request (status 0 while it
+    is down, which also trips the breaker) and a fake clock: each tick is
+    5 minutes."""
+
+    T0 = 1760270400.0
+
+    def setUp(self):
+        _chdir_tmp(self)
+        fresh_config_warnings(self)
+        env = mock.patch.dict(os.environ, {"SLACK_BOT_TOKEN": "xoxb-test",
+                                           "SLACK_CHANNEL_IDS": "C1"})
+        env.start()
+        self.addCleanup(env.stop)
+        cw.notify._breaker["until"] = 0.0
+        self.addCleanup(cw.notify._breaker.__setitem__, "until", 0.0)
+        self.clock = self.T0
+        for target, fake in (("time.time", lambda: self.clock),
+                             ("time.sleep", lambda s: None)):
+            t = mock.patch(target, side_effect=fake)
+            t.start()
+            self.addCleanup(t.stop)
+        self.down, self.posts, self.emails = False, [], []
+        p = mock.patch.multiple(
+            cw.notify,
+            http_request=mock.Mock(side_effect=self._slack),
+            send_email=mock.Mock(side_effect=lambda s, b, **kw: self.emails.append(s) or True))
+        p.start()
+        self.addCleanup(p.stop)
+        self.org, self.active = dict(ORG), True
+        g = mock.patch.object(cw, "_get", side_effect=lambda path: {
+            "scenario": {"id": 6281245, "name": "Salla | Product Updated",
+                         "isActive": self.active}})
+        g.start()
+        self.addCleanup(g.stop)
+        self.w = cw.CreditWatch(cfg(make_watch_scenarios=WATCH, make_org_id="1"))
+        for name, value in (("read_consumptions", {}), ("read_usage", None),
+                            ("check_relay_dlq", None)):
+            m = mock.patch.object(self.w, name, return_value=value)
+            m.start()
+            self.addCleanup(m.stop)
+        m = mock.patch.object(self.w, "read_org", side_effect=lambda: dict(self.org))
+        self.read_org = m.start()
+        self.addCleanup(m.stop)
+
+    def _slack(self, method, url, headers=None, body=None, timeout=None):
+        if self.down:
+            return 0, {}, ""                    # refused or timed out
+        if url == cw.notify.SLACK_REACT:
+            return 200, {}, '{"ok": true}'
+        p = json.loads(body)
+        self.posts.append({"text": p["text"], "thread_ts": p.get("thread_ts"),
+                           "broadcast": p.get("reply_broadcast", False)})
+        return 200, {}, json.dumps({"ok": True, "ts": f"{len(self.posts)}.0001"})
+
+    def tick(self, n=1):
+        for _ in range(n):
+            self.w.tick()
+            self.clock += 300
+
+    def parents(self, words):
+        return [(f"{i + 1}.0001", p) for i, p in enumerate(self.posts)
+                if p["thread_ts"] is None and words in p["text"]]
+
+    def test_credits_out_while_slack_refuses_posts_one_thread_once_healthy(self):
+        self.org["remaining"] = 500.0
+        self.tick()                             # healthy: the low-credit thread opens
+        self.org["remaining"] = 0.0
+        self.down = True
+        self.tick()                             # out of credits while Slack refuses
+        self.assertEqual(self.parents("out of credits"), [])
+        self.assertEqual(cw.notify.issue_get(cw.OUT_KEY)["state"], "failed")
+        self.down = False
+        self.tick(24)                           # two healthy hours, still at 0
+        out = self.parents("out of credits")
+        self.assertEqual(len(out), 1)
+        ts = out[0][0]
+        detail = [p for p in self.posts if p["thread_ts"] == ts]
+        self.assertEqual(len(detail), 1)
+        self.assertIn("0 credits left", detail[0]["text"])
+        self.assertTrue(cw.notify_open(cw.OUT_KEY))
+        # emailed once, when Slack refused it; the late thread does not repeat it
+        self.assertEqual(sum(s.startswith("🔴 Make is out of credits") for s in self.emails), 1)
+        self.org["remaining"] = 3000.0
+        self.tick()                             # credits back: answered in that thread
+        reply = self.posts[-1]
+        self.assertEqual(reply["thread_ts"], ts)
+        self.assertTrue(reply["broadcast"])
+        self.assertIn("credits are back", reply["text"])
+        self.assertEqual(self.parents("Make credits are back"), [])
+        self.assertEqual(len(self.parents("out of credits")), 1)
+
+    def test_scenario_off_while_slack_refuses_posts_one_thread_once_healthy(self):
+        self.active = False
+        self.down = True
+        self.tick()
+        self.assertEqual(cw.notify.issue_get(KEY)["state"], "failed")
+        self.down = False
+        self.tick(12)                           # an hour of healthy ticks, still off
+        self.assertEqual(len(self.posts), 2)
+        (ts, parent), = self.parents("switched itself off")
+        self.assertEqual(self.posts[1]["thread_ts"], ts)
+        self.assertIn("History", self.posts[1]["text"])
+        self.assertTrue(cw.notify_open(KEY))
+        self.active = True
+        self.tick()
+        self.assertEqual(self.posts[-1]["thread_ts"], ts)
+        self.assertIn("switched on again", self.posts[-1]["text"])
+
+    def test_credits_back_before_the_retry_closes_it_quietly(self):
+        # the retry runs after the checks: a problem that cleared in the same
+        # tick is not posted red and answered seconds later
+        self.org["remaining"] = 500.0
+        self.tick()
+        self.org["remaining"] = 0.0
+        self.down = True
+        self.tick()
+        self.down = False
+        self.org["remaining"] = 3000.0
+        self.tick()
+        self.assertEqual(self.parents("out of credits"), [])
+        self.assertEqual(len(self.parents("Make credits are back")), 1)
+        self.assertEqual(cw.notify.issue_get(cw.OUT_KEY)["state"], "closed")
+
+    def test_refused_thread_posts_even_when_the_make_read_fails(self):
+        self.org["remaining"] = 0.0
+        self.down = True
+        self.tick()
+        self.down = False
+        self.read_org.side_effect = RuntimeError("Make API 503")
+        with self.assertRaises(RuntimeError):
+            self.w.tick()
+        self.assertEqual(len(self.parents("out of credits")), 1)
+
+    def test_dry_run_and_alerts_off_leave_refused_threads_alone(self):
+        self.org["remaining"] = 0.0
+        self.down = True
+        self.tick()
+        self.down = False
+        self.w.dry_run = True
+        self.tick()
+        self.w.dry_run = False
+        self.w.cfg.alerts_enabled = False
+        self.tick()
+        self.assertEqual(self.posts, [])
+        self.assertEqual(cw.notify.issue_get(cw.OUT_KEY)["state"], "failed")
+        self.w.cfg.alerts_enabled = True
+        self.tick()
+        self.assertEqual(len(self.parents("out of credits")), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

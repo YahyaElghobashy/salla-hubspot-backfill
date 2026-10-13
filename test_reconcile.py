@@ -629,5 +629,88 @@ class ReviewFixes(unittest.TestCase):
         self.assertEqual(counts.detail[0], "1 of the 1 missing order(s) are on hold at the catalog gate, not lost")
 
 
+class BlankOrderIdRows(unittest.TestCase):
+    """[v2.14.1] N12: a queue row with no order id is never claimed by the
+    drain (QueueDrainEngine.claimable skips it), so counting it as held put a
+    phantom hold in every digest and Sunday certificate that nothing clears."""
+
+    NOW = datetime(2026, 10, 11, 3, 33, tzinfo=RIYADH)
+
+    def setUp(self):
+        _chdir_tmp(self)
+
+    @staticmethod
+    def _rows(old, recent):
+        live = [{"order_id": "", "status": "held", "received_at": old,
+                 "note": "catalog gate: Old item -- in review queue"},
+                {"order_id": "7", "status": "held", "received_at": recent,
+                 "note": "catalog gate: Dryer -- in review queue"}]
+        qlog = [{"order_id": "", "status": "queued", "queued_at": old, "items": "Old item"},
+                {"order_id": None, "status": "held", "queued_at": old, "items": "Old item"},
+                {"status": "queued", "queued_at": old, "items": "Old item"},
+                {"order_id": "8", "status": "queued", "queued_at": recent, "items": "Brush"}]
+        return live, qlog
+
+    def test_blank_order_id_rows_are_not_held_orders(self):
+        with _sheets(*self._rows("46200.5", "46300.68")):
+            idx = reconcile.held_index(_cfg())
+        self.assertEqual(sorted(idx), ["7", "8"])
+
+    def test_pipeline_does_not_list_a_blank_row_as_stuck(self):
+        with _sheets(*self._rows("46200.5", "46300.68")):
+            f = phase_pipeline(_cfg(), now=self.NOW)
+        self.assertTrue(f.measured)
+        self.assertEqual(f.data["stuck"], 2)
+        self.assertNotIn("Old item", " ".join(f.detail))
+
+    def test_digest_held_count_leaves_blank_rows_out(self):
+        import report_digest
+
+        def serial(days_ago):
+            return str((datetime.now() - datetime(1899, 12, 30)).days - days_ago)
+        with mock.patch("backfill.Config.load", return_value=_cfg()), \
+                _sheets(*self._rows(serial(107), serial(5))):
+            lh = report_digest._live_held()
+        self.assertEqual(lh["value"], 2)
+        self.assertEqual(lh["oldest_days"], 5)
+        self.assertNotIn("Old item", lh["top"])
+
+
+
+class TextAttemptsCell(unittest.TestCase):
+    """[v2.14.1] review round 2, M3: GoogleIO.queue_read parsed attempts with
+    int(), so one hand-edited cell ("n/a") raised out of the whole read: the
+    Sunday check reported "queue check not recorded", held back every repair,
+    and the digest said "held count not recorded"."""
+
+    def _gio(self, values):
+        class Gio(backfill.GoogleIO):
+            sheets = mock.MagicMock()          # the real one is a read-only property
+        gio = object.__new__(Gio)
+        gio.cfg = _cfg()
+        gio.sheets_rl = None
+        gio._gexec = lambda req, what, rl: {"values": values}
+        return gio
+
+    def test_a_text_attempts_cell_reads_as_zero(self):
+        gio = self._gio([["46300.5", "7", "R7", "e", "held", "n/a", "webhook", "catalog gate: Dryer"],
+                         ["46300.6", "8", "R8", "e", "held", 3, "webhook", "catalog gate: Brush"],
+                         ["46300.7", "9", "R9", "e", "held", "inf"]])
+        rows = gio.queue_read("Q")
+        self.assertEqual([r["attempts"] for r in rows], [0, 3, 0])
+        self.assertEqual([r["order_id"] for r in rows], ["7", "8", "9"])
+
+    def test_held_index_survives_it(self):
+        gio = self._gio([["46300.5", "7", "R7", "e", "held", "n/a", "webhook", "catalog gate: Dryer"]])
+        qlog = mock.MagicMock()
+        qlog.return_value.qlog_read.return_value = []
+        with mock.patch("backfill.GoogleIO", return_value=gio), \
+                mock.patch("queue_drain.DrainGoogleIO", qlog):
+            try:
+                idx = reconcile.held_index(_cfg())
+            except ValueError as e:                          # the old failure
+                self.fail(f"held_index raised {e}")
+        self.assertIn("7", idx)
+
 if __name__ == "__main__":
     unittest.main(verbosity=1)
