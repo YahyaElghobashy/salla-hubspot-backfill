@@ -54,13 +54,17 @@ NEW_SALLA, NEW_HS = "1982906533", "434196269276"      # relisted Multi Styler (d
 NEW_NAME = "المجفف متعدد الاستخدام"                    # its product name in HubSpot and Salla
 REFERENCE_TEMPLATE = "1448268221"                     # its new-dryer component was built by Make
 
-# bundles on Clara's updated Multi Styler list still on the retired dryer
+# bundles still on the retired dryer (first five are on Clara's updated list)
 SWITCH = [
     ("102885086", "Multi Styler + Mousse (+ bag)"),
     ("1307694046", "Multi Styler + Mousse + Gloss (Volume & Gloss set)"),
     ("599685400", "Multi Styler + Leave-in + Serum"),
     ("266454889", "Multi Styler + Repair Cream"),
     ("1092951511", "Multi Styler + Slim Ionic Brush"),
+    # 15 Oct, same switch for the three not on Clara's list
+    ("1209728408", "Multi Styler + Scalp Scrub"),
+    ("1984971270", "Multi Styler + Gloss Spray (+ bag)"),
+    ("551938319", "Multi Styler + Repair & Shine Gloss"),
 ]
 
 BAG_SALLA = "1973407079"                              # Compact Modern Bag, C45
