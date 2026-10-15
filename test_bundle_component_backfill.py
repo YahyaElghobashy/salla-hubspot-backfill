@@ -18,6 +18,15 @@ COMPS = [{"salla_id": "1982906533", "qty": 1}, {"salla_id": "1724277051", "qty":
 
 
 class Helpers(unittest.TestCase):
+    def test_to_ms_reads_iso_and_digits(self):
+        # the v3 batch read returns ISO text; reading it as a number dated nothing
+        self.assertEqual(bb.to_ms("2026-07-15T17:38:36Z"), 1784137116000)
+        self.assertEqual(bb.to_ms("2026-07-15T17:38:36.000Z"), 1784137116000)
+        self.assertEqual(bb.to_ms("1784134716000"), 1784134716000)
+        for bad in ("", None, "not a date"):
+            self.assertEqual(bb.to_ms(bad), 0)
+        self.assertLess(bb.to_ms("2026-07-15T17:38:36Z"), bb.PRE_RELIST_CUTOFF_MS)
+
     def test_parse_instance_key(self):
         self.assertEqual(bb.parse_instance_key("101::202::1448268221"), ("101", "202", "1448268221"))
         for bad in ("", None, "101::202", "101::::1448268221", "a::b::c::d"):

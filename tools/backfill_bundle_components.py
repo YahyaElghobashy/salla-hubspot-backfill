@@ -60,6 +60,21 @@ DEVICE_SWAP = {"1982906533": "1268166868"}       # current component -> what shi
 
 # ---- pure helpers (tested) ----------------------------------------------------
 
+def to_ms(value):
+    """A HubSpot datetime as epoch ms. The v3 object API returns ISO text
+    ("2026-07-15T17:38:36Z"), the search API epoch-ms digits; both are read.
+    0 when empty or unreadable (the caller then never swaps)."""
+    s = str(value or "").strip()
+    if not s:
+        return 0
+    if s.isdigit():
+        return int(s)
+    try:
+        return int(datetime.fromisoformat(s.replace("Z", "+00:00")).timestamp() * 1000)
+    except ValueError:
+        return 0
+
+
 def parse_instance_key(key):
     """bundle_instance_key "<order>::<item>::<template>" -> (order, item, template)."""
     parts = str(key or "").split("::")
@@ -215,11 +230,8 @@ def plan(hs, keys):
             continue
         hs_oid = hs_orders[0]
         o = orders.get(hs_oid) or {}
-        try:
-            ms = int(o.get("hs_external_created_date") or 0) or int(
-                datetime.fromisoformat(str(o.get("createdate")).replace("Z", "+00:00")).timestamp() * 1000)
-        except (TypeError, ValueError):
-            ms = 0
+        ms = to_ms(o.get("hs_external_created_date")) or to_ms(o.get("createdate"))
+        stats["dated" if ms else "undated"] += 1
         tpl = templates[tkey]
         for comp in components_for(ms, tpl["components"]):
             props = line_props(item_id, oid, tkey, tpl["name"], pr.get("bundle_quantity"),
