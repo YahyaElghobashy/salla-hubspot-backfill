@@ -327,9 +327,12 @@ def main():
           f"  (device lines: {sum(1 for l in lines if l['device']):,})")
     if lines:
         print("  sample:", json.dumps(lines[0]["props"], ensure_ascii=False)[:400])
-    ORDERS_OUT.parent.mkdir(exist_ok=True)
-    ORDERS_OUT.write_text("\n".join(order_ids) + ("\n" if order_ids else ""), encoding="utf-8")
-    print(f"  order ids for the warranty sweep: {ORDERS_OUT} ({len(order_ids):,})")
+    # one file per key set: a later run for other keys must never overwrite the list
+    # a running sweep was started from (15 Oct: a 1-key dry run replaced the 8,452 list)
+    out = ORDERS_OUT.with_name(f"{ORDERS_OUT.stem}_{'_'.join(keys)}{ORDERS_OUT.suffix}")
+    out.parent.mkdir(exist_ok=True)
+    out.write_text("\n".join(order_ids) + ("\n" if order_ids else ""), encoding="utf-8")
+    print(f"  order ids for the warranty sweep: {out} ({len(order_ids):,})")
     if not args.apply:
         print("DRY RUN -- rerun with --apply to write.")
         return
