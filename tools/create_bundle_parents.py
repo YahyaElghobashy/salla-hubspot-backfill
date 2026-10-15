@@ -31,6 +31,7 @@ import argparse
 import csv
 import os
 import sys
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -82,7 +83,13 @@ def main():
         status, resp = hs._write("POST", "/crm/v3/objects/products",
                                  {"properties": props}, "create bundle parent")
         pid = str((resp or {}).get("id") or "")
-        back = existing(hs, sid) if pid else []
+        # the search index lags a create by a few seconds: retry before calling it failed
+        back = []
+        for wait in (0, 3, 6, 10):
+            time.sleep(wait)
+            back = existing(hs, sid) if pid else []
+            if any(r.get("id") == pid for r in back):
+                break
         ok = status in (200, 201) and any(r.get("id") == pid for r in back)
         print(f"       {'created ' + pid if ok else 'FAILED (HTTP %s)' % status}"
               f"{', readback matches' if ok else ''}")
