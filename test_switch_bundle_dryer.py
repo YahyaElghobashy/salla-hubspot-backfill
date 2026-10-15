@@ -62,7 +62,9 @@ class FakeHS:
             return 200, {"results": [{"name": n} for n in (
                 "bundle_template_key", "component_salla_product_id", "component_hubspot_product_id",
                 "component_status", "component_key", "component_code", "component_product_sku",
-                "component_product_name_snapshot", "quantity_in_bundle")] + [{"name": "hs_object_id"}]}
+                "component_product_name_snapshot", "quantity_in_bundle", "bundle_code",
+                "bundle_template_record_id", "component_name", "migration_run_id",
+                "last_sync_status")] + [{"name": "hs_object_id"}]}
         parts = path.split("/")             # /crm/v4/objects/COMP/cid/associations/to
         cid, to = parts[5], parts[7]
         return 200, {"results": [{"toObjectId": k, "associationTypes": v}
@@ -97,7 +99,17 @@ def seed(hs):
         hs.add_tpl(key)
         hs.add_comp(key, sw.OLD_SALLA, sw.OLD_HS, code="C18", sku="OLDSKU", name="OLD")
         hs.add_comp(key, "111", "h111")
-    hs.add_comp(sw.BAG_SOURCE, sw.BAG_SALLA, "hbag", code="C45", sku="C45", name="Bag")
+    hs.add_comp(sw.BAG_SOURCE, sw.BAG_SALLA, "hbag", code="C45", sku="C45", name="Bag",
+                bundle_code="SRCCODE", bundle_template_record_id="tSRC",
+                component_name="SRCCODE | C45 | Bag", migration_run_id="m1",
+                last_sync_status="needs_review")
+    for k in (sw.REFERENCE_TEMPLATE, "770385112", "119765676"):
+        if k != sw.REFERENCE_TEMPLATE:
+            hs.add_tpl(k)
+            hs.add_comp(k, sw.NEW_SALLA, sw.NEW_HS, name=" متعدد الاستخدام")
+    tgt = [i for i, v in hs.comp.items() if v["bundle_template_key"] == sw.BAG_TARGET
+           and v["component_salla_product_id"] == "111"][0]
+    hs.comp[tgt].update(bundle_code="TGTCODE", component_name="TGTLABEL | CH11 | foam")
 
 
 class Base(unittest.TestCase):
@@ -133,7 +145,7 @@ class Switch(Base):
         self.assertEqual((c["component_salla_product_id"], c["component_hubspot_product_id"]),
                          (sw.NEW_SALLA, sw.NEW_HS))
         self.assertEqual(c["component_key"], f"{key}::{sw.NEW_SALLA}")
-        self.assertEqual(c["component_product_name_snapshot"], "NEWNAME")
+        self.assertEqual(c["component_product_name_snapshot"], sw.NEW_NAME)
         self.assertEqual(c["component_code"], "C18")                 # untouched
         self.assertEqual(c["component_status"], "active")
         self.assertIn(sw.NEW_HS, hs.links[(cid, "products")])
@@ -167,6 +179,20 @@ class Switch(Base):
         self.assertEqual(hs.comp, before)
 
 
+class Names(Base):
+    def test_cut_names_fixed_once(self):
+        hs = FakeHS()
+        seed(hs)
+        self.assertTrue(sw.fix_names(hs, self.props(), True, []))
+        names = {v["bundle_template_key"]: v["component_product_name_snapshot"] for v in hs.comp.values()
+                 if v["component_salla_product_id"] == sw.NEW_SALLA}
+        for k in sw.NAME_FIX:
+            self.assertEqual(names[k], sw.NEW_NAME)
+        n = len(hs.writes)
+        self.assertTrue(sw.fix_names(hs, self.props(), True, []))
+        self.assertEqual(len(hs.writes), n)
+
+
 class Bag(Base):
     def test_bag_added_once(self):
         hs = FakeHS()
@@ -182,6 +208,11 @@ class Bag(Base):
         self.assertEqual((v["component_status"], v["component_code"]), ("active", "C45"))
         self.assertEqual(hs.links[(cid, TPL)], {f"t{sw.BAG_TARGET}": [{"category": "USER_DEFINED", "typeId": 55}]})
         self.assertIn("hbag", hs.links[(cid, "products")])
+        self.assertEqual(v["bundle_template_record_id"], f"t{sw.BAG_TARGET}")
+        self.assertEqual(v["bundle_code"], "TGTCODE")
+        self.assertEqual(v["component_name"], "TGTLABEL | C45 | Bag")
+        self.assertNotIn("migration_run_id", v)
+        self.assertNotIn("last_sync_status", v)
         self.assertEqual(hs.tpl[f"t{sw.BAG_TARGET}"]["active_component_count"], "4")
         self.assertEqual(hs.tpl[f"t{sw.BAG_TARGET}"]["component_count"], "4")
         n = len(hs.writes)

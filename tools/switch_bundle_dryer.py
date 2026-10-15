@@ -51,6 +51,7 @@ LEDGER = Path("mirror/bundle_dryer_switch.csv")
 
 OLD_SALLA, OLD_HS = "1268166868", "419301315812"      # retired Multi Styler listing
 NEW_SALLA, NEW_HS = "1982906533", "434196269276"      # relisted Multi Styler (device)
+NEW_NAME = "المجفف متعدد الاستخدام"                    # its product name in HubSpot and Salla
 REFERENCE_TEMPLATE = "1448268221"                     # its new-dryer component was built by Make
 
 # bundles on Clara's updated Multi Styler list still on the retired dryer
@@ -70,6 +71,12 @@ SWITCH_FIELDS = ("component_salla_product_id", "component_hubspot_product_id",
                  "component_key", "component_product_name_snapshot",
                  "component_product_sku", "component_code")
 SKIP_ON_COPY = {"bundle_template_key", "component_key"}
+# per-record bookkeeping of the source bag that must not travel to the target
+DROP_ON_COPY = {"bundle_template_record_id", "bundle_code", "component_name", "component_position",
+                "last_sync_status", "last_sync_error", "migration_run_id",
+                "source_mapping_row", "source_mapping_sheet"}
+# Make-built new-dryer components (15 Oct) whose name came in cut from the sheet
+NAME_FIX = [REFERENCE_TEMPLATE, "770385112", "119765676"]
 
 
 # ---- HubSpot helpers --------------------------------------------------------
@@ -179,7 +186,7 @@ def switch_one(hs, key, label, ref, props, apply, ledger):
         return False
     want = {"component_salla_product_id": NEW_SALLA, "component_hubspot_product_id": NEW_HS,
             "component_key": new_key,
-            "component_product_name_snapshot": p(ref, "component_product_name_snapshot")}
+            "component_product_name_snapshot": NEW_NAME}
     if p(ref, "component_product_sku"):
         # a blank reference sku would blank reporting_product_key on future dryer lines
         want["component_product_sku"] = p(ref, "component_product_sku")
@@ -215,6 +222,30 @@ def switch_one(hs, key, label, ref, props, apply, ledger):
     return ok
 
 
+def fix_names(hs, props, apply, ledger):
+    """Full product name on new-dryer components whose name was cut."""
+    ok = True
+    for key in NAME_FIX:
+        for c in components(hs, key, props):
+            if (p(c, "component_status") != "active" or p(c, "component_salla_product_id") != NEW_SALLA
+                    or p(c, "component_product_name_snapshot") == NEW_NAME):
+                continue
+            before = p(c, "component_product_name_snapshot")
+            print(f"{'RENAME' if apply else 'WOULD '} {key}: component {c['id']} name "
+                  f"{before!r} -> {NEW_NAME!r}")
+            if not apply:
+                continue
+            st, _ = hs._write("PATCH", f"/crm/v3/objects/{backfill.OBJ_COMPONENT}/{c['id']}",
+                              {"properties": {"component_product_name_snapshot": NEW_NAME}},
+                              "fix dryer component name")
+            ledger.append([now_str(), "rename", key, c["id"],
+                           json.dumps({"component_product_name_snapshot": before}, ensure_ascii=False),
+                           json.dumps({"component_product_name_snapshot": NEW_NAME}, ensure_ascii=False),
+                           "ok" if st in (200, 201) else f"fail {st}"])
+            ok = ok and st in (200, 201)
+    return ok
+
+
 def add_bag(hs, props, writable, apply, ledger):
     tpl = template(hs, BAG_TARGET)
     if tpl in (None, "many") or p(tpl, "template_status") != "active":
@@ -235,8 +266,20 @@ def add_bag(hs, props, writable, apply, ledger):
     if by_key(hs, new_key):
         print(f"REFUSE bag: component key {new_key} already exists")
         return False
-    body = {k: p(s, k) for k in writable if k not in SKIP_ON_COPY and p(s, k) != ""}
-    body.update({"bundle_template_key": BAG_TARGET, "component_key": new_key})
+    body = {k: p(s, k) for k in writable
+            if k not in SKIP_ON_COPY | DROP_ON_COPY and p(s, k) != ""}
+    body.update({"bundle_template_key": BAG_TARGET, "component_key": new_key,
+                 "bundle_template_record_id": tpl["id"]})
+    # follow the target's own siblings: same bundle_code, same "<code> | <comp> | <name>" label
+    sib = [c for c in components(hs, BAG_TARGET, {"component_status", "bundle_code", "component_name"})
+           if p(c, "component_status") == "active"]
+    codes = [p(c, "bundle_code") for c in sib if p(c, "bundle_code")]
+    if codes:
+        body["bundle_code"] = codes[0]
+    labels = [p(c, "component_name") for c in sib if " | " in p(c, "component_name")]
+    prefix = labels[0].split(" | ")[0] if labels else ""
+    body["component_name"] = " | ".join(x for x in (prefix, p(s, "component_code"),
+                                                    p(s, "component_product_name_snapshot")) if x)
     tpl_links = [t for to, t in assoc(hs, s["id"], backfill.OBJ_BUNDLE_TEMPLATE)]
     prod_links = [(to, t) for to, t in assoc(hs, s["id"], "products")]
     a, c = p(tpl, "active_component_count"), p(tpl, "component_count")
@@ -304,6 +347,8 @@ def main():
     for key, label in SWITCH:
         if not switch_one(hs, key, label, ref, props, args.apply, ledger):
             failed += 1
+    if not fix_names(hs, props, args.apply, ledger):
+        failed += 1
     if not add_bag(hs, props, comp_props(hs), args.apply, ledger):
         failed += 1
 
